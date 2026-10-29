@@ -135,6 +135,10 @@ class _BulkPreviewContext:
     unit_display_by_raw: Dict[str, str]
     workshop_warehouse_by_product: Dict[int, Tuple[str, str]]
     warehouse_stock_by_item: Dict[Tuple[str, int, str, str], float]
+    feeder_warehouse_by_item: Dict[int, Tuple[str, str]]
+    feeder_source_revision: str | None
+    feeder_unavailable_reason: str | None
+    feeder_stock_by_item: Dict[Tuple[str, int, str, str], float]
 
 
 def _material_workshop_warehouse(
@@ -710,6 +714,10 @@ def preview_materials(
             int(product.product_id), ("", "")
         )
         workshop_stock_by_item = _bulk_context.warehouse_stock_by_item
+        feeder_warehouse_by_item = _bulk_context.feeder_warehouse_by_item
+        feeder_source_revision = _bulk_context.feeder_source_revision
+        feeder_unavailable_reason = _bulk_context.feeder_unavailable_reason
+        feeder_stock_by_item = _bulk_context.feeder_stock_by_item
     else:
         workshop_ref, workshop_name = _material_workshop_warehouse(
             db,
@@ -721,6 +729,39 @@ def preview_materials(
             db,
             ledger_generation_id=int(ledger_generation_id),
             warehouse_refs=[workshop_ref],
+            physical_keys=[
+                (
+                    int(component["component_item_id"]),
+                    str(component.get("characteristic_ref") or ""),
+                    str(component.get("organization_ref") or ""),
+                )
+                for component in components
+            ],
+        )
+        from .prodflow_feeder_config import (
+            ProdFlowFeederUnavailable,
+            feeder_warehouse_snapshot,
+        )
+        try:
+            feeder_refs, feeder_source_revision = feeder_warehouse_snapshot(db, comp_ids)
+            feeder_unavailable_reason = None
+        except ProdFlowFeederUnavailable as exc:
+            feeder_refs, feeder_source_revision = {}, None
+            feeder_unavailable_reason = str(exc)
+        feeder_names = {
+            str(ref): str(name or ref)
+            for ref, name in db.query(
+                StockWarehouse.warehouse_ref1c, StockWarehouse.warehouse_name,
+            ).filter(StockWarehouse.warehouse_ref1c.in_(set(feeder_refs.values()))).all()
+        } if feeder_refs else {}
+        feeder_warehouse_by_item = {
+            int(item_id): (str(ref), feeder_names.get(str(ref), str(ref)))
+            for item_id, ref in feeder_refs.items()
+        }
+        feeder_stock_by_item = _warehouse_stock(
+            db,
+            ledger_generation_id=int(ledger_generation_id),
+            warehouse_refs=list(feeder_refs.values()),
             physical_keys=[
                 (
                     int(component["component_item_id"]),
@@ -789,8 +830,11 @@ def preview_materials(
         else:
             workshop_covering = None
             workshop_label = "unavailable"
-        require_reserved_at_workshop = own_at_workshop > 1e-9
-        covering = own_at_workshop if require_reserved_at_workshop else available + own_reserved
+        # Owner decision §60: launch coverage is global accepted free stock
+        # plus every exact hold of this order, regardless of whether the hold
+        # is still in transit or already at the workshop.  Workshop-local
+        # readiness remains a separate field and still guards consumption.
+        covering = available + own_reserved
         missing = max(0.0, required - covering)
         label = _component_coverage_label(required, covering)
         comp["available_qty"] = available
@@ -810,6 +854,33 @@ def preview_materials(
         comp["workshop_coverage_qty"] = workshop_covering
         comp["workshop_coverage_status"] = _ui_coverage_status(workshop_label)
         comp["workshop_coverage_label"] = _ui_coverage_label(workshop_label)
+        feeder_ref, feeder_name = feeder_warehouse_by_item.get(iid, ("", ""))
+        if feeder_ref and exact_custody_scope_supported:
+            feeder_stock = feeder_stock_by_item.get(
+                (feeder_ref, iid, characteristic_ref, organization_ref), 0.0
+            )
+            feeder_reserved = reservation_state.reserved_at_warehouse(feeder_ref, iid)
+            feeder_free = max(0.0, feeder_stock - feeder_reserved)
+            feeder_need = max(0.0, required - own_reserved)
+            feeder_pending = max(0.0, feeder_need - feeder_free)
+            feeder_reason = None
+            feeder_status = _component_coverage_label(feeder_need, feeder_free)
+        else:
+            feeder_stock = feeder_free = feeder_pending = None
+            feeder_reason = feeder_unavailable_reason or (
+                "feeder_assignment_missing" if not feeder_ref
+                else "unsupported_exact_custody_scope"
+            )
+            feeder_status = "unavailable"
+        comp["feeder_warehouse_ref1c"] = feeder_ref or None
+        comp["feeder_warehouse_name"] = feeder_name or None
+        comp["feeder_source_revision"] = feeder_source_revision
+        comp["feeder_stock_qty"] = feeder_stock
+        comp["feeder_free_qty"] = feeder_free
+        comp["feeder_pending_qty"] = feeder_pending
+        comp["feeder_status"] = _ui_coverage_status(feeder_status)
+        comp["feeder_label"] = _ui_coverage_label(feeder_status)
+        comp["feeder_unavailable_reason"] = feeder_reason
         comp["reserved_orders"] = reserved_orders_by_item.get(iid, [])
         comp["missing_qty"] = missing
         launch_covering = max(own_at_workshop, raw_stock - reserved)
@@ -857,8 +928,6 @@ def preview_materials(
         if component.get('launch_coverage') != 'ok':
             launchable = min(launchable, _supported_whole_count(Decimal(str(component['launch_available_qty'])), norm))
         if component.get('coverage') == 'ok':
-            # Full coverage already permits the commanded quantity. Dividing
-            # a float-serialized amount by its norm can lose a whole unit.
             continue
         covering = max(Decimal('0'), Decimal(str(component['required_qty'])) - Decimal(str(component['missing_qty'])))
         supported = min(supported, _supported_whole_count(covering, norm))
@@ -1029,6 +1098,42 @@ def _preview_material_products_bulk(
             for component in value[5]
         ],
     )
+    from .prodflow_feeder_config import (
+        ProdFlowFeederUnavailable,
+        feeder_warehouse_snapshot,
+    )
+    try:
+        feeder_refs, feeder_source_revision = feeder_warehouse_snapshot(
+            db, sorted(component_ids),
+        )
+        feeder_unavailable_reason = None
+    except ProdFlowFeederUnavailable as exc:
+        feeder_refs, feeder_source_revision = {}, None
+        feeder_unavailable_reason = str(exc)
+    feeder_names = {
+        str(ref): str(name or ref)
+        for ref, name in db.query(
+            StockWarehouse.warehouse_ref1c, StockWarehouse.warehouse_name,
+        ).filter(StockWarehouse.warehouse_ref1c.in_(set(feeder_refs.values()))).all()
+    } if feeder_refs else {}
+    feeder_warehouse_by_item = {
+        int(item_id): (str(ref), feeder_names.get(str(ref), str(ref)))
+        for item_id, ref in feeder_refs.items()
+    }
+    feeder_stock_by_item = _warehouse_stock(
+        db,
+        ledger_generation_id=generation_id,
+        warehouse_refs=list(feeder_refs.values()),
+        physical_keys=[
+            (
+                int(component["component_item_id"]),
+                str(component.get("characteristic_ref") or ""),
+                str(component.get("organization_ref") or ""),
+            )
+            for value in resolved.values()
+            for component in value[5]
+        ],
+    )
     context = _BulkPreviewContext(
         ledger_generation_id=generation_id,
         allow_building_read=not _current_only,
@@ -1040,6 +1145,10 @@ def _preview_material_products_bulk(
         unit_display_by_raw=unit_display_by_raw,
         workshop_warehouse_by_product=workshop_warehouse_by_product,
         warehouse_stock_by_item=warehouse_stock_by_item,
+        feeder_warehouse_by_item=feeder_warehouse_by_item,
+        feeder_source_revision=feeder_source_revision,
+        feeder_unavailable_reason=feeder_unavailable_reason,
+        feeder_stock_by_item=feeder_stock_by_item,
     )
     return {
         product_id: preview_materials(
@@ -1384,7 +1493,8 @@ def material_supported_snapshot_is_consistent(snapshot: Mapping[str, Any]) -> bo
     """A known full-coverage count must not contradict its own quantity."""
 
     supported = snapshot.get('material_supported_qty')
-    if supported is not None and 'material_launchable_qty' not in snapshot:
+    launchable = snapshot.get('material_launchable_qty')
+    if supported is not None and launchable is None:
         return False
     quantity = snapshot.get('qty')
     return not (

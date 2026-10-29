@@ -50,6 +50,10 @@ from .production_material_custody_projection import (
     load_current_accepted_material_custody,
 )
 from .planning_truth import require_accepted_truth
+from .prodflow_feeder_config import (
+    ProdFlowFeederUnavailable,
+    feeder_warehouse_for_items,
+)
 from .mrp_mutation_guard import require_materialized_orders
 from .production_output_truth import accepted_product_output
 from .workshop_resolution import (
@@ -81,96 +85,6 @@ def _clean_odata_error_message(error: Exception) -> str:
     if "URL:" in raw:
         raw = raw.split("URL:", 1)[0].strip()
     return raw.strip("<> ") or "1С отказала в проведении перемещения"
-
-
-def _auto_select_source_warehouse(
-    db: Session,
-    component_item_ids: List[int],
-    *,
-    excluded_refs: Optional[set[str]] = None,
-    ledger_generation_id: Optional[int] = None,
-) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """
-    Given a list of component item_ids, find the best source warehouse.
-
-    Returns (selected_ref1c, candidates) where:
-    - selected_ref1c is the auto-chosen warehouse ref (or None if ambiguous/none)
-    - candidates is a list of dicts with {ref1c, name, components_covered, total_components}
-
-    Excludes ignored_warehouses. Ignores warehouses with is_selected=False
-    (those are deliberately excluded from stock accounting).
-
-    A warehouse is "best" if it covers the most distinct components with qty>0.
-    If exactly one warehouse covers the maximum — it is auto-selected.
-    If there's a tie — returns None + all tied candidates so UI can ask.
-    """
-    if not component_item_ids:
-        return None, []
-
-    total = len(component_item_ids)
-
-    ignored_refs = {
-        str(r[0])
-        for r in db.query(IgnoredWarehouse.warehouse_ref1c).all()
-    }
-    excluded_refs = {str(ref) for ref in (excluded_refs or set()) if str(ref)}
-    selected_refs = {
-        str(r[0])
-        for r in db.query(StockWarehouse.warehouse_ref1c)
-        .filter(StockWarehouse.is_selected.is_(True))
-        .all()
-    }
-
-    if ledger_generation_id is None:
-        raise ValueError("accepted Ledger generation is required for source stock selection")
-    from .mrp_stock_helpers import current_stock_bin_query
-
-    # Canon R6: the current bin set is ``is_current``; its generation column
-    # is provenance.  Filtering it by the pointer emptied this list after
-    # every obligation refresh and kept only touched keys after a bounded one.
-    rows = (
-        current_stock_bin_query(
-            db, int(ledger_generation_id), StockBin.warehouse_ref1c, StockBin.item_id,
-        )
-        .filter(StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0)
-        .all()
-    )
-
-    coverage: Dict[str, set] = {}
-    for wh_ref, item_id in rows:
-        wh_ref = str(wh_ref)
-        if wh_ref in ignored_refs:
-            continue
-        if wh_ref in excluded_refs:
-            continue
-        if selected_refs and wh_ref not in selected_refs:
-            continue
-        coverage.setdefault(wh_ref, set()).add(int(item_id))
-
-    if not coverage:
-        return None, []
-
-    wh_names: Dict[str, str] = {
-        str(r[0]): str(r[1] or r[0])
-        for r in db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.warehouse_name).all()
-    }
-
-    max_covered = max(len(v) for v in coverage.values())
-    candidates = [
-        {
-            "ref1c": ref,
-            "name": wh_names.get(ref, ref),
-            "components_covered": len(covered),
-            "total_components": total,
-        }
-        for ref, covered in coverage.items()
-        if len(covered) == max_covered
-    ]
-
-    if len(candidates) == 1:
-        return candidates[0]["ref1c"], candidates
-
-    return None, candidates
 
 
 def _source_warehouse_options(
@@ -261,22 +175,21 @@ def _source_warehouse_options(
     return result
 
 
-def _allocate_components_by_source_warehouse(
+def _allocate_components_from_prodflow_feeders(
     db: Session,
     components: List[Dict[str, Any]],
     *,
-    destination_warehouse_ref1c: Optional[str] = None,
-    selected_source_warehouse_ref1c: Optional[str] = None,
-    ledger_generation_id: Optional[int] = None,
-    component_source_warehouses: Optional[Dict[int, str]] = None,
-    reservation_state: Optional[MaterialCustodyState] = None,
-) -> Tuple[Dict[Optional[str], List[Dict[str, Any]]], List[Dict[str, Any]]]:
-    component_item_ids = [int(c["component_item_id"]) for c in components]
-    excluded = {str(destination_warehouse_ref1c)} if destination_warehouse_ref1c else set()
+    destination_warehouse_ref1c: Optional[str],
+    ledger_generation_id: int,
+    reservation_state: MaterialCustodyState,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Allocate only physically free feeder stock; never choose another store."""
+    component_ids = [int(row["component_item_id"]) for row in components]
+    feeder_by_item = feeder_warehouse_for_items(db, component_ids)
     options_by_item = _source_warehouse_options(
         db,
-        component_item_ids,
-        excluded_refs=excluded,
+        component_ids,
+        excluded_refs={str(destination_warehouse_ref1c or "")},
         ledger_generation_id=ledger_generation_id,
         reservation_state=reservation_state,
         component_scopes={
@@ -287,50 +200,38 @@ def _allocate_components_by_source_warehouse(
             for component in components
         },
     )
-    selected_ref = _clean_ref1c(selected_source_warehouse_ref1c) or None
-
-    groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
-    selection_required: List[Dict[str, Any]] = []
-    for comp in components:
-        component_id = int(comp["component_item_id"])
-        options = options_by_item.get(component_id, [])
-        explicit_source = (component_source_warehouses or {}).get(component_id)
-        component_source = _clean_ref1c(explicit_source) if explicit_source is not None else None
-        if explicit_source is not None:
-            if not component_source or component_source not in {str(row["ref1c"]) for row in options}:
-                raise ValueError(f"component_item_id={component_id}: selected source warehouse is not an accepted stock candidate")
-            groups.setdefault(component_source, []).append(comp)
-            continue
-        if not options:
-            groups.setdefault(None, []).append(comp)
-            continue
-        if len(options) == 1:
-            groups.setdefault(str(options[0]["ref1c"]), []).append(comp)
-            continue
-        option_refs = {str(row["ref1c"]) for row in options}
-        if not selected_ref or selected_ref not in option_refs:
-            selection_required.append(
-                {
-                    "component_item_id": component_id,
-                    "item_name": str(comp.get("item_name") or ""),
-                    "item_article": str(comp.get("item_article") or ""),
-                    "required_qty": _to_float(comp.get("required_qty")),
-                    "warehouse_candidates": [
-                        {
-                            "ref1c": str(row["ref1c"]),
-                            "name": str(row["name"]),
-                            "qty": _to_float(row.get("qty")),
-                        }
-                        for row in options
-                    ],
-                }
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    shortages: List[Dict[str, Any]] = []
+    for component in components:
+        item_id = int(component["component_item_id"])
+        feeder_ref = str(feeder_by_item[item_id])
+        option = next(
+            (
+                row for row in options_by_item.get(item_id, ())
+                if str(row.get("ref1c") or "") == feeder_ref
+            ),
+            None,
+        )
+        required = _to_float(component.get("required_qty"))
+        free_at_feeder = max(0.0, _to_float((option or {}).get("qty")))
+        allocated = min(required, free_at_feeder)
+        if allocated > 1e-9:
+            groups.setdefault(feeder_ref, []).append(
+                {**component, "required_qty": allocated}
             )
-            continue
-        groups.setdefault(selected_ref, []).append(comp)
-
-    if selection_required:
-        return {}, selection_required
-    return groups, []
+        remaining = max(0.0, required - allocated)
+        if remaining > 1e-9:
+            shortages.append({
+                "component_item_id": item_id,
+                "item_name": str(component.get("item_name") or ""),
+                "item_article": str(component.get("item_article") or ""),
+                "feeder_warehouse_ref1c": feeder_ref,
+                "required_qty": required,
+                "available_at_feeder_qty": free_at_feeder,
+                "pending_qty": remaining,
+                "reason": "feeder_stock_insufficient",
+            })
+    return groups, shortages
 
 
 def _destination_stock_by_component(
@@ -878,15 +779,19 @@ def create_material_issues(
     1. Free stock already lying on the destination workshop warehouse is claimed
        as a zero-distance posted issue (source=destination), never exported to
        1C.
-    2. Only the remainder becomes physical transfer requests, so storekeepers
-       are never asked to move a full kit that partially exists at the
-       destination already.
+    2. Only physically free stock on each component's accepted ProdFlow feeder
+       becomes a transfer request. Stock elsewhere remains global launch
+       coverage but never becomes an implicit transfer source.
 
     Idempotent: a repeated click with nothing outstanding returns the
     existing documents in `reused`. After the order quantity shrinks, open
     (non-posted) reservations are released down to the requirement.
     """
     require_accepted_truth(db, "production_material_issue_create")
+    if source_warehouse_ref1c or component_source_warehouses:
+        raise ValueError(
+            "Ручной выбор склада-источника отменён; используется только склад-питатель ProdFlow"
+        )
     # Hold a transaction-scoped lock for the whole read-modify-write below so
     # concurrent callers cannot both claim the same free workshop stock.
     _lock_material_issue_pool(db)
@@ -897,6 +802,7 @@ def create_material_issues(
             "created": [],
             "reused": [],
             "selection_required": [],
+            "feeder_shortages": [],
             "already_on_destination": [],
             "errors": [],
         }
@@ -909,6 +815,7 @@ def create_material_issues(
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
     selection_required: List[Dict[str, Any]] = []
+    feeder_shortages: List[Dict[str, Any]] = []
     errors: List[str] = []
     already_on_destination: List[Dict[str, Any]] = []
     consumed_destination_stock: Dict[Tuple[str, int], float] = {}
@@ -1007,7 +914,6 @@ def create_material_issues(
 
         comp_ids = [int(c["component_item_id"]) for c in components]
         own = reservation_state.for_product(int(product.product_id))
-
         outstanding: Dict[int, float] = {}
         excess: Dict[int, float] = {}
         for comp in components:
@@ -1017,6 +923,48 @@ def create_material_issues(
                 outstanding[cid] = need
             elif need < -1e-9:
                 excess[cid] = -need
+        outstanding_components = [
+            {**comp, "required_qty": outstanding[int(comp["component_item_id"])]}
+            for comp in components
+            if int(comp["component_item_id"]) in outstanding
+        ]
+        unlinked_local = [
+            row for row in existing_rows
+            if str(row.status or "") in {"draft", "requested"}
+            and not _material_issue_has_1c_link(db, row)
+        ]
+
+        # Fully covered linked/posted history remains immutable and is credited
+        # by accepted custody. No feeder lookup is needed when no new local
+        # draft can be exported or extended.
+        if not outstanding and not unlinked_local:
+            for existing in existing_rows:
+                if not existing.warehouse_ref1c:
+                    existing.warehouse_ref1c = resolved_warehouse
+                reused.append(_issue_reuse_payload(existing, product))
+            continue
+        try:
+            feeder_by_item = feeder_warehouse_for_items(db, comp_ids)
+        except ProdFlowFeederUnavailable as exc:
+            errors.append(f"product_id={pid}: {exc}")
+            continue
+        conflicting_local = []
+        for existing in unlinked_local:
+            source_ref = _clean_ref1c(existing.source_warehouse_ref1c)
+            if source_ref == _clean_ref1c(existing.warehouse_ref1c):
+                continue
+            for line in existing.lines or ():
+                expected = feeder_by_item.get(int(line.component_item_id))
+                if source_ref != expected:
+                    conflicting_local.append(
+                        f"issue_id={int(existing.issue_id)} component_item_id={int(line.component_item_id)}"
+                    )
+        if conflicting_local:
+            errors.append(
+                f"product_id={pid}: local material draft uses a non-feeder source; "
+                + ", ".join(conflicting_local[:8])
+            )
+            continue
 
         if excess:
             _shrink_transit_reservations(db, existing_rows, excess)
@@ -1027,12 +975,6 @@ def create_material_issues(
                     existing.warehouse_ref1c = resolved_warehouse
                 reused.append(_issue_reuse_payload(existing, product))
             continue
-
-        outstanding_components = [
-            {**comp, "required_qty": outstanding[int(comp["component_item_id"])]}
-            for comp in components
-            if int(comp["component_item_id"]) in outstanding
-        ]
 
         # Step 1 (planned, applied after source selection succeeds): reserve
         # free stock already on the destination workshop as zero-distance posts.
@@ -1069,27 +1011,24 @@ def create_material_issues(
 
         groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
         if transfer_components:
-            groups, needed_selection = _allocate_components_by_source_warehouse(
-                db,
-                transfer_components,
-                destination_warehouse_ref1c=resolved_warehouse,
-                selected_source_warehouse_ref1c=source_warehouse_ref1c,
-                ledger_generation_id=generation_id,
-                component_source_warehouses=component_source_warehouses,
-                reservation_state=reservation_state,
-            )
-            if needed_selection:
-                selection_required.append(
-                    {
-                        "product_id": int(product.product_id),
-                        "order_number": str(product.order.order_number or ""),
-                        "item_name": str(product.item.item_name or ""),
-                        "components": needed_selection,
-                        "warehouse_candidates": needed_selection[0]["warehouse_candidates"],
-                    }
+            try:
+                groups, pending = _allocate_components_from_prodflow_feeders(
+                    db,
+                    transfer_components,
+                    destination_warehouse_ref1c=resolved_warehouse,
+                    ledger_generation_id=int(generation_id),
+                    reservation_state=reservation_state,
                 )
+            except ProdFlowFeederUnavailable as exc:
+                errors.append(f"product_id={pid}: {exc}")
                 continue
-
+            if pending:
+                feeder_shortages.append({
+                    "product_id": int(product.product_id),
+                    "order_number": str(product.order.order_number or ""),
+                    "item_name": str(product.item.item_name or ""),
+                    "components": pending,
+                })
         if claims:
             already_on_destination.append(
                 {
@@ -1232,6 +1171,7 @@ def create_material_issues(
         "created": created,
         "reused": reused,
         "selection_required": selection_required,
+        "feeder_shortages": feeder_shortages,
         "already_on_destination": already_on_destination,
         "errors": errors,
     }

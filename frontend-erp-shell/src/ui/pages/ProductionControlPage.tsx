@@ -12,13 +12,13 @@ import {
   type ProductionFilters,
   type ProductionControlView,
   type ProductionOperationOption,
-  type WarehouseCandidate,
   type WorkshopWarehouse,
 } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
 import {
   deleteProductionOrder,
   exportMaterialIssuesTo1C,
+  exportProductionOrdersTo1C,
   refreshCurrentProductionOrders,
   fetchRouteSheetsPrintHtml,
   markRouteSheetsPrinted,
@@ -65,7 +65,6 @@ import { DrumSchedulePanel } from './production-control/DrumSchedulePanel'
 import { AssemblyQueuePanel } from './production-control/AssemblyQueuePanel'
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
 import { ProduceDialog, type ProduceChainSide } from './production-control/ProduceDialog'
-import { WarehousePickerDialog } from './production-control/WarehousePickerDialog'
 import { firstExportProblem, issueIdsFromCreateResult, limit } from './production-control/helpers'
 import {
   activeProductionRow,
@@ -183,12 +182,6 @@ export function ProductionControlPage() {
   const [warehouses, setWarehouses] = useState<ControlWarehouse[]>([])
   const [workshopRows, setWorkshopRows] = useState<WorkshopWarehouse[]>([])
   const [ignoredRefs, setIgnoredRefs] = useState<Set<string>>(new Set())
-  const [warehousePickerOpen, setWarehousePickerOpen] = useState(false)
-  const [warehousePickerCandidates, setWarehousePickerCandidates] = useState<WarehouseCandidate[]>([])
-  const [warehousePickerComponents, setWarehousePickerComponents] = useState<Array<{ item_name: string; item_article?: string | null; required_qty: number }>>([])
-  const [warehousePickerProductIds, setWarehousePickerProductIds] = useState<number[]>([])
-  const [warehousePickerSelected, setWarehousePickerSelected] = useState('')
-  const [warehousePickerMode, setWarehousePickerMode] = useState<'issues' | 'export'>('issues')
 
   useEffect(() => {
     filtersRef.current = filters
@@ -424,7 +417,6 @@ export function ProductionControlPage() {
   }
 
   function requestMaterialIssues(
-    sourceWarehouseRef: string | undefined,
     productIds: number[],
     context?: { identities: string[]; sourceRevision: string },
   ) {
@@ -435,7 +427,7 @@ export function ProductionControlPage() {
         || new Set(context.identities).size !== requested.length) {
         throw new Error('Текущие строки материалов недоступны: требуется полный identity и единая revision')
       }
-      return postMaterialIssues(requested, 'erp-shell', sourceWarehouseRef, context.identities, context.sourceRevision)
+      return postMaterialIssues(requested, 'erp-shell', context.identities, context.sourceRevision)
     }
     const actionRows = rows.filter((row) => row.product_id != null && requested.includes(row.product_id))
     const identities = actionRows.map((row) => row.current_identity)
@@ -449,25 +441,7 @@ export function ProductionControlPage() {
     ) {
       throw new Error('Текущие строки материалов недоступны: требуется полный identity и единая revision')
     }
-    return postMaterialIssues(requested, 'erp-shell', sourceWarehouseRef, identities as string[], Array.from(revisions)[0])
-  }
-
-  function showWarehousePicker(result: MaterialIssueCreateResponse, mode: 'issues' | 'export', productIds?: number[]) {
-    const selectionRequired = result.selection_required ?? []
-    if (!selectionRequired.length) return false
-    const candidates = selectionRequired[0].warehouse_candidates
-    const components = selectionRequired.flatMap((item) => item.components ?? [])
-    setWarehousePickerCandidates(candidates)
-    setWarehousePickerComponents(components.map((item) => ({
-      item_name: item.item_name,
-      item_article: item.item_article,
-      required_qty: item.required_qty,
-    })))
-    setWarehousePickerProductIds(productIds?.length ? productIds : selectionRequired.map((item) => item.product_id))
-    setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
-    setWarehousePickerMode(mode)
-    setWarehousePickerOpen(true)
-    return true
+    return postMaterialIssues(requested, 'erp-shell', identities as string[], Array.from(revisions)[0])
   }
 
   function prepareRouteSheetWindow() {
@@ -494,7 +468,11 @@ export function ProductionControlPage() {
       || new Set(identities).size !== requested.length || revisions.size !== 1) {
       throw new Error('Текущие строки исполнения недоступны: требуется полный identity и единая revision')
     }
-    return { identities: identities as string[], sourceRevision: Array.from(revisions)[0] as string }
+    return {
+      identities: identities as string[],
+      sourceRevision: Array.from(revisions)[0] as string,
+      rows: selected,
+    }
   }
 
   async function refreshActionSelection(ids: number[]) {
@@ -605,7 +583,7 @@ export function ProductionControlPage() {
     renderRouteSheets(ids, prepareRouteSheetWindow())
   }
 
-  async function createMaterialIssues(sourceWarehouseRef?: string, productIds?: number[]) {
+  async function createMaterialIssues(productIds?: number[]) {
     const ids = productIds ?? selectedRows.flatMap(productionRowProductIds)
     if (!ids.length) return
     if (!beginDangerousMutation()) return
@@ -613,18 +591,12 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     try {
-      const result = await requestMaterialIssues(sourceWarehouseRef, ids)
-      const selectionRequired = result.selection_required ?? []
+      const result = await requestMaterialIssues(ids)
       const errors = result.errors?.length ?? 0
+      const feederPending = result.feeder_shortages?.length ?? 0
       const alreadyOnDestination = result.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
 
-      if (selectionRequired.length > 0) {
-        showWarehousePicker(result, 'issues')
-        const msg = `Создано документов: ${result.created?.length ?? 0}${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${errors ? `, ошибок ${errors}` : ''}. Для ${selectionRequired.length} поз. нужно выбрать склад-источник.`
-        setMessage(msg)
-      } else {
-        setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
-      }
+      setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${feederPending ? `, ожидают пополнения питателя ${feederPending}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
       await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -634,24 +606,7 @@ export function ProductionControlPage() {
     }
   }
 
-  async function confirmWarehousePicker() {
-    if (!warehousePickerSelected || !warehousePickerProductIds.length) return
-    const mode = warehousePickerMode
-    const productIds = [...warehousePickerProductIds]
-    const sourceRef = warehousePickerSelected
-    setWarehousePickerOpen(false)
-    setWarehousePickerProductIds([])
-    setWarehousePickerCandidates([])
-    setWarehousePickerComponents([])
-    setWarehousePickerSelected('')
-    if (mode === 'export') {
-      await exportTo1C(sourceRef, productIds)
-    } else {
-      await createMaterialIssues(sourceRef, productIds)
-    }
-  }
-
-  async function exportTo1C(sourceWarehouseRef?: string, productIds?: number[]) {
+  async function exportTo1C(productIds?: number[]) {
     let ids = productIds ?? selectedRows.flatMap(productionRowProductIds)
     const workItemIds = productIds == null
       ? selectedRows.flatMap((row) => row.product_id != null || row.work_item_id == null ? [] : [row.work_item_id])
@@ -728,29 +683,56 @@ export function ProductionControlPage() {
         : currentActionSelection(ids)
       const chains = await openPaintWeldChains(ids, chainContext.identities, chainContext.sourceRevision)
       ids = Array.from(new Set(chains.product_ids ?? ids))
+      const contextProductIds = new Set(chainContext.rows.flatMap((row) => (
+        row.product_id == null ? [] : [row.product_id]
+      )))
+      const finalContext = ids.every((productId) => contextProductIds.has(productId))
+        ? chainContext
+        : await refreshActionSelection(ids)
       const materialContext = {
-        identities: chains.current_identities ?? [],
-        sourceRevision: chains.source_revision ?? '',
+        identities: finalContext.identities,
+        sourceRevision: finalContext.sourceRevision,
       }
-      const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids, materialContext)
+      const issueResult = await requestMaterialIssues(ids, materialContext)
       if (issueResult.errors?.length) {
         throw new Error(`Запуск в 1С остановлен: ${issueResult.errors.join('\n')}`)
       }
-      const selectionRequired = issueResult.selection_required ?? []
+      const feederPending = issueResult.feeder_shortages?.length ?? 0
       const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
-      if (selectionRequired.length > 0) {
-        closeRouteSheetWindow(printWindow)
-        showWarehousePicker(issueResult, 'export', ids)
-        setMessage(`${alreadyOnDestination ? `Уже на участке: ${alreadyOnDestination}. ` : ''}Для ${selectionRequired.length} поз. нужно выбрать склад-источник перед выгрузкой в 1С.`)
-        await load(offsetRef.current)
-        return
-      }
       const issueIds = issueIdsFromCreateResult(issueResult)
       if (!issueIds.length) {
-        closeRouteSheetWindow(printWindow)
-        const errors = issueResult.errors?.length ?? 0
-        setMessage(`Запуск в 1С: заявок на перемещение не создано${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
-        await load(offsetRef.current)
+        const orderIds = Array.from(new Set(finalContext.rows.map((row) => row.order_id).filter(
+          (orderId): orderId is number => orderId != null,
+        )))
+        if (!orderIds.length) {
+          closeRouteSheetWindow(printWindow)
+          throw new Error('Созданный заказ недоступен для выгрузки в 1С')
+        }
+        const parent = await exportProductionOrdersTo1C(
+          orderIds, materialContext.identities, materialContext.sourceRevision,
+        )
+        const orderReceipts = successfulProductionOrderReceipts(parent)
+        const ordersCreated = Number(parent.orders_created ?? 0)
+        const ordersExisting = Number(parent.orders_already_linked ?? 0)
+        const ordersError = Number(parent.orders_error ?? 0)
+        const summary = `Запуск в 1С: заказов проведено ${ordersCreated}`
+          + (ordersExisting ? `, заказов уже было ${ordersExisting}` : '')
+          + (feederPending ? `; ожидают пополнения питателя ${feederPending}` : '')
+        if (ordersError || parent.status === 'partial_error') {
+          closeRouteSheetWindow(printWindow)
+          throw new Error(`${summary}, ошибок ${ordersError}`)
+        }
+        const pendingReceipt = {
+          targetRefs: new Set(orderReceipts.map((receipt) => receipt.targetRef)),
+          exportBasisRevision: materialContext.sourceRevision,
+          requiresRevisionMove: ordersCreated > 0,
+        }
+        ids.forEach((productId) => pendingPublicationReceipts.current.set(productId, pendingReceipt))
+        setPublicationPendingIds((current) => new Set([...current, ...ids]))
+        void continuePublishedOrderRefresh(
+          ids, orderReceipts, printWindow, summary, materialContext.sourceRevision,
+          ordersCreated > 0,
+        )
         return
       }
       const result = await exportMaterialIssuesTo1C(
@@ -773,6 +755,7 @@ export function ProductionControlPage() {
         `; перемещений создано ${transfersCreated}` +
         (transfersExisting ? `, перемещений уже было ${transfersExisting}` : '') +
         (internalReserves ? `; заявок без перемещения ${internalReserves} — материал уже на участке` : '') +
+        (feederPending ? `; ожидают пополнения питателя ${feederPending}` : '') +
         (skipped ? `, пропущено ${skipped}` : '') +
         (errored ? `, ошибок ${errored}` : '')
       if (errored > 0 || result.status === 'partial_error' || parent.status === 'partial_error') {
@@ -1493,17 +1476,6 @@ export function ProductionControlPage() {
           )}
           setProduceOpen={setProduceOpen}
           submitProduce={submitProduce}
-        />
-      )}
-      {warehousePickerOpen && warehousePickerCandidates.length > 0 && (
-        <WarehousePickerDialog
-          warehousePickerCandidates={warehousePickerCandidates}
-          warehousePickerComponents={warehousePickerComponents}
-          warehousePickerProductIds={warehousePickerProductIds}
-          warehousePickerSelected={warehousePickerSelected}
-          setWarehousePickerOpen={setWarehousePickerOpen}
-          setWarehousePickerSelected={setWarehousePickerSelected}
-          confirmWarehousePicker={confirmWarehousePicker}
         />
       )}
     </main>

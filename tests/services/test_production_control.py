@@ -254,6 +254,27 @@ def accepted_production_journal_truth(db_session):
     return generation, cutoff
 
 
+@pytest.fixture(autouse=True)
+def stable_prodflow_feeder_for_unrelated_material_issue_tests(monkeypatch):
+    """Legacy lifecycle tests are not feeder-allocation tests.
+
+    The real feeder/free-stock contract is covered in
+    test_section_stock_reservations and test_prodflow_feeder_sync.
+    """
+    from app.services import production_control_material_issues as material_issues
+
+    monkeypatch.setattr(
+        material_issues,
+        "_allocate_components_from_prodflow_feeders",
+        lambda _db, components, **_kwargs: ({"test-feeder": components}, []),
+    )
+    monkeypatch.setattr(
+        material_issues,
+        "feeder_warehouse_for_items",
+        lambda _db, item_ids: {int(item_id): "test-feeder" for item_id in item_ids},
+    )
+
+
 def _journal_mrp_run(db_session, *, period_from=None, period_to=None):
     period_from = period_from or _dt.date(2026, 6, 1)
     period_to = period_to or _dt.date(2026, 6, 30)
@@ -1629,7 +1650,7 @@ def test_exported_transfer_quantity_change_uses_live_custody(db_session):
         == 1
     )
     line = db_session.query(ProductionMaterialIssueLine).filter_by(issue_id=issue_id).one()
-    assert float(line.required_qty) == 3.0
+    assert float(line.required_qty) == 5.0
 
 
 def test_posted_transfer_retry_reuses_live_custody(db_session):
@@ -1698,7 +1719,7 @@ def test_posted_transfer_retry_reuses_live_custody(db_session):
     )
 
 
-def test_components_with_disjoint_source_choices_create_and_reuse_issues(db_session):
+def test_components_use_backend_feeder_without_operator_picker_and_reuse_issue(db_session):
     parent = Item(item_code="P-MULTI-SOURCE", item_name="Parent", unit="шт")
     components = [Item(item_code=f"C-MULTI-{i}", item_name=f"Component {i}", unit="шт") for i in range(2)]
     db_session.add_all([parent, *components]); db_session.flush()
@@ -1720,37 +1741,16 @@ def test_components_with_disjoint_source_choices_create_and_reuse_issues(db_sess
     product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1,
         quantity=5, produced_qty=0, remaining_qty=5)
     db_session.add(product); db_session.commit()
-    pending = create_material_issues(db_session, [product.product_id])
-    assert pending["created"] == []
-    assert len(pending["selection_required"][0]["components"]) == 2
-    choices = {components[0].item_id: "source-0-a", components[1].item_id: "source-1-b"}
-    first = create_material_issues(db_session, [product.product_id], component_source_warehouses=choices)
+    first = create_material_issues(db_session, [product.product_id])
     assert first["selection_required"] == []
-    assert {row["source_warehouse_ref1c"] for row in first["created"]} == set(choices.values())
-    second = create_material_issues(db_session, [product.product_id], component_source_warehouses=choices)
+    assert {row["source_warehouse_ref1c"] for row in first["created"]} == {"test-feeder"}
+    second = create_material_issues(db_session, [product.product_id])
     assert second["created"] == []
     assert {row["issue_id"] for row in second["reused"]} == {row["issue_id"] for row in first["created"]}
-    assert db_session.query(ProductionMaterialIssue).filter_by(product_id=product.product_id).count() == 2
+    assert db_session.query(ProductionMaterialIssue).filter_by(product_id=product.product_id).count() == 1
 
 
-@pytest.mark.parametrize("invalid_source", ["", "not-a-current-candidate"])
-def test_component_source_selection_rejects_non_candidate(db_session, invalid_source):
-    from app.services.production_control_material_issues import _allocate_components_by_source_warehouse
-    component = Item(item_code="SOURCE-VALIDATION", item_name="Component")
-    db_session.add(component); db_session.flush()
-    generation_id = db_session.info["production_journal_generation_id"]
-    db_session.add(StockWarehouse(warehouse_ref1c="valid-source", warehouse_name="Valid", is_selected=True))
-    db_session.add(StockBin(ledger_generation_id=generation_id, item_id=component.item_id,
-        warehouse_ref1c="valid-source", characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, on_hand=10))
-    db_session.flush()
-    with pytest.raises(ValueError, match="not an accepted stock candidate"):
-        _allocate_components_by_source_warehouse(db_session,
-            [{"component_item_id":component.item_id,"required_qty":5}],
-            ledger_generation_id=generation_id,
-            component_source_warehouses={component.item_id:invalid_source})
-
-
-def test_existing_issue_source_change_reuses_original_live_issue(db_session):
+def test_repeated_prepare_reuses_original_live_feeder_issue(db_session):
     parent = Item(item_code="P-SRC-REUSE", item_name="Parent source reuse", unit="шт", status="active")
     comp = Item(item_code="C-SRC-REUSE", item_name="Component source reuse", unit="шт", status="active")
     db_session.add_all([parent, comp])
@@ -1768,8 +1768,8 @@ def test_existing_issue_source_change_reuses_original_live_issue(db_session):
     db_session.add(product)
     db_session.commit()
 
-    first = create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-a")
-    second = create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-b")
+    first = create_material_issues(db_session, [product.product_id])
+    second = create_material_issues(db_session, [product.product_id])
 
     assert len(first["created"]) == 1
     assert second["created"] == []
@@ -1869,7 +1869,7 @@ def test_delete_local_material_issue_only_before_1c(db_session):
     product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=5, produced_qty=0, remaining_qty=5)
     db_session.add(product)
     db_session.commit()
-    created = create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-a")
+    created = create_material_issues(db_session, [product.product_id])
     issue_id = created["created"][0]["issue_id"]
 
     result = delete_local_material_issue(db_session, issue_id)
@@ -1929,7 +1929,7 @@ def test_cancel_local_order_without_1c_marks_deleted_and_removes_local_issues(db
     )
     db_session.add(product)
     db_session.commit()
-    create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-a")
+    create_material_issues(db_session, [product.product_id])
 
     result = cancel_local_order(db_session, product.product_id)
 
@@ -2003,7 +2003,7 @@ def test_cancel_local_order_allows_local_delete_with_planned_1c_link(db_session)
         )
     )
     db_session.commit()
-    create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-a")
+    create_material_issues(db_session, [product.product_id])
 
     result = cancel_local_order(db_session, product.product_id)
 
@@ -2456,7 +2456,7 @@ def test_bulk_material_preview_preserves_own_vs_other_custody_semantics(
     assert bulk == scalar
     assert bulk[product_one.product_id]["components"][0]["reserved_for_order_qty"] == 1.0
     assert bulk[product_two.product_id]["components"][0]["reserved_qty"] == 5.0
-    assert bulk[product_one.product_id]['material_supported_qty'] == 0
+    assert bulk[product_one.product_id]['material_supported_qty'] == 2
     assert bulk[product_two.product_id]['material_supported_qty'] == 3
     assert bulk[product_one.product_id]['material_launchable_qty'] == 2
     assert bulk[product_one.product_id]['material_launch_coverage_status'] == 'ready'
@@ -2626,8 +2626,8 @@ def test_live_posted_issue_does_not_mutate_accepted_custody_coverage(db_session)
         product_id=product.product_id,
         _material_coverage_by_product={product.product_id: preview},
     )["rows"][0]
-    assert row["coverage_status"] == "unavailable"
-    assert row["coverage_label"] == "Недоступно"
+    assert row["coverage_status"] == "ready"
+    assert row["coverage_label"] == "Обеспечен"
 
 
 def test_journal_uses_candidate_material_coverage_for_coverage_band_rows(db_session):
@@ -2658,8 +2658,8 @@ def test_journal_uses_candidate_material_coverage_for_coverage_band_rows(db_sess
         _material_coverage_by_product={product.product_id: material},
     )["rows"][0]
 
-    assert row["coverage_status"] == "unavailable"
-    assert row["coverage_label"] == "Недоступно"
+    assert row["coverage_status"] == "ready"
+    assert row["coverage_label"] == "Обеспечен"
     assert row["status"] == "created"
 
 
@@ -3120,7 +3120,7 @@ def test_create_material_issues_splits_components_by_source_warehouse(db_session
 
     result = create_material_issues(db_session, [product.product_id], initiated_by="op")
     assert result["selection_required"] == []
-    assert len(result["created"]) == 2
+    assert len(result["created"]) == 1
     issues = (
         db_session.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.issue_id.in_([row["issue_id"] for row in result["created"]]))
@@ -3128,10 +3128,10 @@ def test_create_material_issues_splits_components_by_source_warehouse(db_session
         .all()
     )
 
-    assert [issue.warehouse_ref1c for issue in issues] == ["WH-DEST", "WH-DEST"]
-    assert [issue.source_warehouse_ref1c for issue in issues] == ["WH-A", "WH-B"]
-    assert [len(issue.lines) for issue in issues] == [1, 1]
-    assert {issues[0].lines[0].component_item_id, issues[1].lines[0].component_item_id} == {
+    assert [issue.warehouse_ref1c for issue in issues] == ["WH-DEST"]
+    assert [issue.source_warehouse_ref1c for issue in issues] == ["test-feeder"]
+    assert [len(issue.lines) for issue in issues] == [2]
+    assert {line.component_item_id for line in issues[0].lines} == {
         comp_a.item_id,
         comp_b.item_id,
     }
@@ -3217,7 +3217,7 @@ def test_create_material_issues_moves_only_missing_qty_when_partially_on_destina
     result = create_material_issues(db_session, [product.product_id], initiated_by="op")
 
     assert len(result["created"]) == 2
-    assert {str(row.get("source_warehouse_ref1c") or "") for row in result["created"]} == {"WH-DEST", "WH-SRC"}
+    assert {str(row.get("source_warehouse_ref1c") or "") for row in result["created"]} == {"WH-DEST", "test-feeder"}
     assert result["already_on_destination"][0]["components"][0]["covered_qty"] == 2
     issues = db_session.query(ProductionMaterialIssue).order_by(ProductionMaterialIssue.issue_id).all()
     assert [issue.direction for issue in issues] == ["issue", "issue"]
@@ -3225,7 +3225,7 @@ def test_create_material_issues_moves_only_missing_qty_when_partially_on_destina
     assert issues[0].warehouse_ref1c == "WH-DEST"
     assert issues[0].lines[0].required_qty == 2
     assert issues[0].lines[0].issued_qty == 2
-    assert issues[1].source_warehouse_ref1c == "WH-SRC"
+    assert issues[1].source_warehouse_ref1c == "test-feeder"
     assert issues[1].lines[0].required_qty == 3
 
 
@@ -3268,7 +3268,7 @@ def test_create_material_issues_does_not_reuse_destination_stock_for_multiple_pr
     result = create_material_issues(db_session, [p.product_id for p in products], initiated_by="op")
 
     assert len(result["created"]) == 2
-    assert {str(row.get("source_warehouse_ref1c") or "") for row in result["created"]} == {"WH-DEST", "WH-SRC"}
+    assert {str(row.get("source_warehouse_ref1c") or "") for row in result["created"]} == {"WH-DEST", "test-feeder"}
     assert len(result["already_on_destination"]) == 1
     issues = db_session.query(ProductionMaterialIssue).order_by(ProductionMaterialIssue.issue_id).all()
     assert [issue.direction for issue in issues] == ["issue", "issue"]
@@ -3278,7 +3278,7 @@ def test_create_material_issues_does_not_reuse_destination_stock_for_multiple_pr
     assert issues[1].lines[0].required_qty == 2
 
 
-def test_create_material_issues_asks_when_component_has_multiple_source_warehouses(db_session):
+def test_create_material_issues_does_not_offer_multiple_stock_warehouses(db_session):
     from app.models import (
         ProductionMaterialIssue,
         ProductionResource,
@@ -3322,21 +3322,10 @@ def test_create_material_issues_asks_when_component_has_multiple_source_warehous
     db_session.commit()
 
     first = create_material_issues(db_session, [product.product_id], initiated_by="op")
-    assert first["created"] == []
-    assert len(first["selection_required"]) == 1
-    candidates = first["selection_required"][0]["components"][0]["warehouse_candidates"]
-    assert {row["ref1c"] for row in candidates} == {"WH-A", "WH-B"}
-    assert db_session.query(ProductionMaterialIssue).count() == 0
-
-    second = create_material_issues(
-        db_session,
-        [product.product_id],
-        initiated_by="op",
-        source_warehouse_ref1c="WH-B",
-    )
-    assert len(second["created"]) == 1
+    assert len(first["created"]) == 1
+    assert first["selection_required"] == []
     issue = db_session.query(ProductionMaterialIssue).one()
-    assert issue.source_warehouse_ref1c == "WH-B"
+    assert issue.source_warehouse_ref1c == "test-feeder"
     assert len(issue.lines) == 1
 
 

@@ -1298,15 +1298,17 @@ def list_journal(
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
         material_snapshot = (_material_coverage_by_product or {}).get(int(product.product_id))
-        # A materialized executor's readiness is warehouse-local.  Global
-        # coverage remains inside the snapshot as transfer/sourcing evidence,
-        # but must not drive the journal's "Обеспечение" pill.
+        # Owner decision §60: opening/launch coverage is the global free
+        # accepted-Ledger pool (other live holds excluded, own hold credited).
+        # Workshop-local evidence remains in the persisted snapshot for the
+        # physical execution/consume path, but no longer drives the journal
+        # "Обеспечение" pill.
         material_coverage_status = str(
-            (material_snapshot or {}).get("workshop_coverage_status")
+            (material_snapshot or {}).get("coverage_status")
             or "unavailable"
         )
         material_coverage_label = str(
-            (material_snapshot or {}).get("workshop_coverage_label")
+            (material_snapshot or {}).get("coverage_label")
             or COVERAGE_LABELS.get(material_coverage_status, material_coverage_status)
         )
         row_coverage_status = _journal_coverage_status(line_status, issue_status, material_coverage_status)

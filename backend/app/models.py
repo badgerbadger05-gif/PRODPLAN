@@ -2791,6 +2791,41 @@ class ShelfPolicy(Base):
     item = relationship("Item")
 
 
+class ProdFlowFeederAssignment(Base):
+    """Static one-time feeder assignment captured from ProdFlow."""
+
+    __tablename__ = "prodflow_feeder_assignment"
+    __table_args__ = (
+        UniqueConstraint("item_id", name="uq_prodflow_feeder_assignment_item"),
+        Index("ix_prodflow_feeder_assignment_warehouse", "warehouse_ref1c"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id", ondelete="RESTRICT"), nullable=False, index=True)
+    warehouse_ref1c = Column(String(36), nullable=False)
+    source_item_code = Column(String(100), nullable=False)
+    route_class = Column(String(100), nullable=True)
+    source_revision = Column(String(64), nullable=False, index=True)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
+    item = relationship("Item")
+
+
+class ProdFlowFeederManifest(Base):
+    """Singleton checksum/provenance for the loaded static configuration."""
+
+    __tablename__ = "prodflow_feeder_manifest"
+
+    id = Column(Integer, primary_key=True)
+    status = Column(String(16), nullable=False)
+    source_revision = Column(String(64), nullable=False)
+    row_count = Column(Integer, nullable=False, default=0, server_default="0")
+    loaded_at = Column(DateTime(timezone=True), nullable=False)
+    source_name = Column(String(100), nullable=False, server_default="ProdFlowSupermarketPosition")
+    last_error = Column(TEXT, nullable=True)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 class ShelfProjection(Base):
     """Immutable generation-bound timing projection of existing MRP demand."""
 

@@ -1012,7 +1012,7 @@ def test_bulk_make_material_snapshot_preserves_negative_synthetic_product_identi
     assert bulk[-int(reservation.id)] == scalar
     component = scalar["components"][0]
     assert component["reserved_for_order_qty"] == 7
-    assert component["missing_qty"] == 3
+    assert component["missing_qty"] == 0
 
 
 def test_candidate_builder_loads_custody_per_bulk_phase_not_per_make_row(
@@ -2085,7 +2085,7 @@ def test_public_current_read_is_paged_and_stable_after_live_mutation(db_session)
     assert get_materials_snapshot(db_session, product.product_id) == material_first
 
 
-def test_legacy_current_material_snapshot_is_unavailable_until_republished(db_session):
+def test_global_journal_coverage_survives_missing_workshop_detail_until_republished(db_session):
     generation = _building_generation(db_session, "production-journal-legacy-material")
     _item, _order, product = _journal_line(db_session)
     snapshot = _build_candidate(db_session, generation.id, accepted_run_ids=[])
@@ -2113,10 +2113,65 @@ def test_legacy_current_material_snapshot_is_unavailable_until_republished(db_se
     db_session.commit()
 
     public = read_current_projection(db_session, limit=20, offset=0)["rows"][0]
-    assert public["coverage_status"] == "unavailable"
-    assert public["coverage_label"] == "Недоступно"
+    # Owner decision §60: the journal launch pill is global accepted free
+    # stock.  Missing workshop-local fields still block the detailed execution
+    # card below, but no longer erase valid global launch coverage.
+    assert public["coverage_status"] == "ready"
+    assert public["coverage_label"] == "Обеспечен"
     with pytest.raises(CurrentExecutionUnavailable, match="warehouse-local evidence"):
         get_materials_snapshot(db_session, product.product_id)
+
+
+def test_published_material_snapshot_exposes_prodflow_feeder_pending(db_session):
+    from app.services.prodflow_feeder_config import publish_prodflow_feeder_assignments
+
+    generation = _building_generation(db_session, "production-journal-feeder-fields")
+    item, _order, product = _journal_line(db_session)
+    component = models.Item(
+        item_code="SNAP-FEEDER-COMP", item_name="Feeder component",
+        item_article="SNAP-FEEDER", unit="шт", status="active",
+    )
+    spec = models.Specification(
+        spec_name="Snapshot feeder spec", spec_ref1c="snapshot-feeder-spec",
+    )
+    db_session.add_all((component, spec))
+    db_session.flush()
+    db_session.add_all((
+        models.DefaultSpecification(item_id=int(item.item_id), spec_id=int(spec.spec_id)),
+        models.SpecComponent(spec_id=int(spec.spec_id), item_id=int(component.item_id), quantity=1),
+    ))
+    feeder = models.StockWarehouse(
+        warehouse_ref1c="FEEDER-A", warehouse_code="FA",
+        warehouse_name="Питатель A", is_selected=True,
+    )
+    db_session.add(feeder)
+    db_session.flush()
+    publish_prodflow_feeder_assignments(
+        db_session,
+        positions=[{
+            "name": "position-feeder-a", "item": component.item_code,
+            "warehouse": feeder.warehouse_name, "is_active": 1,
+        }],
+        warehouses=[{
+            "name": feeder.warehouse_name,
+            "custom_ref1c": feeder.warehouse_ref1c,
+        }],
+        observed_at=datetime.now(timezone.utc),
+    )
+    snapshot = _build_candidate(db_session, generation.id, accepted_run_ids=[])
+    _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation, snapshot)
+
+    material = get_materials_snapshot(db_session, product.product_id)
+    row = next(
+        value for value in material["components"]
+        if int(value["component_item_id"]) == int(component.item_id)
+    )
+    assert row["feeder_warehouse_ref1c"] == "FEEDER-A"
+    assert row["feeder_warehouse_name"] == "Питатель A"
+    assert row["feeder_free_qty"] == 0
+    assert row["feeder_pending_qty"] == pytest.approx(row["required_qty"])
+    assert row["feeder_source_revision"]
 
 
 def test_operator_quantity_is_live_while_accepted_output_stays_frozen(db_session):

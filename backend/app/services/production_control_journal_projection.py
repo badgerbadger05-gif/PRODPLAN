@@ -101,7 +101,7 @@ def _public_journal_row(payload: Mapping[str, Any]) -> dict[str, Any]:
     snapshot = row.get("material_coverage_snapshot")
     if row.get("product_id") is not None and (
         not isinstance(snapshot, Mapping)
-        or snapshot.get("workshop_coverage_status") in (None, "")
+        or snapshot.get("coverage_status") in (None, "")
     ):
         row["coverage_status"] = "unavailable"
         row["coverage_label"] = "Недоступно"

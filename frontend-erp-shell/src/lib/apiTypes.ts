@@ -5113,12 +5113,6 @@ export interface components {
             initiated_by?: string | null;
             /** Warehouse Ref1C */
             warehouse_ref1c?: string | null;
-            /** Source Warehouse Ref1C */
-            source_warehouse_ref1c?: string | null;
-            /** Component Source Warehouses */
-            component_source_warehouses?: {
-                [key: string]: string;
-            };
             /** Current Identities */
             current_identities?: string[];
             /** Expected Source Revision */

@@ -989,6 +989,18 @@ def test_welded_material_issues_use_frozen_bom_after_default_spec_change(
             custody_projection.MaterialCustodyState(),
         ),
     )
+    monkeypatch.setattr(
+        material_issues,
+        "feeder_warehouse_for_items",
+        lambda _db, item_ids: {
+            int(item_id): "warehouse-source" for item_id in item_ids
+        },
+    )
+    monkeypatch.setattr(
+        material_issues,
+        "_allocate_components_from_prodflow_feeders",
+        lambda _db, components, **_kwargs: ({"warehouse-source": components}, []),
+    )
 
     result = open_paint_chain(
         db,

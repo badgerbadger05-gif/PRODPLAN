@@ -29,6 +29,8 @@ from app.models import (
     WorkshopWarehouseBinding,
     PhysicalImportBatch,
     LedgerGeneration,
+    ProdFlowFeederAssignment,
+    ProdFlowFeederManifest,
 )
 from app.services import production_control_material_availability as material_availability
 from app.services.production_control_material_availability import preview_materials
@@ -96,6 +98,27 @@ def _set_stock(db, item: Item, breakdown: dict[str, float]):
     db.commit()
 
 
+def _set_feeder(db, item: Item, warehouse_ref1c: str):
+    db.query(ProdFlowFeederAssignment).filter_by(item_id=item.item_id).delete()
+    manifest = db.get(ProdFlowFeederManifest, 1)
+    if manifest is None:
+        manifest = ProdFlowFeederManifest(id=1)
+        db.add(manifest)
+    manifest.status = "complete"
+    manifest.source_revision = "test-feeder-revision"
+    manifest.row_count = 1
+    manifest.loaded_at = datetime.now().astimezone()
+    manifest.source_name = "ProdFlowSupermarketPosition"
+    manifest.last_error = None
+    db.add(ProdFlowFeederAssignment(
+        item_id=item.item_id,
+        warehouse_ref1c=warehouse_ref1c,
+        source_item_code=str(item.item_code),
+        source_revision=manifest.source_revision,
+    ))
+    db.commit()
+
+
 def _make_order_line(db, parent: Item, *, order_qty: float, suffix: str):
     order = ProductionOrder(
         order_number=f"O-{suffix}",
@@ -151,6 +174,8 @@ def _setup(db, *, qty_per_unit=1.0, order_qty=8.0, suffix="A"):
     db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=qty_per_unit))
     db.commit()
+    if db.query(StockWarehouse).filter_by(warehouse_ref1c=SOURCE_WH).first() is not None:
+        _set_feeder(db, comp, SOURCE_WH)
     product = _make_order_line(db, parent, order_qty=order_qty, suffix=suffix)
     return parent, comp, product
 
@@ -204,6 +229,107 @@ def _seed_accepted_custody_projection(db, *, product, component, qty: float) -> 
     )
     db.commit()
     db.expire_all()
+
+
+def test_global_free_allows_launch_but_zero_feeder_creates_no_fake_custody(db_session):
+    db = db_session
+    other = "wh-other"
+    _add_warehouses(db, selected=(WORKSHOP_WH, SOURCE_WH, other))
+    _parent, component, product = _setup(db, order_qty=10, suffix="GLOBAL-FEEDER-ZERO")
+    _set_feeder(db, component, SOURCE_WH)
+    _set_stock(db, component, {SOURCE_WH: 0, other: 100})
+
+    materials = preview_materials(db, product.product_id)
+    assert materials["coverage_status"] == "ready"
+    assert materials["components"][0]["available_qty"] == pytest.approx(100)
+    assert materials["components"][0]["feeder_warehouse_ref1c"] == SOURCE_WH
+    assert materials["components"][0]["feeder_free_qty"] == pytest.approx(0)
+    assert materials["components"][0]["feeder_pending_qty"] == pytest.approx(10)
+
+    result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    assert result["created"] == []
+    pending = result["feeder_shortages"][0]["components"][0]
+    assert pending["feeder_warehouse_ref1c"] == SOURCE_WH
+    assert pending["available_at_feeder_qty"] == 0
+    assert pending["pending_qty"] == pytest.approx(10)
+    assert db.query(ProductionMaterialCustodyEvent).filter_by(
+        product_id=product.product_id,
+    ).count() == 0
+
+
+def test_partial_feeder_allocates_only_free_feeder_qty_and_leaves_remainder_pending(db_session):
+    db = db_session
+    other = "wh-other-partial"
+    _add_warehouses(db, selected=(WORKSHOP_WH, SOURCE_WH, other))
+    _parent, component, product = _setup(db, order_qty=10, suffix="GLOBAL-FEEDER-PARTIAL")
+    _set_feeder(db, component, SOURCE_WH)
+    _set_stock(db, component, {SOURCE_WH: 4, other: 100})
+
+    result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    assert len(result["created"]) == 1
+    issue = db.get(ProductionMaterialIssue, result["created"][0]["issue_id"])
+    assert issue.source_warehouse_ref1c == SOURCE_WH
+    assert issue.lines[0].required_qty == pytest.approx(4)
+    pending = result["feeder_shortages"][0]["components"][0]
+    assert pending["pending_qty"] == pytest.approx(6)
+    custody = db.query(ProductionMaterialCustodyEvent).filter_by(
+        product_id=product.product_id, source_kind="issue_created",
+    ).one()
+    assert custody.warehouse_ref1c == SOURCE_WH
+    assert custody.delta_qty == pytest.approx(4)
+    refreshed = preview_materials(db, product.product_id)["components"][0]
+    assert refreshed["feeder_warehouse_ref1c"] == SOURCE_WH
+    assert refreshed["feeder_pending_qty"] == pytest.approx(6)
+
+    repeated = create_material_issues(
+        db, [product.product_id], warehouse_ref1c=WORKSHOP_WH,
+    )
+    assert repeated["created"] == []
+    assert repeated["reused"] == []
+    assert repeated["feeder_shortages"][0]["components"][0][
+        "pending_qty"
+    ] == pytest.approx(6)
+    assert db.query(ProductionMaterialIssue).filter_by(
+        product_id=product.product_id,
+    ).count() == 1
+    assert db.query(ProductionMaterialCustodyEvent).filter_by(
+        product_id=product.product_id, source_kind="issue_created",
+    ).count() == 1
+
+    _set_stock(db, component, {SOURCE_WH: 10, other: 100})
+    refilled = create_material_issues(
+        db, [product.product_id], warehouse_ref1c=WORKSHOP_WH,
+    )
+    assert refilled["created"] == []
+    assert len(refilled["reused"]) == 1
+    assert refilled["feeder_shortages"] == []
+    db.refresh(issue)
+    assert issue.lines[0].required_qty == pytest.approx(10)
+    assert preview_materials(db, product.product_id)["components"][0][
+        "feeder_pending_qty"
+    ] == pytest.approx(0)
+
+
+def test_missing_feeder_binding_fails_clear_without_warehouse_picker(db_session):
+    db = db_session
+    _add_warehouses(db)
+    _parent, component, product = _setup(db, order_qty=2, suffix="NO-FEEDER")
+    db.query(ProdFlowFeederAssignment).delete()
+    db.query(ProdFlowFeederManifest).delete()
+    db.commit()
+    _set_stock(db, component, {SOURCE_WH: 20})
+
+    result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    assert result["created"] == []
+    assert result["selection_required"] == []
+    assert "ProdFlow feeder assignments are not imported" in result["errors"][0]
+
+
+def test_manual_source_override_is_rejected(db_session):
+    with pytest.raises(ValueError, match="Ручной выбор склада-источника отменён"):
+        create_material_issues(
+            db_session, [], source_warehouse_ref1c="operator-choice",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -452,8 +578,10 @@ def test_fully_held_physical_workshop_cell_cannot_create_another_local_claim(db_
         product_id=current.product_id,
         _material_coverage_by_product={current.product_id: before},
     )["rows"][0]
-    assert journal_row["coverage_status"] == "shortage"
-    assert journal_row["coverage_label"] == "Дефицит"
+    # §60: the journal launch pill uses global free stock; the detail card
+    # still exposes workshop shortage and prevents physical consumption.
+    assert journal_row["coverage_status"] == "ready"
+    assert journal_row["coverage_label"] == "Обеспечен"
 
     overheld_row = (
         db.query(ProductionMaterialCustodyProjection)
@@ -569,7 +697,8 @@ def test_create_material_issues_fully_from_workshop_marks_line_assembled(db_sess
     second = create_material_issues(
         db, [product_b.product_id], warehouse_ref1c=WORKSHOP_WH
     )
-    assert len(second["created"]) == 2
+    assert len(second["created"]) == 1
+    assert second["feeder_shortages"][0]["components"][0]["pending_qty"] == pytest.approx(6)
     assert len(second["already_on_destination"]) == 1
     covered = second["already_on_destination"][0]["components"][0]
     assert covered["covered_qty"] == pytest.approx(2.0)

@@ -210,11 +210,10 @@ export function updateOrderStatus(
   })
 }
 
-export function postMaterialIssues(productIds: number[], initiatedBy: string, sourceWarehouseRef?: string, currentIdentities: string[] = [], expectedSourceRevision?: string | null) {
+export function postMaterialIssues(productIds: number[], initiatedBy: string, currentIdentities: string[] = [], expectedSourceRevision?: string | null) {
   const body: ApiSchemas['MaterialIssueCreatePayload'] = {
     product_ids: productIds,
     initiated_by: initiatedBy,
-    ...(sourceWarehouseRef ? { source_warehouse_ref1c: sourceWarehouseRef } : {}),
     current_identities: currentIdentities,
     expected_source_revision: expectedSourceRevision,
   }
@@ -276,6 +275,24 @@ export function exportMaterialIssuesTo1C(
     expected_source_revision: expectedSourceRevision,
   }
   return api<MaterialIssueExportResponse>('/v1/production-control/material-issues/export-to-1c', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function exportProductionOrdersTo1C(
+  orderIds: number[],
+  currentIdentities: string[],
+  expectedSourceRevision: string,
+) {
+  const payload: ApiSchemas['ExportProductionOrdersPayload'] = {
+    order_ids: orderIds,
+    dry_run: false,
+    allow_production: true,
+    current_identities: currentIdentities,
+    expected_source_revision: expectedSourceRevision,
+  }
+  return api<Record<string, unknown>>('/v1/production-control/orders/export-to-1c', {
     method: 'POST',
     body: JSON.stringify(payload),
   })

@@ -67,6 +67,15 @@ export type MaterialRow = {
   workshop_coverage_status?: string | null
   workshop_coverage_label?: string | null
   workshop_availability_reason?: string | null
+  feeder_warehouse_ref1c?: string | null
+  feeder_warehouse_name?: string | null
+  feeder_source_revision?: string | null
+  feeder_stock_qty?: number | null
+  feeder_free_qty?: number | null
+  feeder_pending_qty?: number | null
+  feeder_status?: string | null
+  feeder_label?: string | null
+  feeder_unavailable_reason?: string | null
   reserved_orders?: Array<{
     product_id: number
     order_id?: number | null
@@ -167,6 +176,21 @@ export type MaterialIssueCreateResponse = {
       item_article?: string | null
       required_qty: number
       warehouse_candidates: WarehouseCandidate[]
+    }>
+  }>
+  feeder_shortages?: Array<{
+    product_id: number
+    order_number?: string
+    item_name?: string
+    components: Array<{
+      component_item_id: number
+      item_name: string
+      item_article?: string | null
+      feeder_warehouse_ref1c: string
+      required_qty: number
+      available_at_feeder_qty: number
+      pending_qty: number
+      reason: string
     }>
   }>
   already_on_destination?: Array<{

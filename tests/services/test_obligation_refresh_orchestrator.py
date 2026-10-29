@@ -1942,7 +1942,6 @@ def test_source_warehouse_options_survive_an_obligation_refresh(db_session):
     pointer``.
     """
     from app.services.production_control_material_issues import (
-        _auto_select_source_warehouse,
         _source_warehouse_options,
     )
 
@@ -1980,11 +1979,6 @@ def test_source_warehouse_options_survive_an_obligation_refresh(db_session):
         db_session, [int(item.item_id)], ledger_generation_id=pointer,
     )
     assert [row["ref1c"] for row in options[int(item.item_id)]] == ["WH-OUT"]
-    selected, candidates = _auto_select_source_warehouse(
-        db_session, [int(item.item_id)], ledger_generation_id=pointer,
-    )
-    assert selected == "WH-OUT"
-    assert [row["ref1c"] for row in candidates] == ["WH-OUT"]
 
 
 # --- Item 27 ---------------------------------------------------------------------

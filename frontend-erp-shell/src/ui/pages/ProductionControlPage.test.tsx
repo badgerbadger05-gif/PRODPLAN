@@ -38,6 +38,7 @@ vi.mock('../../services/productionControl', () => ({
   fetchRouteSheetsPrintHtml: vi.fn(),
   markRouteSheetsPrinted: vi.fn(),
   exportMaterialIssuesTo1C: vi.fn(),
+  exportProductionOrdersTo1C: vi.fn(),
   refreshCurrentProductionOrders: vi.fn(),
   markMaterialIssueAssembled: vi.fn(),
   syncExecutionFrom1C: vi.fn(),
@@ -73,6 +74,7 @@ import {
   updateOrderStatus,
   postMaterialIssues,
   exportMaterialIssuesTo1C,
+  exportProductionOrdersTo1C,
   refreshCurrentProductionOrders,
   syncExecutionFrom1C,
   deleteProductionOrder,
@@ -418,6 +420,10 @@ beforeEach(() => {
     parent_orders_export: { orders_created: 1, orders_already_linked: 0, orders_error: 0, status: 'ok' },
     entries: [],
     skipped_rows: [],
+  })
+  vi.mocked(exportProductionOrdersTo1C).mockResolvedValue({
+    status: 'ok', orders_created: 1, orders_already_linked: 0,
+    orders_error: 0, entries: [], skipped_rows: [],
   })
   vi.mocked(syncExecutionFrom1C).mockResolvedValue({
     orders: { orders_updated: 1, errors: [] },
@@ -1172,6 +1178,34 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.queryByText('На складе')).not.toBeInTheDocument()
   })
 
+  it('shows global launch coverage and feeder pending without a local warehouse pill', async () => {
+    vi.mocked(getOrderMaterials).mockResolvedValue({
+      ...fakeMaterials(),
+      coverage_status: 'ready',
+      coverage_label: 'Обеспечен',
+      workshop_coverage_status: 'unavailable',
+      workshop_coverage_label: 'Недоступно',
+      components: [{
+        ...fakeMaterials().components[0],
+        coverage_status: 'ready', coverage_label: 'Обеспечен',
+        workshop_coverage_status: 'unavailable',
+        workshop_coverage_label: 'Недоступно',
+        stock_qty: 100, reserved_qty: 20, reserved_for_order_qty: 10,
+        available_qty: 70,
+        feeder_warehouse_name: 'Питатель сварки',
+        feeder_free_qty: 0, feeder_pending_qty: 30,
+      }],
+    })
+    renderPage()
+
+    expect(await screen.findByText('Общий физический остаток: 100')).toBeInTheDocument()
+    expect(screen.getByText('Свободно без закрепления: 70')).toBeInTheDocument()
+    expect(screen.getByText('Закреплено под эту строку: 10')).toBeInTheDocument()
+    expect(screen.getByText('Ожидает пополнения питателя: 30')).toBeInTheDocument()
+    expect(screen.queryByText(/На участке физически/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Выберите склад-источник/)).not.toBeInTheDocument()
+  })
+
   it('double-clicking a row opens saved materials without requesting a refresh', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -1250,12 +1284,38 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(exportBtn)
 
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
-      [101], 'erp-shell', undefined, ['production:order:101'], 'rev-7',
+      [101], 'erp-shell', ['production:order:101'], 'rev-7',
     ))
     // issue_id 1 from postMaterialIssues result flows into the 1C export.
     await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith(
       [1], ['production:order:101'], 'rev-7',
     ))
+  })
+
+  it('opens the parent order when feeder is empty without creating a transfer', async () => {
+    vi.mocked(postMaterialIssues).mockResolvedValue({
+      status: 'ok', created: [], reused: [], selection_required: [],
+      feeder_shortages: [{
+        product_id: 101, components: [{
+          component_item_id: 501, item_name: 'Материал',
+          feeder_warehouse_ref1c: 'FEEDER', required_qty: 10,
+          available_at_feeder_qty: 0, pending_qty: 10,
+          reason: 'feeder_stock_insufficient',
+        }],
+      }],
+      already_on_destination: [], errors: [],
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+
+    await waitFor(() => expect(exportProductionOrdersTo1C).toHaveBeenCalledWith(
+      [101], ['production:order:101'], 'rev-7',
+    ))
+    expect(exportMaterialIssuesTo1C).not.toHaveBeenCalled()
+    expect(screen.queryByText(/Выберите склад-источник/)).not.toBeInTheDocument()
   })
 
   it('launches an order created after cutoff without materializing its retained work item again', async () => {
@@ -1287,7 +1347,7 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
 
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
-      [101], 'erp-shell', undefined, ['production:order:101'], 'rev-7',
+      [101], 'erp-shell', ['production:order:101'], 'rev-7',
     ))
     await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith(
       [1], ['production:order:101'], 'rev-7',
@@ -1361,7 +1421,7 @@ describe('ProductionControlPage — characterization', () => {
     }], ['production:order:101'], 'rev-7', true))
     await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([901], ['production:order:101'], 'rev-8'))
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
-      [901], 'erp-shell', undefined, ['production:order:101'], 'rev-8',
+      [901], 'erp-shell', ['production:order:101'], 'rev-8',
     ))
     await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith(
       [1], ['production:order:101'], 'rev-8',
@@ -1574,14 +1634,11 @@ describe('ProductionControlPage — characterization', () => {
         required_qty: 400, missing_qty: 574 }],
     })
     renderPage()
-    expect(await screen.findByText('Участок: Участок сварочный')).toBeInTheDocument()
-    expect(screen.getByText('На участке физически: 52')).toBeInTheDocument()
-    expect(screen.getByText('На участке под другие заказы: 52')).toBeInTheDocument()
-    expect(screen.getByText('На участке свободно: 0')).toBeInTheDocument()
-    expect(screen.getByText('Все склады физически: 318')).toBeInTheDocument()
-    expect(screen.getByText('Все склады под другие заказы: 492')).toBeInTheDocument()
-    expect(screen.getByText('Все склады не удержано (справочно): -174')).toBeInTheDocument()
+    expect(await screen.findByText('Общий физический остаток: 318')).toBeInTheDocument()
+    expect(screen.getByText('Удержано под другие заказы: 492')).toBeInTheDocument()
+    expect(screen.getByText('Свободно без закрепления: -174')).toBeInTheDocument()
     expect(screen.getByText('Дефицит: 574')).toBeInTheDocument()
+    expect(screen.queryByText(/На участке физически/)).not.toBeInTheDocument()
     expect(screen.queryByText('есть -174')).not.toBeInTheDocument()
   })
 
@@ -1720,9 +1777,15 @@ describe('ProductionControlPage — characterization', () => {
         counterpart_item_name: 'Кронштейн после сварки', counterpart_item_article: 'WELD-1', counterpart_item_code: '',
       },
     } as OrderRow
-    vi.mocked(listProductionOrders).mockResolvedValue({
-      rows: [paint, { ...fakeRows()[1] }], total: 2, limit: 100, offset: 0, latest_run_id: 77,
-      truth_meta: fakeTruthMeta,
+    vi.mocked(listProductionOrders).mockImplementation(async (params) => {
+      const all = [paint, { ...fakeRows()[1] }]
+      const productId = Number(params.get('product_id') || 0)
+      const selected = productId ? all.filter((row) => row.product_id === productId) : all
+      return {
+        rows: selected, total: selected.length, limit: 100, offset: 0,
+        latest_run_id: 77,
+        truth_meta: productId ? { ...fakeTruthMeta, truth_status: 'accepted' } : fakeTruthMeta,
+      }
     })
     vi.mocked(openPaintWeldChains).mockResolvedValue({
       status: 'ok', product_ids: [101, 102], entries: [], errors: [],
@@ -1741,7 +1804,7 @@ describe('ProductionControlPage — characterization', () => {
     )
     await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([101], ['production:order:101'], 'rev-7'))
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
-      [101, 102], 'erp-shell', undefined, ['production:order:101', 'production:order:102'], 'rev-7',
+      [101, 102], 'erp-shell', ['production:order:101', 'production:order:102'], 'rev-7',
     ))
   })
 
