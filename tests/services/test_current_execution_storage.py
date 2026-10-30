@@ -6,6 +6,7 @@ import pytest
 
 from app import models
 from app.services import planning_truth
+from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     load_current_execution_rows,
@@ -20,7 +21,9 @@ def _generation(db, key):
         generation_key=key,
         status="accepted",
         cutoff=cutoff,
-        source_watermarks={},
+        source_watermarks={
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+        },
         capabilities={},
         physical_import_batch=models.PhysicalImportBatch(
             batch_key=f"batch-{key}",

@@ -15,9 +15,13 @@ from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 def _accepted(db, key="one"):
     cutoff = datetime(2026, 7, 23, tzinfo=timezone.utc)
     batch = models.PhysicalImportBatch(batch_key=f"mi-{key}", status="completed", cutoff=cutoff, source_watermarks={})
+    mutation_state = db.get(models.AcceptedProductionMutationState, 1)
+    mutation_epoch = int(mutation_state.last_issued_epoch or 0) if mutation_state else 0
     generation = models.LedgerGeneration(
         generation_key=f"mi-{key}", status="accepted", cutoff=cutoff, accepted_at=cutoff,
-        physical_import_batch=batch, source_watermarks={}, capabilities={}, algorithm_version="test",
+        physical_import_batch=batch,
+        source_watermarks={"accepted_production_mutation_epoch": mutation_epoch},
+        capabilities={}, algorithm_version="test",
     )
     db.add_all((batch, generation)); db.flush()
     planning_truth.publish_generation(db, generation)

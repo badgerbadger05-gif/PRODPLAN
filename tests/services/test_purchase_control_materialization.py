@@ -12,6 +12,7 @@ import pytest
 from app import models
 from app.services.item_ledger.reservation import replenishment_execution_pct
 from app.services import planning_truth
+from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
 from app.services import purchase_control_materialization as pcm
 from app.services.purchase_control_materialization import (
     PurchaseControlMaterializationError,
@@ -281,6 +282,10 @@ def _stale_generation_fixture(db):
     current_generation.status = "accepted"
     current_generation.accepted_at = datetime(2026, 7, 24, 13, tzinfo=timezone.utc)
     current_generation.capabilities = dict(CAPABILITIES)
+    current_generation.source_watermarks = {
+        **dict(current_generation.source_watermarks or {}),
+        "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+    }
     payload = deepcopy(old_snapshot.payload)
     payload["meta"] = dict(payload.get("meta") or {})
     payload["meta"].update(

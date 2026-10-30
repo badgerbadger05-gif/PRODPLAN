@@ -646,7 +646,7 @@ def test_retention_holds_only_the_provenance_table_while_evidence_is_missing(
     from app.services.item_ledger import execution_projection_retention as retention
 
     monkeypatch.setattr(
-        retention, "_assert_current_execution_coverage", lambda db, gid: None,
+        retention, "_assert_current_execution_coverage", lambda db, gid, **kw: None,
     )
     monkeypatch.setattr(
         retention, "_provenance_prune_is_safe",

@@ -114,6 +114,7 @@ BEGIN
           FROM (
               VALUES
                   ('planning_truth_state', 'current_generation_id', 'ledger_generation'),
+                  ('accepted_production_mutation', 'accepted_generation_id', 'ledger_generation'),
                   ('production_plan_correction', 'expected_generation_id', 'ledger_generation'),
                   ('production_plan_correction', 'published_generation_id', 'ledger_generation'),
                   ('production_material_issues', 'ledger_generation_id', 'ledger_generation'),
@@ -309,6 +310,11 @@ SELECT setval(
 ALTER TABLE planning_truth_state
     ADD CONSTRAINT planning_truth_state_current_generation_id_fkey
     FOREIGN KEY (current_generation_id)
+    REFERENCES ledger_generation(id)
+    ON DELETE RESTRICT;
+ALTER TABLE accepted_production_mutation
+    ADD CONSTRAINT accepted_production_mutation_accepted_generation_id_fkey
+    FOREIGN KEY (accepted_generation_id)
     REFERENCES ledger_generation(id)
     ON DELETE RESTRICT;
 ALTER TABLE production_plan_correction

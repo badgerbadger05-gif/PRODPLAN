@@ -224,12 +224,24 @@ def _generations(db_session):
     )
     target = models.LedgerGeneration(
         generation_key="bounded-replay-target", status="building", cutoff=TARGET_CUTOFF,
-        source_watermarks={}, capabilities={}, physical_import_batch=target_batch,
+        source_watermarks={
+            "accepted_production_mutation_epoch": 0,
+        }, capabilities={}, physical_import_batch=target_batch,
         algorithm_version="bounded-replay-tests",
     )
     db_session.add_all([parent, target])
     db_session.flush()
-    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    db_session.add_all([
+        models.PlanningTruthState(id=1, current_generation_id=parent.id),
+        models.AcceptedProductionMutationState(id=1),
+        models.ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(parent.id),
+            baseline_generation_id=int(parent.id),
+            cutoff=PARENT_CUTOFF,
+            status="complete",
+            source_event_high_watermark_id=0,
+        ),
+    ])
     db_session.commit()
     return parent, target, parent_batch, target_batch
 
@@ -389,7 +401,7 @@ def _patch_payloads(monkeypatch, *, evidence=()):
         lambda *a, **kw: {"rows": [], "meta": {}},
     )
     monkeypatch.setattr(
-        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+        publisher, "install_verified_material_custody_handoff", lambda *a, **kw: None,
     )
     monkeypatch.setattr(publisher, "publish_current_execution_scope", lambda *a, **kw: Result())
     monkeypatch.setattr(
@@ -409,7 +421,7 @@ def _patch_payloads(monkeypatch, *, evidence=()):
     )
     monkeypatch.setattr(publisher, "publish_generation", lambda db, target, **kw: None)
     monkeypatch.setattr(
-        publisher, "publish_current_future_supply", lambda db, generation_id: {},
+        publisher, "publish_current_future_supply", lambda db, generation_id, **kw: {},
     )
     monkeypatch.setattr(publisher, "_fixed_run_ids", lambda db: ())
     monkeypatch.setattr(
@@ -1128,14 +1140,10 @@ def test_untyped_delta_receipt_owed_to_a_buy_owner_is_refused(db_session, monkey
         publisher, "build_bounded_supplier_receipt_manifest",
         lambda *a, **kw: publisher.BoundedBuyReceiptDeltaManifest(),
     )
-    monkeypatch.setattr(
-        publisher, "apply_current_replenishment_for_bounded_buy_scopes",
-        lambda *a, **kw: SimpleNamespace(replayed_rows=0),
-    )
 
     with pytest.raises(
         publisher.ForwardPhysicalRefreshUnavailable,
-        match="untyped although their items have an active current BUY owner",
+        match="leaves supplier receipts untyped",
     ):
         publisher.publish_forward_physical_refresh_current(
             db_session,
@@ -1253,7 +1261,7 @@ def test_assembly_output_outside_every_make_scope_is_refused(db_session, monkeyp
     monkeypatch.setattr(publisher, "_current_scopes", lambda *a, **kw: ())
     with pytest.raises(
         publisher.ForwardPhysicalRefreshUnavailable,
-        match="outside every MAKE scope",
+        match="outside MAKE scope",
     ):
         publisher.publish_forward_physical_refresh_current(
             db_session,

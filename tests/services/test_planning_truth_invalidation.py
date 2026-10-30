@@ -4,6 +4,7 @@ import pytest
 
 from app import models
 from app.services import planning_truth
+from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     get_current_execution_scope,
@@ -170,6 +171,9 @@ def test_later_accepted_publication_replaces_invalidated_pointer(db_session):
         status="rejected", reason="bad replay evidence",
     )
     replacement = _generation("accepted-two", cutoff_hour=10)
+    replacement.source_watermarks = {
+        "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db_session),
+    }
     state = planning_truth.publish_generation(db_session, replacement)
     db_session.commit()
 

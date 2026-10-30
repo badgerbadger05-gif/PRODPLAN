@@ -1617,6 +1617,16 @@ def accept_generation_build(
     """
     with db.begin_nested():
         generation = _building_generation(db, generation_id)
+        from app.services.accepted_command_mutation import (
+            capture_accepted_mutation_epoch,
+        )
+        marks = dict(generation.source_watermarks or {})
+        marks.setdefault(
+            "accepted_production_mutation_epoch",
+            capture_accepted_mutation_epoch(db),
+        )
+        generation.source_watermarks = marks
+        db.flush()
         physical = materialize_generation_stock_bins(db, int(generation.id))
         future_supply = (
             _capture_physical_future_supply(

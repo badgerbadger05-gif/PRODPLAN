@@ -81,10 +81,21 @@ def _generations(db_session, *, key="scope-repair", with_target=True):
     db_session.flush()
     if with_target:
         target.physical_import_batch_id = target_batch.id
-        target.source_watermarks = {"parent_generation_id": int(parent.id)}
+        target.source_watermarks = {
+            "parent_generation_id": int(parent.id),
+            "accepted_production_mutation_epoch": 0,
+        }
         db_session.add(target)
         db_session.flush()
-    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    db_session.add_all([
+        models.PlanningTruthState(id=1, current_generation_id=parent.id),
+        models.AcceptedProductionMutationState(id=1),
+        models.ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(parent.id),
+            baseline_generation_id=int(parent.id), cutoff=parent_cutoff,
+            status="complete", source_event_high_watermark_id=0,
+        ),
+    ])
     db_session.commit()
     return parent, (target if with_target else None)
 
@@ -159,7 +170,7 @@ def _patch_compute_only(monkeypatch):
         publisher, "apply_bounded_current_material_custody_events", lambda *a, **kw: 0,
     )
     monkeypatch.setattr(
-        publisher, "handoff_current_physical_refresh_provenance",
+        publisher, "install_verified_material_custody_handoff",
         lambda *a, **kw: SimpleNamespace(),
     )
     monkeypatch.setattr(

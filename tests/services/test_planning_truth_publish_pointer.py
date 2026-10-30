@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 import pytest
 
 from app import models
+from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
 from app.services.item_ledger.generation_lifecycle import accept_generation_build
 from app.services.planning_truth import (
     PlanningTruthPublishConflict,
@@ -37,7 +38,9 @@ def _accepted(db, key: str, *, cutoff: datetime | None = None):
         physical_import_batch=batch,
         algorithm_version="test",
         replay_version="test",
-        source_watermarks={},
+        source_watermarks={
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+        },
         capabilities={"physical_ledger": True},
     )
     db.add(generation)

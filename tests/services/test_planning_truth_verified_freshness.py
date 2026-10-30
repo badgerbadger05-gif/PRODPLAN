@@ -20,6 +20,7 @@ from alembic.script import ScriptDirectory
 
 from app import models
 from app.services import planning_truth
+from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,7 +36,10 @@ def _accepted(db, key: str, *, accepted_at: datetime) -> models.LedgerGeneration
         status="accepted",
         cutoff=accepted_at,
         accepted_at=accepted_at,
-        source_watermarks={"1c": accepted_at.isoformat()},
+        source_watermarks={
+            "1c": accepted_at.isoformat(),
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+        },
         capabilities={planning_truth.CAPABILITY_PHYSICAL_LEDGER: True},
         algorithm_version="verified-freshness-test/1",
         replay_version="verified-freshness-test/1",

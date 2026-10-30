@@ -122,6 +122,7 @@ from app.services.production_material_custody_projection import (
     build_terminal_custody_event_specs,
     fold_candidate_custody_event_specs,
     install_precomputed_current_material_custody,
+    lock_current_custody_marker,
     material_custody_state_from_values,
 )
 from app.services.production_material_custody_events import (
