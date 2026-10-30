@@ -135,9 +135,7 @@ class _BulkPreviewContext:
     unit_display_by_raw: Dict[str, str]
     workshop_warehouse_by_product: Dict[int, Tuple[str, str]]
     warehouse_stock_by_item: Dict[Tuple[str, int, str, str], float]
-    feeder_warehouse_by_item: Dict[int, Tuple[str, str]]
-    feeder_source_revision: str | None
-    feeder_unavailable_reason: str | None
+    feeder_warehouse_by_product: Dict[int, Tuple[str, str, str | None, str | None]]
     feeder_stock_by_item: Dict[Tuple[str, int, str, str], float]
 
 
@@ -180,6 +178,35 @@ def _material_workshop_warehouse(
         )
         name = str(getattr(warehouse, "warehouse_name", "") or "")
     return ref, name
+
+
+def _material_feeder_warehouse(
+    db: Session,
+    product: ProductionProduct,
+    *,
+    custody_product_id: int,
+    spec_id: int | None,
+) -> Tuple[str, str, str | None, str | None]:
+    """Resolve the one feeder configured for the executor's workshop."""
+    from .workshop_resolution import resolve_workshop_for_product, warehouse_binding_for_workshop
+
+    material_product = product
+    if int(custody_product_id) != int(product.product_id):
+        material_product = db.get(ProductionProduct, int(custody_product_id))
+        if material_product is None:
+            return "", "", None, "linked_custody_product_missing"
+    workshop_id = resolve_workshop_for_product(db, material_product, spec_id=spec_id)
+    binding = warehouse_binding_for_workshop(db, workshop_id)
+    ref = str(getattr(binding, "feeder_warehouse_ref1c", "") or "") if binding else ""
+    if not ref:
+        return "", "", None, "workshop_feeder_assignment_missing"
+    warehouse = db.query(StockWarehouse).filter(
+        StockWarehouse.warehouse_ref1c == ref
+    ).one_or_none()
+    if warehouse is None:
+        return "", "", None, "workshop_feeder_warehouse_unknown"
+    revision = f"workshop-feeder:{int(workshop_id)}:{ref}"
+    return ref, str(warehouse.warehouse_name or ref), revision, None
 
 
 def _warehouse_stock(
@@ -714,9 +741,11 @@ def preview_materials(
             int(product.product_id), ("", "")
         )
         workshop_stock_by_item = _bulk_context.warehouse_stock_by_item
-        feeder_warehouse_by_item = _bulk_context.feeder_warehouse_by_item
-        feeder_source_revision = _bulk_context.feeder_source_revision
-        feeder_unavailable_reason = _bulk_context.feeder_unavailable_reason
+        feeder_ref, feeder_name, feeder_source_revision, feeder_unavailable_reason = (
+            _bulk_context.feeder_warehouse_by_product.get(
+                int(product.product_id), ("", "", None, "workshop_feeder_assignment_missing")
+            )
+        )
         feeder_stock_by_item = _bulk_context.feeder_stock_by_item
     else:
         workshop_ref, workshop_name = _material_workshop_warehouse(
@@ -738,30 +767,15 @@ def preview_materials(
                 for component in components
             ],
         )
-        from .prodflow_feeder_config import (
-            ProdFlowFeederUnavailable,
-            feeder_warehouse_snapshot,
+        feeder_ref, feeder_name, feeder_source_revision, feeder_unavailable_reason = (
+            _material_feeder_warehouse(
+                db, product, custody_product_id=int(custody_product_id), spec_id=spec_id,
+            )
         )
-        try:
-            feeder_refs, feeder_source_revision = feeder_warehouse_snapshot(db, comp_ids)
-            feeder_unavailable_reason = None
-        except ProdFlowFeederUnavailable as exc:
-            feeder_refs, feeder_source_revision = {}, None
-            feeder_unavailable_reason = str(exc)
-        feeder_names = {
-            str(ref): str(name or ref)
-            for ref, name in db.query(
-                StockWarehouse.warehouse_ref1c, StockWarehouse.warehouse_name,
-            ).filter(StockWarehouse.warehouse_ref1c.in_(set(feeder_refs.values()))).all()
-        } if feeder_refs else {}
-        feeder_warehouse_by_item = {
-            int(item_id): (str(ref), feeder_names.get(str(ref), str(ref)))
-            for item_id, ref in feeder_refs.items()
-        }
         feeder_stock_by_item = _warehouse_stock(
             db,
             ledger_generation_id=int(ledger_generation_id),
-            warehouse_refs=list(feeder_refs.values()),
+            warehouse_refs=[feeder_ref],
             physical_keys=[
                 (
                     int(component["component_item_id"]),
@@ -854,7 +868,6 @@ def preview_materials(
         comp["workshop_coverage_qty"] = workshop_covering
         comp["workshop_coverage_status"] = _ui_coverage_status(workshop_label)
         comp["workshop_coverage_label"] = _ui_coverage_label(workshop_label)
-        feeder_ref, feeder_name = feeder_warehouse_by_item.get(iid, ("", ""))
         if feeder_ref and exact_custody_scope_supported:
             feeder_stock = feeder_stock_by_item.get(
                 (feeder_ref, iid, characteristic_ref, organization_ref), 0.0
@@ -881,6 +894,13 @@ def preview_materials(
         comp["feeder_status"] = _ui_coverage_status(feeder_status)
         comp["feeder_label"] = _ui_coverage_label(feeder_status)
         comp["feeder_unavailable_reason"] = feeder_reason
+        comp["feeder_unavailable_label"] = (
+            f"Для участка {workshop_name or 'не определён'} не указан склад-питатель"
+            if feeder_reason == "workshop_feeder_assignment_missing"
+            else "Склад-питатель участка не найден в справочнике складов"
+            if feeder_reason == "workshop_feeder_warehouse_unknown"
+            else None
+        )
         comp["reserved_orders"] = reserved_orders_by_item.get(iid, [])
         comp["missing_qty"] = missing
         launch_covering = max(own_at_workshop, raw_stock - reserved)
@@ -1098,32 +1118,19 @@ def _preview_material_products_bulk(
             for component in value[5]
         ],
     )
-    from .prodflow_feeder_config import (
-        ProdFlowFeederUnavailable,
-        feeder_warehouse_snapshot,
-    )
-    try:
-        feeder_refs, feeder_source_revision = feeder_warehouse_snapshot(
-            db, sorted(component_ids),
+    feeder_warehouse_by_product = {
+        int(product_id): _material_feeder_warehouse(
+            db,
+            products_by_id[product_id],
+            custody_product_id=int(resolved[product_id][2]),
+            spec_id=resolved[product_id][4],
         )
-        feeder_unavailable_reason = None
-    except ProdFlowFeederUnavailable as exc:
-        feeder_refs, feeder_source_revision = {}, None
-        feeder_unavailable_reason = str(exc)
-    feeder_names = {
-        str(ref): str(name or ref)
-        for ref, name in db.query(
-            StockWarehouse.warehouse_ref1c, StockWarehouse.warehouse_name,
-        ).filter(StockWarehouse.warehouse_ref1c.in_(set(feeder_refs.values()))).all()
-    } if feeder_refs else {}
-    feeder_warehouse_by_item = {
-        int(item_id): (str(ref), feeder_names.get(str(ref), str(ref)))
-        for item_id, ref in feeder_refs.items()
+        for product_id in ids
     }
     feeder_stock_by_item = _warehouse_stock(
         db,
         ledger_generation_id=generation_id,
-        warehouse_refs=list(feeder_refs.values()),
+        warehouse_refs=[value[0] for value in feeder_warehouse_by_product.values()],
         physical_keys=[
             (
                 int(component["component_item_id"]),
@@ -1145,9 +1152,7 @@ def _preview_material_products_bulk(
         unit_display_by_raw=unit_display_by_raw,
         workshop_warehouse_by_product=workshop_warehouse_by_product,
         warehouse_stock_by_item=warehouse_stock_by_item,
-        feeder_warehouse_by_item=feeder_warehouse_by_item,
-        feeder_source_revision=feeder_source_revision,
-        feeder_unavailable_reason=feeder_unavailable_reason,
+        feeder_warehouse_by_product=feeder_warehouse_by_product,
         feeder_stock_by_item=feeder_stock_by_item,
     )
     return {

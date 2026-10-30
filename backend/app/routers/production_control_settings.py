@@ -22,6 +22,7 @@ router = APIRouter()
 
 class WorkshopBindingPayload(BaseModel):
     warehouse_ref1c: str
+    feeder_warehouse_ref1c: Optional[str] = None
     production_warehouse_ref1c: Optional[str] = None
 
 
@@ -67,6 +68,7 @@ def put_workshop_binding(
             db,
             int(workshop_id),
             payload.warehouse_ref1c,
+            feeder_warehouse_ref1c=payload.feeder_warehouse_ref1c,
             production_warehouse_ref1c=payload.production_warehouse_ref1c,
         )
     except ValueError as e:

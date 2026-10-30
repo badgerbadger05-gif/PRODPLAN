@@ -50,10 +50,6 @@ from .production_material_custody_projection import (
     load_current_accepted_material_custody,
 )
 from .planning_truth import require_accepted_truth
-from .prodflow_feeder_config import (
-    ProdFlowFeederUnavailable,
-    feeder_warehouse_for_items,
-)
 from .mrp_mutation_guard import require_materialized_orders
 from .production_output_truth import accepted_product_output
 from .workshop_resolution import (
@@ -175,17 +171,20 @@ def _source_warehouse_options(
     return result
 
 
-def _allocate_components_from_prodflow_feeders(
+def _allocate_components_from_workshop_feeder(
     db: Session,
     components: List[Dict[str, Any]],
     *,
     destination_warehouse_ref1c: Optional[str],
+    feeder_warehouse_ref1c: str,
     ledger_generation_id: int,
     reservation_state: MaterialCustodyState,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """Allocate only physically free feeder stock; never choose another store."""
     component_ids = [int(row["component_item_id"]) for row in components]
-    feeder_by_item = feeder_warehouse_for_items(db, component_ids)
+    feeder_ref = _clean_ref1c(feeder_warehouse_ref1c)
+    if not feeder_ref:
+        raise ValueError("workshop feeder warehouse is not configured")
     options_by_item = _source_warehouse_options(
         db,
         component_ids,
@@ -204,7 +203,6 @@ def _allocate_components_from_prodflow_feeders(
     shortages: List[Dict[str, Any]] = []
     for component in components:
         item_id = int(component["component_item_id"])
-        feeder_ref = str(feeder_by_item[item_id])
         option = next(
             (
                 row for row in options_by_item.get(item_id, ())
@@ -476,6 +474,16 @@ def _destination_warehouse_for_product(
     workshop_id_resolved = resolve_workshop_for_product(db, product, spec_id=spec_id)
     binding = warehouse_binding_for_workshop(db, workshop_id_resolved)
     return _clean_ref1c(binding.warehouse_ref1c) if binding else None
+
+
+def _feeder_warehouse_for_product(
+    db: Session,
+    product: ProductionProduct,
+    spec_id: Optional[int],
+) -> Optional[str]:
+    workshop_id_resolved = resolve_workshop_for_product(db, product, spec_id=spec_id)
+    binding = warehouse_binding_for_workshop(db, workshop_id_resolved)
+    return _clean_ref1c(binding.feeder_warehouse_ref1c) if binding else None
 
 
 def _free_destination_stock(
@@ -779,7 +787,7 @@ def create_material_issues(
     1. Free stock already lying on the destination workshop warehouse is claimed
        as a zero-distance posted issue (source=destination), never exported to
        1C.
-    2. Only physically free stock on each component's accepted ProdFlow feeder
+    2. Only physically free stock on the order workshop's configured feeder
        becomes a transfer request. Stock elsewhere remains global launch
        coverage but never becomes an implicit transfer source.
 
@@ -943,10 +951,22 @@ def create_material_issues(
                     existing.warehouse_ref1c = resolved_warehouse
                 reused.append(_issue_reuse_payload(existing, product))
             continue
-        try:
-            feeder_by_item = feeder_warehouse_for_items(db, comp_ids)
-        except ProdFlowFeederUnavailable as exc:
-            errors.append(f"product_id={pid}: {exc}")
+        feeder_ref = _feeder_warehouse_for_product(db, product, spec_id)
+        if not feeder_ref:
+            errors.append(f"product_id={pid}: workshop feeder warehouse is not configured")
+            continue
+        linked_without_export_ref = [
+            row for row in existing_rows
+            if str(row.status or "") in {"draft", "requested"}
+            and _material_issue_has_1c_link(db, row)
+            and not _clean_ref1c(row.exported_ref1c)
+            and _clean_ref1c(row.source_warehouse_ref1c) == feeder_ref
+        ]
+        if linked_without_export_ref and outstanding:
+            errors.append(
+                f"product_id={pid}: linked 1C material issue is immutable; "
+                "remaining feeder demand requires operator reconciliation"
+            )
             continue
         conflicting_local = []
         for existing in unlinked_local:
@@ -954,8 +974,7 @@ def create_material_issues(
             if source_ref == _clean_ref1c(existing.warehouse_ref1c):
                 continue
             for line in existing.lines or ():
-                expected = feeder_by_item.get(int(line.component_item_id))
-                if source_ref != expected:
+                if source_ref != feeder_ref:
                     conflicting_local.append(
                         f"issue_id={int(existing.issue_id)} component_item_id={int(line.component_item_id)}"
                     )
@@ -1011,17 +1030,14 @@ def create_material_issues(
 
         groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
         if transfer_components:
-            try:
-                groups, pending = _allocate_components_from_prodflow_feeders(
-                    db,
-                    transfer_components,
-                    destination_warehouse_ref1c=resolved_warehouse,
-                    ledger_generation_id=int(generation_id),
-                    reservation_state=reservation_state,
-                )
-            except ProdFlowFeederUnavailable as exc:
-                errors.append(f"product_id={pid}: {exc}")
-                continue
+            groups, pending = _allocate_components_from_workshop_feeder(
+                db,
+                transfer_components,
+                destination_warehouse_ref1c=resolved_warehouse,
+                feeder_warehouse_ref1c=feeder_ref,
+                ledger_generation_id=int(generation_id),
+                reservation_state=reservation_state,
+            )
             if pending:
                 feeder_shortages.append({
                     "product_id": int(product.product_id),
@@ -1078,7 +1094,7 @@ def create_material_issues(
 
         existing_by_source = {
             str(row.source_warehouse_ref1c or ""): row
-            for row in existing_rows
+            for row in unlinked_local
             if str(row.direction or "") == "issue"
             and str(row.status or "") in ("draft", "requested")
         }

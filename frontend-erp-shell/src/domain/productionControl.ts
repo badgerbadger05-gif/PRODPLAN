@@ -76,6 +76,7 @@ export type MaterialRow = {
   feeder_status?: string | null
   feeder_label?: string | null
   feeder_unavailable_reason?: string | null
+  feeder_unavailable_label?: string | null
   reserved_orders?: Array<{
     product_id: number
     order_id?: number | null
@@ -120,6 +121,7 @@ export type WorkshopWarehouse = {
   workshop_id?: number
   workshop_name?: string | null
   warehouse_ref1c: string
+  feeder_warehouse_ref1c?: string | null
   production_warehouse_ref1c?: string | null
 }
 

@@ -28,6 +28,8 @@ from app.models import (
     PhysicalImportBatch,
     LedgerGeneration,
     PlanningTruthState,
+    ProductionResource,
+    WorkshopWarehouseBinding,
 )
 from app.services.production_control_material_issues import create_material_issues
 from app.services.production_material_custody_projection import (
@@ -35,7 +37,6 @@ from app.services.production_material_custody_projection import (
 )
 from app.services.planning_truth import publish_generation
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
-from app.services.prodflow_feeder_config import publish_prodflow_feeder_assignments
 
 PAINT_WH = "wh-paint"      # склад-получатель окрасочного участка
 WELD_WH = "wh-weld-stock"  # склад сварных остатков («Участок сварочный»)
@@ -89,12 +90,14 @@ def test_paint_order_pulls_welded_component_from_weld_stock_warehouse(db_session
 
     # сварная деталь лежит только на складе сварных остатков
     db.add(StockBin(ledger_generation_id=generation.id, item_id=welded.item_id, characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c=WELD_WH, on_hand=50))
-    publish_prodflow_feeder_assignments(
-        db,
-        positions=[{"name": "welded-feeder", "item": welded.item_code, "warehouse": WELD_WH, "is_active": 1}],
-        warehouses=[{"name": WELD_WH, "custom_ref1c": WELD_WH}],
-        observed_at=datetime.now().astimezone(),
-    )
+    workshop = ProductionResource(resource_name="Paint material consumer")
+    db.add(workshop)
+    db.flush()
+    db.add(WorkshopWarehouseBinding(
+        workshop_id=workshop.resource_id,
+        warehouse_ref1c=PAINT_WH,
+        feeder_warehouse_ref1c=WELD_WH,
+    ))
 
     order = ProductionOrder(
         order_number="PWC-P-paint",
@@ -117,7 +120,10 @@ def test_paint_order_pulls_welded_component_from_weld_stock_warehouse(db_session
     )
     db.add(product)
     db.flush()
-    db.add(ProductionOrderLineState(product_id=product.product_id, status="ready", issue_status="not_requested"))
+    db.add(ProductionOrderLineState(
+        product_id=product.product_id, status="ready", issue_status="not_requested",
+        workshop_id=workshop.resource_id, workshop_id_source="manual",
+    ))
     db.commit()
 
     # получатель — окрасочный склад; источник должен подобраться по остатку сварной

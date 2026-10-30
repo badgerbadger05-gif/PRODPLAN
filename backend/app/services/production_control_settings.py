@@ -21,6 +21,7 @@ def _binding_payload(binding: WorkshopWarehouseBinding) -> Dict[str, Any]:
         "workshop_id": int(binding.workshop_id),
         "workshop_name": workshop_name,
         "warehouse_ref1c": str(binding.warehouse_ref1c or ""),
+        "feeder_warehouse_ref1c": str(binding.feeder_warehouse_ref1c or ""),
         "production_warehouse_ref1c": str(binding.production_warehouse_ref1c or ""),
     }
 
@@ -100,15 +101,19 @@ def replace_settings(
     workshop_warehouses: Iterable[Dict[str, Any]],
     ignored_warehouses: Iterable[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    feeder_changed = False
     desired_bindings: Dict[int, str] = {}
     desired_production_bindings: Dict[int, Optional[str]] = {}
+    desired_feeder_bindings: Dict[int, Optional[str]] = {}
     for row in workshop_warehouses or []:
         workshop_id = int(row.get("resource_id") or row.get("workshop_id") or 0)
         warehouse_ref = str(row.get("warehouse_ref1c") or "").strip()
         production_warehouse_ref = str(row.get("production_warehouse_ref1c") or "").strip()
+        feeder_warehouse_ref = str(row.get("feeder_warehouse_ref1c") or "").strip()
         if workshop_id > 0 and warehouse_ref:
             desired_bindings[workshop_id] = warehouse_ref
             desired_production_bindings[workshop_id] = production_warehouse_ref or None
+            desired_feeder_bindings[workshop_id] = feeder_warehouse_ref or None
 
     existing_bindings = {
         int(row.workshop_id): row
@@ -116,6 +121,7 @@ def replace_settings(
     }
     for workshop_id, binding in existing_bindings.items():
         if workshop_id not in desired_bindings:
+            feeder_changed = feeder_changed or bool(binding.feeder_warehouse_ref1c)
             db.delete(binding)
     valid_workshops = {
         int(row.resource_id)
@@ -128,17 +134,24 @@ def replace_settings(
         raise ValueError(f"Участки не найдены: {', '.join(map(str, missing))}")
     for workshop_id, warehouse_ref in desired_bindings.items():
         production_warehouse_ref = desired_production_bindings.get(workshop_id) or None
+        feeder_warehouse_ref = desired_feeder_bindings.get(workshop_id) or None
         binding = existing_bindings.get(workshop_id)
         if binding is None:
+            feeder_changed = feeder_changed or bool(feeder_warehouse_ref)
             db.add(
                 WorkshopWarehouseBinding(
                     workshop_id=workshop_id,
                     warehouse_ref1c=warehouse_ref,
+                    feeder_warehouse_ref1c=feeder_warehouse_ref,
                     production_warehouse_ref1c=production_warehouse_ref,
                 )
             )
         else:
+            feeder_changed = feeder_changed or (
+                str(binding.feeder_warehouse_ref1c or "") != str(feeder_warehouse_ref or "")
+            )
             binding.warehouse_ref1c = warehouse_ref
+            binding.feeder_warehouse_ref1c = feeder_warehouse_ref
             binding.production_warehouse_ref1c = production_warehouse_ref
 
     desired_ignored: Dict[str, Dict[str, Any]] = {}
@@ -172,6 +185,15 @@ def replace_settings(
             if reason is not None:
                 row.reason = str(reason) if reason else None
 
+    if feeder_changed:
+        from .item_ledger.current_execution import invalidate_current_execution_scope
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+            source_revision="workshop-feeder-settings",
+            reason="workshop_feeder_assignment_changed",
+        )
     db.commit()
     return list_settings(db)
 
@@ -182,6 +204,7 @@ def upsert_workshop_binding(
     warehouse_ref1c: str,
     *,
     production_warehouse_ref1c: Optional[str] = None,
+    feeder_warehouse_ref1c: Optional[str] = None,
 ) -> Dict[str, Any]:
     workshop_id_int = int(workshop_id)
     wh = str(warehouse_ref1c or "").strip()
@@ -204,17 +227,35 @@ def upsert_workshop_binding(
         .filter(WorkshopWarehouseBinding.workshop_id == workshop_id_int)
         .first()
     )
+    new_feeder = str(feeder_warehouse_ref1c or "").strip() or None
+    feeder_changed = (
+        feeder_warehouse_ref1c is not None
+        and str(getattr(binding, "feeder_warehouse_ref1c", "") or "")
+        != str(new_feeder or "")
+    )
     if binding is None:
         binding = WorkshopWarehouseBinding(
             workshop_id=workshop_id_int,
             warehouse_ref1c=wh,
+            feeder_warehouse_ref1c=new_feeder,
             production_warehouse_ref1c=str(production_warehouse_ref1c or "").strip() or None,
         )
         db.add(binding)
     else:
         binding.warehouse_ref1c = wh
+        if feeder_warehouse_ref1c is not None:
+            binding.feeder_warehouse_ref1c = new_feeder
         if production_warehouse_ref1c is not None:
             binding.production_warehouse_ref1c = str(production_warehouse_ref1c or "").strip() or None
+    if feeder_changed:
+        from .item_ledger.current_execution import invalidate_current_execution_scope
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+            source_revision=f"workshop-feeder:{workshop_id_int}:{str(feeder_warehouse_ref1c or '').strip()}",
+            reason="workshop_feeder_assignment_changed",
+        )
     db.commit()
 
     binding = (
@@ -228,11 +269,26 @@ def upsert_workshop_binding(
 
 def delete_workshop_binding(db: Session, workshop_id: int) -> Dict[str, Any]:
     workshop_id_int = int(workshop_id)
+    binding = (
+        db.query(WorkshopWarehouseBinding)
+        .filter(WorkshopWarehouseBinding.workshop_id == workshop_id_int)
+        .one_or_none()
+    )
+    feeder_changed = bool(getattr(binding, "feeder_warehouse_ref1c", None))
     deleted = (
         db.query(WorkshopWarehouseBinding)
         .filter(WorkshopWarehouseBinding.workshop_id == workshop_id_int)
         .delete(synchronize_session=False)
     )
+    if feeder_changed:
+        from .item_ledger.current_execution import invalidate_current_execution_scope
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+            source_revision=f"workshop-feeder:{workshop_id_int}:deleted",
+            reason="workshop_feeder_assignment_changed",
+        )
     db.commit()
     return {"deleted": int(deleted), "workshop_id": workshop_id_int}
 

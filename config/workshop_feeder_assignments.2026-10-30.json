@@ -1,0 +1,12 @@
+{
+  "decision_date": "2026-10-30",
+  "assignments": [
+    {"workshop_id": 4, "workshop_name": "Участок токарный", "feeder_warehouse_ref1c": "602eb77a-bae2-11f0-885d-9ee51454587f", "feeder_warehouse_name": "Склад №2 - склад механического цеха"},
+    {"workshop_id": 5, "workshop_name": "Участок сварочный", "feeder_warehouse_ref1c": "602eb77a-bae2-11f0-885d-9ee51454587f", "feeder_warehouse_name": "Склад №2 - склад механического цеха"},
+    {"workshop_id": 6, "workshop_name": "Участок гибки листового металла", "feeder_warehouse_ref1c": "602eb77a-bae2-11f0-885d-9ee51454587f", "feeder_warehouse_name": "Склад №2 - склад механического цеха"},
+    {"workshop_id": 7, "workshop_name": "Участок заготовительный", "feeder_warehouse_ref1c": "bbd33fe4-ce55-11ef-85f1-9ee51454587f", "feeder_warehouse_name": "Склад №1 - склад металла"},
+    {"workshop_id": 13, "workshop_name": "Участок токарный (ЧПУ)", "feeder_warehouse_ref1c": "602eb77a-bae2-11f0-885d-9ee51454587f", "feeder_warehouse_name": "Склад №2 - склад механического цеха"},
+    {"workshop_id": 19, "workshop_name": "Участок лазерной резки листа", "feeder_warehouse_ref1c": "bbd33fe4-ce55-11ef-85f1-9ee51454587f", "feeder_warehouse_name": "Склад №1 - склад металла"},
+    {"workshop_id": 20, "workshop_name": "Участок лазерной резки трубы", "feeder_warehouse_ref1c": "bbd33fe4-ce55-11ef-85f1-9ee51454587f", "feeder_warehouse_name": "Склад №1 - склад металла"}
+  ]
+}

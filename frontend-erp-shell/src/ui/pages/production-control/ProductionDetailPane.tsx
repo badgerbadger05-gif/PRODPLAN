@@ -434,7 +434,7 @@ export function ProductionDetailPane({
                     <span className="matMissing">Ожидает пополнения питателя: {qty(m.feeder_pending_qty)}</span>
                   )}
                   {m.feeder_unavailable_reason && (
-                    <span className="matMissing">Питатель недоступен: {m.feeder_unavailable_reason}</span>
+                    <span className="matMissing">{m.feeder_unavailable_label || 'Склад-питатель участка недоступен'}</span>
                   )}
                 </div>
                 <span className={`miniPill ${m.coverage_status || 'unknown'}`}>

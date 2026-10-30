@@ -22,6 +22,8 @@ from app.models import (
     ProductionOrderLineState,
     ProductionProduct,
     ProductionResource,
+    ProductionKind,
+    ResourceProductionKind,
     SpecComponent,
     Specification,
     StockWarehouse,
@@ -29,11 +31,10 @@ from app.models import (
     WorkshopWarehouseBinding,
     PhysicalImportBatch,
     LedgerGeneration,
-    ProdFlowFeederAssignment,
-    ProdFlowFeederManifest,
 )
 from app.services import production_control_material_availability as material_availability
 from app.services.production_control_material_availability import preview_materials
+from app.services.production_control_material_availability import preview_make_work_item_materials
 from app.services import production_control_material_issues as material_issues
 from app.services.production_control_material_issues import create_material_issues
 from app.services.production_control_journal import list_journal
@@ -99,23 +100,10 @@ def _set_stock(db, item: Item, breakdown: dict[str, float]):
 
 
 def _set_feeder(db, item: Item, warehouse_ref1c: str):
-    db.query(ProdFlowFeederAssignment).filter_by(item_id=item.item_id).delete()
-    manifest = db.get(ProdFlowFeederManifest, 1)
-    if manifest is None:
-        manifest = ProdFlowFeederManifest(id=1)
-        db.add(manifest)
-    manifest.status = "complete"
-    manifest.source_revision = "test-feeder-revision"
-    manifest.row_count = 1
-    manifest.loaded_at = datetime.now().astimezone()
-    manifest.source_name = "ProdFlowSupermarketPosition"
-    manifest.last_error = None
-    db.add(ProdFlowFeederAssignment(
-        item_id=item.item_id,
-        warehouse_ref1c=warehouse_ref1c,
-        source_item_code=str(item.item_code),
-        source_revision=manifest.source_revision,
-    ))
+    bindings = db.query(WorkshopWarehouseBinding).all()
+    assert bindings
+    for binding in bindings:
+        binding.feeder_warehouse_ref1c = warehouse_ref1c
     db.commit()
 
 
@@ -139,13 +127,22 @@ def _make_order_line(db, parent: Item, *, order_qty: float, suffix: str):
     )
     db.add(product)
     db.flush()
-    db.add(
-        ProductionOrderLineState(
-            product_id=product.product_id,
-            status="ready",
-            issue_status="not_requested",
-        )
+    state = ProductionOrderLineState(
+        product_id=product.product_id,
+        status="ready",
+        issue_status="not_requested",
     )
+    existing = (
+        db.query(ProductionOrderLineState)
+        .join(ProductionProduct, ProductionProduct.product_id == ProductionOrderLineState.product_id)
+        .filter(ProductionProduct.item_id == parent.item_id)
+        .filter(ProductionOrderLineState.workshop_id.isnot(None))
+        .first()
+    )
+    if existing is not None:
+        state.workshop_id = existing.workshop_id
+        state.workshop_id_source = "manual"
+    db.add(state)
     db.commit()
     return product
 
@@ -174,9 +171,22 @@ def _setup(db, *, qty_per_unit=1.0, order_qty=8.0, suffix="A"):
     db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=qty_per_unit))
     db.commit()
-    if db.query(StockWarehouse).filter_by(warehouse_ref1c=SOURCE_WH).first() is not None:
-        _set_feeder(db, comp, SOURCE_WH)
     product = _make_order_line(db, parent, order_qty=order_qty, suffix=suffix)
+    workshop = ProductionResource(resource_name=f"Workshop {suffix}")
+    db.add(workshop)
+    db.flush()
+    db.add(WorkshopWarehouseBinding(
+        workshop_id=workshop.resource_id,
+        warehouse_ref1c=WORKSHOP_WH,
+        feeder_warehouse_ref1c=(
+            SOURCE_WH
+            if db.query(StockWarehouse).filter_by(warehouse_ref1c=SOURCE_WH).first() is not None
+            else None
+        ),
+    ))
+    product.control_state.workshop_id = workshop.resource_id
+    product.control_state.workshop_id_source = "manual"
+    db.commit()
     return parent, comp, product
 
 
@@ -314,15 +324,91 @@ def test_missing_feeder_binding_fails_clear_without_warehouse_picker(db_session)
     db = db_session
     _add_warehouses(db)
     _parent, component, product = _setup(db, order_qty=2, suffix="NO-FEEDER")
-    db.query(ProdFlowFeederAssignment).delete()
-    db.query(ProdFlowFeederManifest).delete()
+    binding = db.query(WorkshopWarehouseBinding).filter_by(
+        workshop_id=product.control_state.workshop_id
+    ).one()
+    binding.feeder_warehouse_ref1c = None
     db.commit()
     _set_stock(db, component, {SOURCE_WH: 20})
 
     result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
     assert result["created"] == []
     assert result["selection_required"] == []
-    assert "ProdFlow feeder assignments are not imported" in result["errors"][0]
+    assert "workshop feeder warehouse is not configured" in result["errors"][0]
+    component_row = preview_materials(db, product.product_id)["components"][0]
+    assert component_row["feeder_unavailable_reason"] == "workshop_feeder_assignment_missing"
+    assert "не указан склад-питатель" in component_row["feeder_unavailable_label"]
+
+
+def test_same_component_uses_the_feeder_of_each_order_workshop(db_session):
+    db = db_session
+    second_feeder = "wh-feeder-two"
+    _add_warehouses(db, selected=(WORKSHOP_WH, SOURCE_WH, second_feeder))
+    parent, component, first = _setup(db, order_qty=1, suffix="TWO-WORKSHOPS")
+    second = _make_order_line(db, parent, order_qty=1, suffix="TWO-WORKSHOPS-B")
+    second_workshop = ProductionResource(resource_name="Second workshop")
+    db.add(second_workshop)
+    db.flush()
+    db.add(WorkshopWarehouseBinding(
+        workshop_id=second_workshop.resource_id,
+        warehouse_ref1c=WORKSHOP_WH,
+        feeder_warehouse_ref1c=second_feeder,
+    ))
+    second.control_state.workshop_id = second_workshop.resource_id
+    second.control_state.workshop_id_source = "manual"
+    _set_stock(db, component, {SOURCE_WH: 2, second_feeder: 3})
+    db.commit()
+
+    first_row = preview_materials(db, first.product_id)["components"][0]
+    second_row = preview_materials(db, second.product_id)["components"][0]
+    assert first_row["component_item_id"] == second_row["component_item_id"]
+    assert first_row["feeder_warehouse_ref1c"] == SOURCE_WH
+    assert second_row["feeder_warehouse_ref1c"] == second_feeder
+
+
+def test_make_proposal_uses_one_workshop_feeder_for_every_component(db_session):
+    db = db_session
+    _add_warehouses(db)
+    parent, first_component, product = _setup(db, order_qty=26, suffix="PROPOSAL-FEEDER")
+    spec = db.query(Specification).join(
+        DefaultSpecification, DefaultSpecification.spec_id == Specification.spec_id
+    ).filter(DefaultSpecification.item_id == parent.item_id).one()
+    kind = ProductionKind(ref_1c="proposal-welding-kind", name="Proposal welding kind")
+    db.add(kind)
+    db.flush()
+    spec.production_kind_id = kind.id
+    db.add(ResourceProductionKind(
+        resource_id=product.control_state.workshop_id,
+        production_kind_id=kind.id,
+    ))
+    components = [first_component]
+    for index in range(3):
+        component = Item(
+            item_code=f"PROPOSAL-C-{index}", item_name=f"Proposal C {index}",
+            item_article=f"PC-{index}", unit="шт", status="active",
+        )
+        db.add(component)
+        db.flush()
+        db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1))
+        components.append(component)
+    for component in components:
+        _set_stock(db, component, {SOURCE_WH: 100})
+    db.commit()
+
+    snapshot = preview_make_work_item_materials(
+        db,
+        work_item_id=10867765,
+        item_id=parent.item_id,
+        quantity=26,
+        spec_id=spec.spec_id,
+        ledger_generation_id=db.info["section_stock_generation"],
+        order_number="MRP-R-632799",
+        run_id=747,
+    )
+
+    assert len(snapshot["components"]) == 4
+    assert {row["feeder_warehouse_ref1c"] for row in snapshot["components"]} == {SOURCE_WH}
+    assert all(row["feeder_unavailable_reason"] is None for row in snapshot["components"])
 
 
 def test_manual_source_override_is_rejected(db_session):
@@ -330,6 +416,52 @@ def test_manual_source_override_is_rejected(db_session):
         create_material_issues(
             db_session, [], source_warehouse_ref1c="operator-choice",
         )
+
+
+def test_linked_requested_issue_is_not_extended_for_new_workshop_feeder_demand(db_session):
+    db = db_session
+    _add_warehouses(db)
+    _parent, component, product = _setup(db, order_qty=10, suffix="LINKED-IMMUTABLE")
+    _set_stock(db, component, {SOURCE_WH: 20})
+    linked = ProductionMaterialIssue(
+        document_number="MT-LINKED", product_id=product.product_id, order_id=product.order_id,
+        status="requested", direction="issue", warehouse_ref1c=WORKSHOP_WH,
+        source_warehouse_ref1c=SOURCE_WH, exported_ref1c="linked-1c-ref",
+        ledger_generation_id=db.info["section_stock_generation"],
+    )
+    db.add(linked)
+    db.flush()
+    linked_line = ProductionMaterialIssueLine(
+        issue_id=linked.issue_id, component_item_id=component.item_id,
+        required_qty=4, issued_qty=0, line_status="planned",
+    )
+    db.add(linked_line)
+    generation = db.get(LedgerGeneration, db.info["section_stock_generation"])
+    db.add(ProductionMaterialCustodyProjection(
+        ledger_generation_id=generation.id, product_id=product.product_id,
+        component_item_id=component.item_id, location_kind="transit",
+        warehouse_ref1c=SOURCE_WH, reserved_qty=4,
+        source_event_high_watermark_id=0, built_at=generation.cutoff,
+    ))
+    db.commit()
+
+    result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    db.refresh(linked_line)
+
+    assert linked_line.required_qty == pytest.approx(4)
+    assert result["errors"] == []
+    new_issue = db.query(ProductionMaterialIssue).filter(
+        ProductionMaterialIssue.product_id == product.product_id,
+        ProductionMaterialIssue.issue_id != linked.issue_id,
+    ).one()
+    assert new_issue.status == "draft"
+    assert new_issue.source_warehouse_ref1c == SOURCE_WH
+    assert new_issue.lines[0].required_qty == pytest.approx(6)
+    repeated = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    assert repeated["created"] == []
+    assert db.query(ProductionMaterialIssue).filter(
+        ProductionMaterialIssue.product_id == product.product_id,
+    ).count() == 2
 
 
 # ---------------------------------------------------------------------------
@@ -419,11 +551,9 @@ def test_second_order_cannot_be_covered_by_first_orders_kit(db_session):
             "reserved_in_transit_qty": pytest.approx(0.0),
         }
     ]
-    # Without a canonical workshop->warehouse binding the local cell is
-    # unavailable, never a fabricated zero or a fallback to global stock.
-    assert comp_row["workshop_warehouse_ref1c"] is None
-    assert comp_row["workshop_stock_qty"] is None
-    assert comp_row["workshop_free_qty"] is None
+    assert comp_row["workshop_warehouse_ref1c"] == WORKSHOP_WH
+    assert comp_row["workshop_stock_qty"] == pytest.approx(8.0)
+    assert comp_row["workshop_free_qty"] == pytest.approx(0.0)
 
     # Order A itself stays covered by its own reservation.
     preview_a = preview_materials(db, product_a.product_id)
@@ -528,6 +658,7 @@ def test_fully_held_physical_workshop_cell_cannot_create_another_local_claim(db_
         WorkshopWarehouseBinding(
             workshop_id=int(workshop.resource_id),
             warehouse_ref1c=WORKSHOP_WH,
+            feeder_warehouse_ref1c=SOURCE_WH,
         )
     )
     current.control_state.workshop_id = int(workshop.resource_id)
@@ -646,6 +777,7 @@ def test_material_issue_fails_closed_when_exact_physical_scope_cannot_be_persist
         WorkshopWarehouseBinding(
             workshop_id=int(workshop.resource_id),
             warehouse_ref1c=WORKSHOP_WH,
+            feeder_warehouse_ref1c=SOURCE_WH,
         )
     )
     product.control_state.workshop_id = int(workshop.resource_id)

@@ -888,6 +888,7 @@ class WorkshopWarehouseBinding(Base):
         index=True,
     )
     warehouse_ref1c = Column(String(36), nullable=False, index=True)
+    feeder_warehouse_ref1c = Column(String(36), nullable=True, index=True)
     production_warehouse_ref1c = Column(String(36), nullable=True, index=True)
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -921,10 +922,12 @@ class ProductionMaterialIssue(Base):
             "source_warehouse_ref1c",
             unique=True,
             postgresql_where=text(
-                "status IN ('draft', 'requested') AND direction = 'issue'"
+                "status IN ('draft', 'requested') AND direction = 'issue' "
+                "AND exported_ref1c IS NULL"
             ),
             sqlite_where=text(
-                "status IN ('draft', 'requested') AND direction = 'issue'"
+                "status IN ('draft', 'requested') AND direction = 'issue' "
+                "AND exported_ref1c IS NULL"
             ),
         ),
     )
@@ -2792,7 +2795,7 @@ class ShelfPolicy(Base):
 
 
 class ProdFlowFeederAssignment(Base):
-    """Static one-time feeder assignment captured from ProdFlow."""
+    """Retired item-level feeder snapshot retained only as transition audit."""
 
     __tablename__ = "prodflow_feeder_assignment"
     __table_args__ = (
@@ -2812,6 +2815,7 @@ class ProdFlowFeederAssignment(Base):
 
 
 class ProdFlowFeederManifest(Base):
+    """Retired item-level snapshot manifest; runtime no longer reads it."""
     """Singleton checksum/provenance for the loaded static configuration."""
 
     __tablename__ = "prodflow_feeder_manifest"

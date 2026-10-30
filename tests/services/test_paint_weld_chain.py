@@ -991,14 +991,12 @@ def test_welded_material_issues_use_frozen_bom_after_default_spec_change(
     )
     monkeypatch.setattr(
         material_issues,
-        "feeder_warehouse_for_items",
-        lambda _db, item_ids: {
-            int(item_id): "warehouse-source" for item_id in item_ids
-        },
+        "_feeder_warehouse_for_product",
+        lambda *args, **kwargs: "warehouse-source",
     )
     monkeypatch.setattr(
         material_issues,
-        "_allocate_components_from_prodflow_feeders",
+        "_allocate_components_from_workshop_feeder",
         lambda _db, components, **_kwargs: ({"warehouse-source": components}, []),
     )
 

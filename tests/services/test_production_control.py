@@ -255,23 +255,23 @@ def accepted_production_journal_truth(db_session):
 
 
 @pytest.fixture(autouse=True)
-def stable_prodflow_feeder_for_unrelated_material_issue_tests(monkeypatch):
+def stable_workshop_feeder_for_unrelated_material_issue_tests(monkeypatch):
     """Legacy lifecycle tests are not feeder-allocation tests.
 
     The real feeder/free-stock contract is covered in
-    test_section_stock_reservations and test_prodflow_feeder_sync.
+    test_section_stock_reservations.
     """
     from app.services import production_control_material_issues as material_issues
 
     monkeypatch.setattr(
         material_issues,
-        "_allocate_components_from_prodflow_feeders",
+        "_allocate_components_from_workshop_feeder",
         lambda _db, components, **_kwargs: ({"test-feeder": components}, []),
     )
     monkeypatch.setattr(
         material_issues,
-        "feeder_warehouse_for_items",
-        lambda _db, item_ids: {int(item_id): "test-feeder" for item_id in item_ids},
+        "_feeder_warehouse_for_product",
+        lambda *args, **kwargs: "test-feeder",
     )
 
 
@@ -2836,9 +2836,11 @@ def test_workshop_warehouse_binding_lifecycle(db_session):
         db_session,
         workshop.resource_id,
         "11111111-1111-1111-1111-111111111111",
+        feeder_warehouse_ref1c="feeder-1",
     )
     assert created["workshop_id"] == workshop.resource_id
     assert created["warehouse_ref1c"] == "11111111-1111-1111-1111-111111111111"
+    assert created["feeder_warehouse_ref1c"] == "feeder-1"
     assert created["workshop_name"] == "Цех сварки"
 
     # Idempotent upsert: same workshop, new warehouse — should update, not create a 2nd row.
@@ -2902,7 +2904,7 @@ def test_replace_settings_matches_frontend_contract(db_session):
     saved = replace_settings(
         db_session,
         workshop_warehouses=[
-            {"resource_id": workshop_a.resource_id, "warehouse_ref1c": "wh-a", "production_warehouse_ref1c": "wh-workshop"},
+            {"resource_id": workshop_a.resource_id, "warehouse_ref1c": "wh-a", "feeder_warehouse_ref1c": "wh-b", "production_warehouse_ref1c": "wh-workshop"},
             {"resource_id": workshop_b.resource_id, "warehouse_ref1c": "wh-b"},
         ],
         ignored_warehouses=[{"warehouse_ref1c": "wh-b"}],
@@ -2913,6 +2915,7 @@ def test_replace_settings_matches_frontend_contract(db_session):
     assert len(saved["workshop_warehouses"]) == 2
     assert saved["workshop_warehouses"][0]["resource_id"] == saved["workshop_warehouses"][0]["workshop_id"]
     assert saved["workshop_warehouses"][0]["production_warehouse_ref1c"] == "wh-workshop"
+    assert saved["workshop_warehouses"][0]["feeder_warehouse_ref1c"] == "wh-b"
     assert db_session.query(WorkshopWarehouseBinding).count() == 2
     assert db_session.query(IgnoredWarehouse).count() == 1
 

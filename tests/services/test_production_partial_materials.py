@@ -596,12 +596,12 @@ def test_command_print_receipt_captures_issue_created_after_saved_snapshot(db_se
     monkeypatch.setattr(material_issues, '_free_destination_stock', lambda *args, **kwargs: {int(component.item_id): 0.0})
     monkeypatch.setattr(
         material_issues,
-        'feeder_warehouse_for_items',
-        lambda db, item_ids: {int(item_id): 'source' for item_id in item_ids},
+        '_feeder_warehouse_for_product',
+        lambda *args, **kwargs: 'source',
     )
     monkeypatch.setattr(
         material_issues,
-        '_allocate_components_from_prodflow_feeders',
+        '_allocate_components_from_workshop_feeder',
         lambda db, components, **kwargs: ({'source': components}, []),
     )
     monkeypatch.setattr(material_issues, 'append_material_issue_custody_event', lambda *args, **kwargs: None)

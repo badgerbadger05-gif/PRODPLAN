@@ -35,14 +35,17 @@ export function ProductionSettingsPane({
       .filter((row): row is readonly [number, string] => typeof row[0] === 'number' && !!row[1]),
   )
 
-  function rowsFromMaps(workshopMap: Map<number, string>, productionMap: Map<number, string>) {
-    const resourceIds = new Set([...workshopMap.keys(), ...productionMap.keys()])
+  const feederByResource = new Map(workshopRows.map((row) => [Number(row.resource_id ?? row.workshop_id), row.feeder_warehouse_ref1c ?? '']))
+
+  function rowsFromMaps(workshopMap: Map<number, string>, productionMap: Map<number, string>, feederMap = feederByResource) {
+    const resourceIds = new Set([...workshopMap.keys(), ...productionMap.keys(), ...feederMap.keys()])
     return Array.from(resourceIds).map((resource_id) => ({
       resource_id,
       workshop_id: resource_id,
       warehouse_ref1c: workshopMap.get(resource_id) ?? '',
+      feeder_warehouse_ref1c: feederMap.get(resource_id) ?? '',
       production_warehouse_ref1c: productionMap.get(resource_id) ?? '',
-    })).filter((row) => row.warehouse_ref1c || row.production_warehouse_ref1c)
+    })).filter((row) => row.warehouse_ref1c || row.production_warehouse_ref1c || row.feeder_warehouse_ref1c)
   }
 
   function setWorkshopWarehouse(resourceId: number, warehouseRef: string) {
@@ -57,6 +60,13 @@ export function ProductionSettingsPane({
     if (warehouseRef) next.set(resourceId, warehouseRef)
     else next.delete(resourceId)
     onWorkshopRowsChange(rowsFromMaps(byResource, next))
+  }
+
+  function setFeederWarehouse(resourceId: number, warehouseRef: string) {
+    const next = new Map(feederByResource)
+    if (warehouseRef) next.set(resourceId, warehouseRef)
+    else next.delete(resourceId)
+    onWorkshopRowsChange(rowsFromMaps(byResource, productionByResource, next))
   }
 
   function toggleIgnored(ref: string, checked: boolean) {
@@ -84,6 +94,7 @@ export function ProductionSettingsPane({
               <tr>
                 <th>Участок</th>
                 <th>Склад участка</th>
+                <th>Склад-питатель</th>
                 <th>Получатель продукции в заказе 1С</th>
               </tr>
             </thead>
@@ -93,6 +104,14 @@ export function ProductionSettingsPane({
                   <td>{resource.resource_name}</td>
                   <td>
                     <select value={byResource.get(resource.resource_id) ?? ''} onChange={(e) => setWorkshopWarehouse(resource.resource_id, e.target.value)}>
+                      <option value="">Не назначен</option>
+                      {warehouses.map((warehouse) => (
+                        <option key={warehouse.warehouse_ref1c} value={warehouse.warehouse_ref1c}>{warehouseLabel(warehouse)}</option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>
+                    <select value={feederByResource.get(resource.resource_id) ?? ''} onChange={(e) => setFeederWarehouse(resource.resource_id, e.target.value)}>
                       <option value="">Не назначен</option>
                       {warehouses.map((warehouse) => (
                         <option key={warehouse.warehouse_ref1c} value={warehouse.warehouse_ref1c}>{warehouseLabel(warehouse)}</option>

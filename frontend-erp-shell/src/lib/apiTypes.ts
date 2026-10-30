@@ -7228,6 +7228,8 @@ export interface components {
         WorkshopBindingPayload: {
             /** Warehouse Ref1C */
             warehouse_ref1c: string;
+            /** Feeder Warehouse Ref1C */
+            feeder_warehouse_ref1c?: string | null;
             /** Production Warehouse Ref1C */
             production_warehouse_ref1c?: string | null;
         };
