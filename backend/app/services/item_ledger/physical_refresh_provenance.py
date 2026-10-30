@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import hashlib
 from sqlalchemy import func, inspect
 from sqlalchemy.orm import Session
 
@@ -409,6 +410,40 @@ def canonical_issue_backfill_source_ids(
     witnesses: list[int] = []
     for event in events:
         if event.source_sle_id is not None:
+            continue
+        if (
+            event.source_kind == "terminal_release"
+            and str(event.source_ref2c or "").startswith("order-terminal-v1:")
+        ):
+            product = db.get(models.ProductionProduct, int(event.product_id))
+            order = (
+                db.get(models.ProductionOrder, int(product.order_id))
+                if product is not None else None
+            )
+            balance = -Decimal(str(event.delta_qty or 0))
+            key = (
+                int(event.product_id), int(event.component_item_id),
+                str(event.location_kind or ""), str(event.warehouse_ref1c or ""),
+            )
+            canonical_balance = format(balance.normalize(), "f")
+            coordinates = (
+                f"{target_cutoff.isoformat()}|{key}|{canonical_balance}|"
+                f"{order.updated_at.isoformat() if order and order.updated_at else ''}"
+            )
+            expected_key = "custody-terminal:" + hashlib.sha256(
+                coordinates.encode()
+            ).hexdigest()
+            if (
+                order is None
+                or balance <= 0
+                or not (bool(order.deletion_mark) or str(order.order_state_key or "").lower() == DONE_STATE_KEY)
+                or order.updated_at is None
+                or not _same_1c_timestamp(event.effective_at, target_cutoff)
+                or str(event.idempotency_key) != expected_key
+            ):
+                raise PhysicalRefreshProvenanceUnavailable(
+                    f"custody terminal plan is invalid (event_id={event.id})"
+                )
             continue
         if parent_cutoff is not None and not event.source_ref2c:
             _prove_forward_local_custody_command(db, event, parent_cutoff, target_cutoff)
@@ -1412,6 +1447,150 @@ def handoff_current_material_custody_provenance(
         custody_event_watermark=watermark,
         future_supply_idempotent=False,
         custody_idempotent=False,
+    )
+
+
+@dataclass(frozen=True)
+class PreparedMaterialCustodyHandoff:
+    parent_generation_id: int
+    target_generation_id: int
+    row_ids: tuple[int, ...]
+    watermark: int
+    parent_cutoff: datetime | None
+    target_cutoff: datetime
+    baseline_generation_id: int
+
+
+def prepare_current_material_custody_handoff(
+    db: Session, *, parent_generation_id: int, target_generation_id: int,
+) -> PreparedMaterialCustodyHandoff:
+    """Read-only validation for the final bounded provenance retag."""
+    parent, target, already_current = _generations(
+        db, parent_generation_id=int(parent_generation_id),
+        target_generation_id=int(target_generation_id),
+    )
+    if already_current:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "prepared custody handoff requires a BUILDING target"
+        )
+    manifest = db.get(
+        models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
+    )
+    if manifest is None or str(manifest.status or "") != "complete":
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody current owner manifest is missing or incomplete"
+        )
+    watermark = int(manifest.source_event_high_watermark_id or 0)
+    if _custody_event_watermark(db) != watermark:
+        raise PhysicalRefreshProvenanceUnavailable("custody has an unpublished event tail")
+    if db.get(models.ProductionMaterialCustodyProjectionManifest, int(target.id)) is not None:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody target manifest already exists before handoff"
+        )
+    rows = db.query(models.ProductionMaterialCustodyProjection).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True)
+    ).all()
+    if any(
+        int(row.ledger_generation_id) != int(parent.id)
+        or int(row.source_event_high_watermark_id or 0) != watermark
+        for row in rows
+    ):
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody current projection basis is mixed or stale"
+        )
+    if target.cutoff is None:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody handoff requires a target generation cutoff"
+        )
+    return PreparedMaterialCustodyHandoff(
+        parent_generation_id=int(parent.id), target_generation_id=int(target.id),
+        row_ids=tuple(sorted(int(row.id) for row in rows)), watermark=watermark,
+        parent_cutoff=manifest.cutoff, target_cutoff=target.cutoff,
+        baseline_generation_id=int(manifest.baseline_generation_id or parent.id),
+    )
+
+
+def install_prepared_material_custody_handoff(
+    db: Session, prepared: PreparedMaterialCustodyHandoff,
+) -> CompactProvenanceHandoffResult:
+    """Final-lock DML only: recheck prepared basis and retag compact owner."""
+    rows = (
+        db.query(models.ProductionMaterialCustodyProjection)
+        .filter(models.ProductionMaterialCustodyProjection.id.in_(prepared.row_ids))
+        .populate_existing().with_for_update().all()
+        if prepared.row_ids else []
+    )
+    manifest = (
+        db.query(models.ProductionMaterialCustodyProjectionManifest)
+        .filter_by(ledger_generation_id=prepared.parent_generation_id)
+        .populate_existing().with_for_update().one_or_none()
+    )
+    if (
+        manifest is None
+        or int(manifest.source_event_high_watermark_id or 0) != prepared.watermark
+        or tuple(sorted(int(row.id) for row in rows)) != prepared.row_ids
+        or any(
+            int(row.ledger_generation_id) != prepared.parent_generation_id
+            or int(row.source_event_high_watermark_id or 0) != prepared.watermark
+            for row in rows
+        )
+    ):
+        raise PhysicalRefreshProvenanceUnavailable(
+            "prepared custody handoff basis changed before install"
+        )
+    for row in rows:
+        row.ledger_generation_id = prepared.target_generation_id
+    manifest.ledger_generation_id = prepared.target_generation_id
+    manifest.cutoff = prepared.target_cutoff
+    manifest.baseline_generation_id = prepared.baseline_generation_id
+    db.flush()
+    return CompactProvenanceHandoffResult(
+        parent_generation_id=prepared.parent_generation_id,
+        target_generation_id=prepared.target_generation_id,
+        future_supply_rows=0, custody_rows=len(rows),
+        custody_event_watermark=prepared.watermark,
+        future_supply_idempotent=False, custody_idempotent=False,
+    )
+
+
+def install_verified_material_custody_handoff(
+    db: Session, *, parent_generation_id: int, target_generation_id: int,
+    expected_watermark: int,
+) -> CompactProvenanceHandoffResult:
+    """DML-only handoff after caller verified every prepared affected cell."""
+    manifest = (
+        db.query(models.ProductionMaterialCustodyProjectionManifest)
+        .filter_by(ledger_generation_id=int(parent_generation_id))
+        .populate_existing().with_for_update().one()
+    )
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    if (
+        target is None or target.cutoff is None
+        or int(manifest.source_event_high_watermark_id or 0) != int(expected_watermark)
+    ):
+        raise PhysicalRefreshProvenanceUnavailable(
+            "verified custody handoff marker changed before install"
+        )
+    changed = db.query(models.ProductionMaterialCustodyProjection).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True),
+        models.ProductionMaterialCustodyProjection.ledger_generation_id
+        == int(parent_generation_id),
+    ).update(
+        {models.ProductionMaterialCustodyProjection.ledger_generation_id: int(target_generation_id)},
+        synchronize_session=False,
+    )
+    manifest.ledger_generation_id = int(target_generation_id)
+    manifest.cutoff = target.cutoff
+    manifest.baseline_generation_id = int(
+        manifest.baseline_generation_id or parent_generation_id
+    )
+    db.flush()
+    return CompactProvenanceHandoffResult(
+        parent_generation_id=int(parent_generation_id),
+        target_generation_id=int(target_generation_id),
+        future_supply_rows=0, custody_rows=int(changed or 0),
+        custody_event_watermark=int(expected_watermark),
+        future_supply_idempotent=False, custody_idempotent=False,
     )
 
 

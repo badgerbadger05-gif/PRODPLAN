@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from app.database import get_db
 from app.models import (
     DefaultSpecification,
+    AcceptedProductionMutationState,
     Item,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
@@ -630,6 +631,7 @@ def test_successful_export_stamps_sync_link_and_issue_status(db_session, monkeyp
     assert link.target_number == issue.document_number
     assert link.target_number.startswith("MT")
     assert len(link.target_number) == 11
+    assert int(link.ledger_generation_id) == int(issue.ledger_generation_id)
 
     # ProductionOrderLineState.issue_status moves to 'exported'.
     state = (
@@ -652,6 +654,8 @@ def test_second_export_patches_existing_transfer(db_session, monkeypatch):
 
     exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
     assert len(fake.posts) == 1
+    state = db.get(AcceptedProductionMutationState, 1)
+    epoch = int(state.last_issued_epoch or 0) if state is not None else 0
 
     result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
     assert result["issues_created"] == 1
@@ -659,6 +663,8 @@ def test_second_export_patches_existing_transfer(db_session, monkeypatch):
     assert len(fake.posts) == 1
     assert len(fake.patches) == 1
     assert fake.patches[0][0] == "Document_ПеремещениеЗапасов(guid'reuse-ref-key')"
+    state = db.get(AcceptedProductionMutationState, 1)
+    assert (int(state.last_issued_epoch or 0) if state is not None else 0) == epoch
 
 
 def test_foreign_number_collision_allocates_another_number_without_adoption(

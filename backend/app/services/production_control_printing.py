@@ -16,6 +16,7 @@ from ..models import (
     Operation,
     PaintWeldChainLink,
     PlanningRun,
+    PlanningTruthState,
     StockBin,
     ProductionPlanHeader,
     ProductionPlanLine,
@@ -400,6 +401,15 @@ def _persist_route_sheets_printed_by_ids(
     unique_ids = sorted({pid for pid in ids if pid is not None})
     if not unique_ids:
         return 0
+    from .accepted_command_mutation import (
+        lock_accepted_mutation_state,
+        record_locked_accepted_production_mutation,
+    )
+    mutation_boundary = (
+        lock_accepted_mutation_state(db)
+        if db.get(PlanningTruthState, 1) is not None
+        else None
+    )
 
     existing_ids = {
         int(row.product_id)
@@ -434,6 +444,14 @@ def _persist_route_sheets_printed_by_ids(
                 issue_status="not_requested",
                 route_sheet_printed_at=now,
             )
+        )
+    if mutation_boundary is not None:
+        record_locked_accepted_production_mutation(
+            db,
+            pointer=mutation_boundary[0],
+            state=mutation_boundary[1],
+            mutation_kind="route_sheet_printed",
+            product_ids=existing_ids,
         )
     db.commit()
     compare_ids = return_ids if return_ids is not None else unique_ids

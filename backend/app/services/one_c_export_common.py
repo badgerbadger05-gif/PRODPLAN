@@ -167,7 +167,7 @@ def upsert_sync_link(
     target_ref_key: Optional[str],
     status: str,
     last_error: Optional[str],
-) -> None:
+) -> bool:
     existing = find_sync_link(
         db,
         sync_link_model,
@@ -192,7 +192,15 @@ def upsert_sync_link(
                 last_synced_at=synced_at,
             )
         )
-        return
+        return True
+
+    semantic_changed = any((
+        str(existing.target_number or "") != str(target_number or ""),
+        str(existing.payload_hash or "") != str(payload_hash or ""),
+        str(existing.status or "") != str(status or ""),
+        str(existing.last_error or "") != str(last_error or ""),
+        bool(target_ref_key) and str(existing.target_ref_key or "") != str(target_ref_key),
+    ))
 
     existing.target_number = target_number
     existing.payload_hash = payload_hash
@@ -202,6 +210,7 @@ def upsert_sync_link(
         existing.target_ref_key = target_ref_key
     if synced_at is not None:
         existing.last_synced_at = synced_at
+    return semantic_changed
 
 
 def post_document_operational(
@@ -253,11 +262,16 @@ def post_export_entries(
     on_success: Callable[[Any, str], None],
     on_error: Optional[Callable[[Any, str], None]] = None,
     log_error: Optional[Callable[[Any], str]] = None,
+    before_commit: Optional[Callable[[Any, str], None]] = None,
+    read_link_semantic: Optional[Callable[[Any], Any]] = None,
 ) -> Tuple[int, int]:
     created = 0
     errored = 0
     for entry, payload_envelope in entries:
         payload = payload_envelope["payload"]
+        pre_attempt_semantic = (
+            read_link_semantic(entry) if read_link_semantic is not None else None
+        )
         try:
             phash = payload_hash(payload)
             existing_ref_key = clean_ref1c(getattr(entry, "target_ref_key", None))
@@ -289,13 +303,13 @@ def post_export_entries(
             entry.target_ref_key = ref_key
             entry.status = "created"
 
-            upsert_link(
+            success_changed = bool(upsert_link(
                 entry=entry,
                 payload_hash=phash,
                 target_ref_key=ref_key,
                 status="success",
                 last_error=None,
-            )
+            ))
             on_success(entry, ref_key)
             created += 1
             # Persist each successful export immediately. A single commit at the
@@ -303,6 +317,16 @@ def post_export_entries(
             # POST but before that commit lost the stored Ref_Key, so a re-run
             # re-POSTed and created a duplicate document in 1C. Committing per
             # entry bounds that window to the single in-flight document.
+            final_semantic = (
+                read_link_semantic(entry) if read_link_semantic is not None else None
+            )
+            semantic_changed = (
+                pre_attempt_semantic != final_semantic
+                if read_link_semantic is not None
+                else success_changed
+            )
+            if before_commit is not None and semantic_changed:
+                before_commit(entry, "success")
             db.commit()
         except Exception as exc:
             # Read the ref_key before any rollback: if the POST succeeded and a
@@ -313,15 +337,25 @@ def post_export_entries(
             entry.error = str(exc)
             errored += 1
             try:
-                upsert_link(
+                error_changed = bool(upsert_link(
                     entry=entry,
                     payload_hash=payload_hash(payload),
                     target_ref_key=existing_ref_key or None,
                     status="error",
                     last_error=str(exc),
-                )
+                ))
                 if on_error is not None:
                     on_error(entry, str(exc))
+                final_semantic = (
+                    read_link_semantic(entry) if read_link_semantic is not None else None
+                )
+                semantic_changed = (
+                    pre_attempt_semantic != final_semantic
+                    if read_link_semantic is not None
+                    else error_changed
+                )
+                if before_commit is not None and semantic_changed:
+                    before_commit(entry, "error")
                 db.commit()
             except Exception:
                 # Keep the session usable for the remaining entries.

@@ -154,7 +154,12 @@ _REQUIRED_SCOPES = (
 )
 
 
-def _assert_current_execution_coverage(db: Session, generation_id: int) -> None:
+def _assert_current_execution_coverage(
+    db: Session,
+    generation_id: int,
+    *,
+    expected_parent_id: int | None = None,
+) -> None:
     generation = db.get(models.LedgerGeneration, int(generation_id))
     if generation is None or str(generation.status or "") != "accepted":
         raise ExecutionProjectionRetentionError(
@@ -163,7 +168,12 @@ def _assert_current_execution_coverage(db: Session, generation_id: int) -> None:
     pointer = db.query(models.PlanningTruthState).filter(
         models.PlanningTruthState.id == 1,
     ).one_or_none()
-    if pointer is None or int(pointer.current_generation_id or -1) != int(generation_id):
+    expected_pointer = (
+        int(generation_id)
+        if expected_parent_id is None
+        else int(expected_parent_id)
+    )
+    if pointer is None or int(pointer.current_generation_id or -1) != expected_pointer:
         raise ExecutionProjectionRetentionError(
             "execution projection cleanup requires the exact accepted truth pointer"
         )
@@ -256,6 +266,8 @@ def _record_retention_hold(db: Session, generation_id: int, reason: str) -> None
 def prune_retired_execution_projections(
     db: Session,
     current_generation_id: int,
+    *,
+    expected_parent_id: int | None = None,
 ) -> dict[str, int]:
     """Remove retired copies after the current publication boundary.
 
@@ -266,7 +278,9 @@ def prune_retired_execution_projections(
     """
 
     current_id = int(current_generation_id)
-    _assert_current_execution_coverage(db, current_id)
+    _assert_current_execution_coverage(
+        db, current_id, expected_parent_id=expected_parent_id,
+    )
     provenance_safe, provenance_reason = _provenance_prune_is_safe(db, current_id)
     params = {"current_generation_id": current_id}
     removed: dict[str, int] = {}

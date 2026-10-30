@@ -312,8 +312,14 @@ def _batch(db, count=2, add_count=0, replace_count=0):
             ))
     target = _generation(
         db, key="refresh", status="building", cutoff=cutoff,
-        watermarks={"generation_kind": "obligation_refresh", "parent_generation_id": parent_generation.id},
+        watermarks={
+            "generation_kind": "obligation_refresh",
+            "parent_generation_id": parent_generation.id,
+            "accepted_production_mutation_epoch": 0,
+        },
     )
+    if db.get(models.AcceptedProductionMutationState, 1) is None:
+        db.add(models.AcceptedProductionMutationState(id=1))
     # An obligation refresh reuses the accepted immutable physical prefix.
     target.physical_import_batch_id = parent_generation.physical_import_batch_id
     db.flush()
@@ -926,6 +932,8 @@ def test_publish_requires_intact_sealed_obligation_manifest(db_session, mutation
         ).encode()).hexdigest()
     else:
         target.source_watermarks[MANIFEST_HASH_KEY] = "0" * 64
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(target, "source_watermarks")
     db_session.flush()
 
     with pytest.raises(ObligationRefreshPublishError, match=error):

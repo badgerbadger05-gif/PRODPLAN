@@ -280,17 +280,18 @@ def test_local_launch_publishes_new_executor_when_retained_order_is_fully_produc
     assert old_product.order.order_state_key is None
 
 
-def test_command_worker_does_not_race_physical_publication(monkeypatch):
+def test_command_worker_has_no_building_lifecycle_gate(monkeypatch):
     from app.services import production_control_command_worker as worker
-    def busy(db, *, action):
-        assert action == 'materialize'
-        raise HTTPException(409, detail={"code": "production_ledger_publication_busy"})
-    monkeypatch.setattr(worker, '_lock_command_publication', busy)
-    monkeypatch.setattr(worker, '_execute', lambda *a: pytest.fail('busy Ledger must not write'))
-    with pytest.raises(HTTPException) as error:
-        from types import SimpleNamespace
-        worker.execute(SimpleNamespace(rollback=lambda: None), 'materialize', {})
-    assert error.value.status_code == 409
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setattr(
+        worker, '_execute',
+        lambda db, action, arguments: calls.append((action, arguments)) or {'ok': True},
+    )
+    assert worker.execute(
+        SimpleNamespace(rollback=lambda: None), 'materialize', {'id': 7},
+    ) == {'ok': True}
+    assert calls == [('materialize', {'id': 7})]
 
 
 def test_materials_command_skips_global_publication_lock(monkeypatch):
@@ -298,11 +299,6 @@ def test_materials_command_skips_global_publication_lock(monkeypatch):
     from app.services import production_control_command_worker as worker
 
     calls = []
-    monkeypatch.setattr(
-        worker,
-        '_lock_command_publication',
-        lambda *args, **kwargs: pytest.fail('materials must not acquire the global P lock'),
-    )
     monkeypatch.setattr(
         worker,
         '_execute',
@@ -319,16 +315,20 @@ def test_materials_command_skips_global_publication_lock(monkeypatch):
     assert calls == [('materials', {'work_item_id': 7, 'qty': 3})]
 
 
-def test_prepare_materials_never_takes_planning_truth_row_lock(db_session, monkeypatch):
+def test_prepare_materials_stamps_short_planning_truth_boundary(db_session, monkeypatch):
     work, identity, revision = _current(db_session)
     real_query = db_session.query
+
+    pointer_locks = []
 
     def guarded_query(*entities, **kwargs):
         query = real_query(*entities, **kwargs)
         if entities == (models.PlanningTruthState,):
-            query.with_for_update = lambda *args, **kwargs: pytest.fail(
-                'materials must rely on manifest-to-row locks, not the global P lock'
-            )
+            real_lock = query.with_for_update
+            def tracked_lock(*args, **kwargs):
+                pointer_locks.append(True)
+                return real_lock(*args, **kwargs)
+            query.with_for_update = tracked_lock
         return query
 
     monkeypatch.setattr(db_session, 'query', guarded_query)
@@ -347,96 +347,22 @@ def test_prepare_materials_never_takes_planning_truth_row_lock(db_session, monke
         current_identity=identity,
         expected_source_revision=revision,
     )['qty'] == 3
-
-
-def test_command_worker_waits_briefly_before_reporting_busy_launch(monkeypatch):
-    from types import SimpleNamespace
-    from sqlalchemy.exc import DBAPIError
-    from app.services import production_control_command_worker as worker
-
-    statements = []
-    lock_calls = []
-    lock_error = DBAPIError(
-        'SELECT planning_truth_state FOR UPDATE', {},
-        SimpleNamespace(pgcode='55P03'),
-    )
-
-    class Query:
-        def filter_by(self, **values):
-            assert values == {'id': 1}
-            return self
-
-        def with_for_update(self, **options):
-            lock_calls.append(options)
-            return self
-
-        def one(self):
-            raise lock_error
-
-    db = SimpleNamespace(
-        get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name='postgresql')),
-        execute=lambda statement: statements.append(str(statement)),
-        query=lambda _model: Query(),
-    )
-
-    with pytest.raises(HTTPException) as error:
-        worker._lock_command_publication(db, action='materialize')
-
-    assert statements == ["SET LOCAL lock_timeout = '3000ms'"]
-    assert lock_calls == [{}]
-    assert error.value.status_code == 409
-    assert error.value.detail == {
-        'code': 'production_ledger_publication_busy',
-        'message': (
-            'Идёт публикация нового состояния журнала. Запуск не выполнен, '
-            'исполнительный заказ не создан. Повторите запуск после обновления журнала.'
-        ),
-    }
-
-
-def test_command_worker_restores_default_lock_timeout_after_acquiring_boundary():
-    from types import SimpleNamespace
-    from app.services import production_control_command_worker as worker
-
-    statements = []
-
-    class Query:
-        def filter_by(self, **values):
-            assert values == {'id': 1}
-            return self
-
-        def with_for_update(self, **options):
-            assert options == {}
-            return self
-
-        def one(self):
-            return object()
-
-    db = SimpleNamespace(
-        get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name='postgresql')),
-        execute=lambda statement: statements.append(str(statement)),
-        query=lambda _model: Query(),
-    )
-
-    worker._lock_command_publication(db, action='materials')
-
-    assert statements == [
-        "SET LOCAL lock_timeout = '3000ms'",
-        "SET LOCAL lock_timeout = DEFAULT",
-    ]
+    assert pointer_locks == [True]
+    assert db_session.query(models.AcceptedProductionMutation).filter_by(
+        mutation_kind="material_preview"
+    ).count() == 1
 
 
 def test_command_worker_rolls_back_failed_publication_transaction(monkeypatch):
     from types import SimpleNamespace
     from app.services import production_control_command_worker as worker
     calls = []
-    monkeypatch.setattr(worker, '_lock_command_publication', lambda db, *, action: calls.append(f'lock:{action}'))
     def fail(*args):
         raise ValueError('failed command')
     monkeypatch.setattr(worker, '_execute', fail)
     with pytest.raises(ValueError):
         worker.execute(SimpleNamespace(rollback=lambda: calls.append('rollback')), 'materialize', {})
-    assert calls == ['lock:materialize', 'rollback']
+    assert calls == ['rollback']
 
 
 def test_current_command_runs_while_physical_import_lifecycle_is_busy(db_session, monkeypatch):

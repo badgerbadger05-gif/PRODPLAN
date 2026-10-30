@@ -62,6 +62,7 @@ from .one_c_manufacture_export import (
     export_manufactures_to_1c,
 )
 from .bom_specification_resolver import BomSpecificationResolver
+from .accepted_command_mutation import stamp_external_production_metadata
 
 
 PIECEWORK_ENTITY = "Document_СдельныйНаряд"
@@ -747,8 +748,8 @@ def _upsert_link(
     target_ref_key: Optional[str],
     status: str,
     last_error: Optional[str],
-) -> None:
-    _upsert_sync_link(
+) -> bool:
+    return _upsert_sync_link(
         db,
         SyncLink,
         source_doctype="piecework",
@@ -864,6 +865,10 @@ def export_piecework_to_1c(
                 _record_manufacture_export_error(db, entry.manufacture_id, str(exc))
                 _upsert_link(db, entry=entry, payload_hash="", target_ref_key=previous_link.target_ref_key if previous_link else None,
                              status="error", last_error=str(exc))
+                stamp_external_production_metadata(
+                    db, mutation_kind="piecework_export_error",
+                    product_ids=(int(entry.product_id),),
+                )
                 db.commit()
         result["entries"].append(asdict(entry))
     if result["manufactures_error"]:
@@ -1208,20 +1213,25 @@ def _export_checked_piecework(db, entries, *, dry_run, combined=False, standalon
             return summary
 
         def save_links(*, entry, payload_hash, target_ref_key, status, last_error):
+            changed = False
             for index, current in enumerate(entries):
                 ref = target_ref_key if payloads[index]["Операции"] else next(iter(existing_refs[current.manufacture_id]), None)
-                _upsert_sync_link(db, SyncLink, source_doctype=source_doctype,
+                changed = bool(_upsert_sync_link(db, SyncLink, source_doctype=source_doctype,
                     source_id=current.manufacture_id, target_entity=PIECEWORK_ENTITY,
                     target_number=target.number, payload_hash=payload_hash,
-                    target_ref_key=ref, status=status, last_error=last_error)
+                    target_ref_key=ref, status=status, last_error=last_error)) or changed
                 if status == "success" and not standalone:
                     manufacture = db.get(ProductionManufacture, current.manufacture_id)
                     if manufacture is not None and str(manufacture.export_error or "").startswith("СдельныйНаряд:"):
                         manufacture.export_error = None
+                        changed = True
+            return changed
 
         if not payload["Операции"]:
-            save_links(entry=target, payload_hash="live-coverage", target_ref_key=retry_ref,
-                       status="success", last_error=None)
+            links_changed = save_links(
+                entry=target, payload_hash="live-coverage",
+                target_ref_key=retry_ref, status="success", last_error=None,
+            )
             db.commit()
             for entry in entries:
                 entry.status = "existing"
@@ -1257,7 +1267,21 @@ def _export_checked_piecework(db, entries, *, dry_run, combined=False, standalon
 
         created, errors = _post_export_entries(db, entries=[(target, {"payload": payload})], client=client,
             target_entity=PIECEWORK_ENTITY, missing_ref_error="1С не вернула ссылку на наряд",
-            upsert_link=save_links, on_success=posted, on_error=failed)
+            upsert_link=save_links, on_success=posted, on_error=failed,
+            before_commit=lambda entry, status: stamp_external_production_metadata(
+                db, mutation_kind=f"piecework_export_{status}",
+                product_ids=tuple(int(row.product_id) for row in entries),
+            ),
+            read_link_semantic=lambda entry: (
+                (lambda link: None if link is None else (
+                    str(link.target_number or ""), str(link.payload_hash or ""),
+                    str(link.target_ref_key or ""), str(link.status or ""),
+                    str(link.last_error or ""), int(link.ledger_generation_id or 0),
+                ))(_find_sync_link(
+                    db, SyncLink, source_doctype=source_doctype,
+                    source_id=int(entry.manufacture_id), target_entity=PIECEWORK_ENTITY,
+                ))
+            ))
         for index, entry in enumerate(entries):
             entry.target_ref_key = target.target_ref_key if payloads[index]["Операции"] else next(iter(existing_refs[entry.manufacture_id]), None)
         summary.update(status="ok" if not errors else "partial_error", created=created, errored=errors,
@@ -1324,6 +1348,10 @@ def create_standalone_piecework(db, product_id, *, qty, operation_executors, req
         unit_ref1c=product.item.unit, qty=float(command.target_qty), number=standalone_piecework_number(command.id),
         spec_ref1c=defaults.spec_ref1c, characteristic_ref1c=product.characteristic_ref1c,
         structural_unit_ref1c=defaults.structural_unit_ref1c, operation_lines=selected)
+    stamp_external_production_metadata(
+        db, mutation_kind="standalone_piecework_preflight",
+        product_ids=(int(product.product_id),),
+    )
     db.commit()
     result = _export_checked_piecework(db, [entry], dry_run=False, standalone=True)
     if result.get("errored"):

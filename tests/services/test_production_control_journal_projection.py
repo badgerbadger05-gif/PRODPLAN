@@ -8,6 +8,7 @@ from app import models
 from app.routers.production_control import get_orders_journal
 from app.services import production_control_material_availability as material_availability
 from app.services.planning_truth import publish_generation
+from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
 from app.services.production_control_material_availability import get_materials_snapshot
 from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
@@ -280,13 +281,19 @@ def _building_generation(db, key: str):
         status="completed",
         cutoff=cutoff,
         completed_at=cutoff,
-        source_watermarks={"explicit_empty_prefix": True},
+        source_watermarks={
+            "explicit_empty_prefix": True,
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+        },
     )
     generation = models.LedgerGeneration(
         generation_key=key,
         status="building",
         cutoff=cutoff,
-        source_watermarks={"explicit_empty_prefix": True},
+        source_watermarks={
+            "explicit_empty_prefix": True,
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+        },
         capabilities={},
         physical_import_batch=physical,
         algorithm_version="test",
@@ -1436,6 +1443,229 @@ def test_compact_production_reuses_unchanged_parent_material_snapshot(
     )
     assert len(changed_payload["rows"]) == changed_payload["meta"]["row_count"] == 1
     assert calls == [product.product_id]
+
+
+def test_compact_target_material_context_reads_target_stock_not_parent(db_session):
+    from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
+    from app.services.production_material_custody import MaterialCustodyState
+
+    parent = _building_generation(db_session, "target-material-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    target = _building_generation(db_session, "target-material-child")
+    root, _order, product = _journal_line(db_session)
+    component = models.Item(item_code="TARGET-COMP", item_name="Target component")
+    spec = models.Specification(spec_name="Target material spec", spec_ref1c="target-material-spec")
+    warehouse = models.StockWarehouse(
+        warehouse_ref1c="TARGET-WH", warehouse_code="TW",
+        warehouse_name="Target warehouse", is_selected=True,
+    )
+    db_session.add_all((component, spec, warehouse))
+    db_session.flush()
+    db_session.add_all((
+        models.DefaultSpecification(item_id=root.item_id, spec_id=spec.spec_id),
+        models.SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1),
+        models.StockBin(
+            ledger_generation_id=parent.id, item_id=component.item_id,
+            characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c=warehouse.warehouse_ref1c, on_hand=10,
+        ),
+    ))
+    product.spec_id = spec.spec_id
+    product.quantity = 5
+    db_session.flush()
+
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": []},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[999],
+        affected_item_ids=None,
+        custody_override=MaterialCustodyState(),
+        use_target_material_context=True,
+    )
+    row = next(row for row in payload["rows"] if row.get("product_id") == product.product_id)
+    component_row = row["material_coverage_snapshot"]["components"][0]
+    assert component_row["stock_qty"] == 0
+    assert row["coverage_status"] == "shortage"
+
+
+def test_compact_target_context_applies_shared_component_custody_once(db_session):
+    from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
+    from app.services.production_material_custody import (
+        MaterialCustodyState, ProductMaterialCustody,
+    )
+
+    parent = _building_generation(db_session, "shared-custody-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    target = _building_generation(db_session, "shared-custody-target")
+    root = models.Item(item_code="SHARED-ROOT", item_name="Shared root")
+    component = models.Item(item_code="SHARED-M", item_name="Shared M")
+    spec = models.Specification(spec_name="Shared spec", spec_ref1c="shared-spec")
+    warehouse = models.StockWarehouse(
+        warehouse_ref1c="SHARED-WH", warehouse_code="SW",
+        warehouse_name="Shared warehouse", is_selected=True,
+    )
+    db_session.add_all((root, component, spec, warehouse))
+    db_session.flush()
+    db_session.add_all((
+        models.DefaultSpecification(item_id=root.item_id, spec_id=spec.spec_id),
+        models.SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1),
+        models.StockBin(
+            ledger_generation_id=target.id, item_id=component.item_id,
+            characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c=warehouse.warehouse_ref1c, on_hand=10,
+        ),
+    ))
+    products = []
+    for suffix in ("A", "B"):
+        order = models.ProductionOrder(
+            order_number=f"SHARED-{suffix}", order_date=parent.cutoff,
+            order_ref1c=f"shared-{suffix}",
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = models.ProductionProduct(
+            order_id=order.order_id, item_id=root.item_id, quantity=6,
+            produced_qty=0, remaining_qty=6, spec_id=spec.spec_id,
+        )
+        db_session.add(product)
+        db_session.flush()
+        products.append(product)
+
+    custody = MaterialCustodyState(
+        by_product={
+            products[0].product_id: ProductMaterialCustody(
+                in_transit={component.item_id: 6},
+            ),
+        },
+        by_warehouse_item={(warehouse.warehouse_ref1c, component.item_id): 6},
+        by_product_warehouse_item={
+            (
+                products[0].product_id, warehouse.warehouse_ref1c,
+                component.item_id, "transit",
+            ): 6,
+        },
+    )
+    db_session.flush()
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id, parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": []}, drum_payload={"rows": []},
+        shelf_payload={"rows": []}, accepted_run_ids=[999],
+        affected_item_ids=None, custody_override=custody,
+        use_target_material_context=True,
+    )
+    by_product = {
+        int(row["product_id"]): row for row in payload["rows"]
+        if row.get("product_id") is not None
+    }
+    a = by_product[products[0].product_id]["material_coverage_snapshot"]["components"][0]
+    b = by_product[products[1].product_id]["material_coverage_snapshot"]["components"][0]
+    assert (a["stock_qty"], a["available_qty"], a["reserved_for_order_qty"]) == (10, 4, 6)
+    assert (b["stock_qty"], b["available_qty"], b["reserved_qty"]) == (10, 4, 6)
+
+
+def test_target_reservation_override_bridges_new_requirement_and_local_order(db_session):
+    from app.services.item_ledger.reservation_current import (
+        PreparedReservationOwnerView,
+    )
+    from app.services.production_control_journal import materialize_make_work_items
+
+    parent = _building_generation(db_session, "target-reservation-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    run, work = _make_proposal(db_session, parent, "-target-reservation")
+    db_session.add(models.PlanningLivePointer(
+        plan_id=run.source_plan_id, run_id=run.run_id,
+    ))
+    db_session.flush()
+    owner = db_session.get(models.ReservationEntry, work.reservation_id)
+    owner.owner_kind = "current"
+    owner.is_current = True
+    owner.current_identity = (
+        f"reservation:req:{owner.requirement_id}:mode:make"
+    )
+    db_session.flush()
+    created = materialize_make_work_items(
+        db_session, [work.id],
+        launch_requests={work.id: {"launch_qty": 5, "expected_materialized_qty": 0}},
+    )["created"]
+    assert sum(float(row["qty"]) for row in created) == 5
+    old_requirement = db_session.get(models.MrpRequirement, work.requirement_id)
+    target = _building_generation(db_session, "target-reservation-child")
+    target_run = models.PlanningRun(
+        status="BUILDING", config_snapshot=dict(run.config_snapshot or {}),
+        source_plan_id=run.source_plan_id, prior_run_id=run.run_id,
+        period_from=run.period_from, period_to=run.period_to,
+        ledger_generation_id=target.id,
+        ledger_cutoff=parent.cutoff, active_freeze_version=run.active_freeze_version,
+    )
+    db_session.add(target_run)
+    db_session.flush()
+    new_requirement = models.MrpRequirement(
+        run_id=target_run.run_id, item_id=old_requirement.item_id,
+        total_required_qty=old_requirement.total_required_qty,
+        net_required_qty=old_requirement.net_required_qty,
+        period_from=old_requirement.period_from,
+        period_to=old_requirement.period_to,
+        bom_level=old_requirement.bom_level, freeze_version=old_requirement.freeze_version,
+    )
+    db_session.add(new_requirement)
+    db_session.flush()
+    target_view = PreparedReservationOwnerView(
+        current_identity=f"reservation:req:{new_requirement.id}:mode:make",
+        stage_reservation_id=owner.id + 100000,
+        accepted_owner_id=None,
+        item_id=owner.item_id,
+        characteristic_ref=str(owner.characteristic_ref or ""),
+        organization_ref=str(owner.organization_ref or ""),
+        run_id=target_run.run_id, freeze_version=owner.freeze_version,
+        requirement_id=new_requirement.id, realization_mode="make",
+        planning_stock_pool=str(owner.planning_stock_pool),
+        reserved_qty=owner.reserved_qty,
+        covered_from_stock_at_freeze_qty=owner.covered_from_stock_at_freeze_qty,
+        replenishment_required_qty=owner.replenishment_required_qty,
+        replenishment_received_qty=5, realized_qty=5,
+        lifecycle_status="active",
+        priority_period_from=owner.priority_period_from,
+        priority_period_to=owner.priority_period_to,
+    )
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id, parent_generation_id=parent.id,
+        assembly_payload={
+            "queue_rows": [{
+                "entity_kind": "assembly_queue",
+                "business_identity": "plan-line:target-reservation",
+                "payload": {"run_id": run.run_id, "item_id": owner.item_id},
+            }],
+        },
+        drum_payload={"rows": []}, shelf_payload={"rows": []},
+        accepted_run_ids=[target_run.run_id], affected_item_ids=None,
+        use_target_material_context=True,
+        reservation_views_override=[target_view],
+    )
+    proposal = next(
+        row for row in payload["rows"] if row.get("product_id") is None
+    )
+    assert proposal["current_identity"] == (
+        f"mrp-reservation:reservation:req:{new_requirement.id}:mode:make"
+    )
+    # Target remaining is 12 - received 5 = 7; the existing local executor
+    # created from the predecessor requirement owns 5, so only 2 remain.
+    assert proposal["launchable_qty"] == 2
+    assert any(float(row.get("quantity") or 0) == 5 for row in payload["rows"] if row.get("product_id"))
 
 
 def test_compact_make_row_parity_with_legacy_builder(db_session):

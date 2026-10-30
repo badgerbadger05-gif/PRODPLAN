@@ -318,6 +318,13 @@ read-model. Frontend выполняет только форматировани�
   цепочка закрытых исторических run этого же плана;
 - отсутствие ссылок на несуществующую документацию.
 
+Accepted-command coordination has one compact technical owner:
+`AcceptedProductionMutationState` plus compactable affected-scope rows
+`AcceptedProductionMutation`. It never owns quantities. `last_issued_epoch`
+and `last_consumed_epoch` are monotonic and never reset by GC. Pending rows
+above the consumed HWM block destructive clear/rebuild; consumed rows may be
+deleted only atomically with HWM advance. Its generation FK is `RESTRICT`.
+
 ## R4. Текущее пополнение и границы транзакции
 
 Принятое физическое replenishment назначается единственным писателем

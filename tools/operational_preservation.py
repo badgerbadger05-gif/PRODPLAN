@@ -32,12 +32,16 @@ TABLES = (
     "purchase_export_batch", "purchase_export_line_allocation",
     "purchase_export_obligation_allocation", "production_plan_header",
     "production_plan_line",
+    "accepted_production_mutation_state", "accepted_production_mutation",
 )
 # This historical alias is not a table in the source schema; capture its
 # absence explicitly instead of silently omitting unavailable tables.
-OPTIONAL_TABLES = frozenset({"production_order_lines"})
+OPTIONAL_TABLES = frozenset({
+    "production_order_lines",
+    "accepted_production_mutation_state", "accepted_production_mutation",
+})
 SOURCE_REVISION = "20260909_02"
-TARGET_REVISION = "20261030_01"
+TARGET_REVISION = "20261030_02"
 PURCHASE_ADDITIONS = frozenset({
     "current_execution_scope_id", "current_execution_source_revision",
 })

@@ -860,6 +860,8 @@ def _current_business_payload(row: Any) -> dict[str, Any]:
 def publish_current_future_supply(
     db: Session,
     generation_id: int,
+    *,
+    expected_parent_id: int | None = None,
 ) -> Mapping[str, Any]:
     """Promote one accepted capture into the compact current projection.
 
@@ -869,12 +871,25 @@ def publish_current_future_supply(
     """
     target = db.get(models.LedgerGeneration, int(generation_id))
     pointer = db.query(models.PlanningTruthState).filter_by(id=1).one_or_none()
-    if (
-        target is None
-        or str(target.status) != "accepted"
-        or pointer is None
-        or int(pointer.current_generation_id or -1) != int(target.id)
-    ):
+    pre_pointer = expected_parent_id is not None
+    valid_boundary = (
+        target is not None
+        and pointer is not None
+        and (
+            (
+                pre_pointer
+                and str(target.status) in {"building", "accepted"}
+                and int(pointer.current_generation_id or -1)
+                == int(expected_parent_id)
+            )
+            or (
+                not pre_pointer
+                and str(target.status) == "accepted"
+                and int(pointer.current_generation_id or -1) == int(target.id)
+            )
+        )
+    )
+    if not valid_boundary:
         raise FutureSupplyCaptureError(
             "future supply current publication requires the accepted truth pointer"
         )

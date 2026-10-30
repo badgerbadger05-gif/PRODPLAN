@@ -56,6 +56,7 @@ from .odata_client import OData1CClient
 from .one_c_document_numbers import material_issue_number, material_issue_number_value
 from .one_c_production_order_export import export_production_orders_to_1c
 from .planning_truth import require_accepted_truth
+from .accepted_command_mutation import stamp_external_production_metadata
 
 
 STOCK_TRANSFER_ENTITY = "Document_ПеремещениеЗапасов"
@@ -673,8 +674,8 @@ def _upsert_link(
     target_ref_key: Optional[str],
     status: str,
     last_error: Optional[str],
-) -> None:
-    _upsert_sync_link(
+) -> bool:
+    changed = _upsert_sync_link(
         db,
         SyncLink,
         source_doctype="material_issue",
@@ -690,10 +691,13 @@ def _upsert_link(
     link = _existing_link(db, int(entry.issue_id))
     if link is None:
         raise RuntimeError("material issue SyncLink upsert was not persisted")
+    generation_changed = False
     if link.ledger_generation_id is None and entry.ledger_generation_id is not None:
         # Creation provenance is immutable; later accepted generations do not
         # expire an operational transfer that is still tied to live MRP work.
         link.ledger_generation_id = int(entry.ledger_generation_id)
+        generation_changed = True
+    return bool(changed or generation_changed)
 
 
 def _mark_issue_exported(
@@ -983,6 +987,17 @@ def export_material_issues_to_1c(
         # Persist the allocated collision-free number before network I/O.  If
         # the process stops after 1C accepts the POST, the next attempt uses
         # the same origin marker and recovers instead of creating a duplicate.
+        affected_issue_ids = {
+            int(entry.issue_id) for entry in (*recovered, *pending_entries)
+        }
+        stamp_external_production_metadata(
+            db, mutation_kind="material_issue_export_preflight",
+            product_ids=tuple(
+                int(row[0])
+                for row in db.query(ProductionMaterialIssue.product_id)
+                .filter(ProductionMaterialIssue.issue_id.in_(affected_issue_ids)).all()
+            ),
+        )
         db.commit()
 
     for entry, payload in zip(pending_entries, pending_payloads):
@@ -997,6 +1012,22 @@ def export_material_issues_to_1c(
         upsert_link=lambda **kwargs: _upsert_link(db, **kwargs),
         on_success=lambda entry, ref_key: _mark_issue_exported(db, entry.issue_id, ref_key),
         on_error=lambda entry, error: _mark_issue_error(db, entry.issue_id, error),
+        before_commit=lambda entry, status: stamp_external_production_metadata(
+            db,
+            mutation_kind=f"material_issue_export_{status}",
+            product_ids=tuple(
+                int(row[0])
+                for row in db.query(ProductionMaterialIssue.product_id)
+                .filter(ProductionMaterialIssue.issue_id == int(entry.issue_id)).all()
+            ),
+        ),
+        read_link_semantic=lambda entry: (
+            (lambda link: None if link is None else (
+                str(link.target_number or ""), str(link.payload_hash or ""),
+                str(link.target_ref_key or ""), str(link.status or ""),
+                str(link.last_error or ""), int(link.ledger_generation_id or 0),
+            ))(_existing_link(db, int(entry.issue_id)))
+        ),
         log_error=lambda entry: f"[1C transfer export] issue_id={entry.issue_id} failed: {entry.error}",
     )
 

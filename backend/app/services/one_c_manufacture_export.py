@@ -67,6 +67,7 @@ from .odata_client import OData1CClient
 from .one_c_document_numbers import manufacture_number
 from .one_c_production_order_export import export_production_orders_to_1c
 from .bom_specification_resolver import BomSpecificationResolver
+from .accepted_command_mutation import stamp_external_production_metadata
 
 
 MANUFACTURE_ENTITY = "Document_СборкаЗапасов"
@@ -567,6 +568,7 @@ def _apply_balance_guard(
     remaining: Dict[Tuple[str, str], float] = {}
     exportable: List[ManufactureExportEntry] = []
     blocked = 0
+    changed_blocked_product_ids: set[int] = set()
     for entry, unit, needed in requirements:
         if not unit or not needed:
             exportable.append(entry)
@@ -592,12 +594,19 @@ def _apply_balance_guard(
                 .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
                 .one()
             )
-            m_row.export_error = error
+            if str(m_row.export_error or "") != str(error):
+                m_row.export_error = error
+                changed_blocked_product_ids.add(int(m_row.product_id))
             blocked += 1
             continue
         for ref, qty in needed.items():
             remaining[(unit, ref)] -= qty
         exportable.append(entry)
+    if changed_blocked_product_ids:
+        stamp_external_production_metadata(
+            db, mutation_kind="manufacture_export_blocked",
+            product_ids=changed_blocked_product_ids,
+        )
     if blocked:
         db.commit()
     return exportable, blocked
@@ -693,8 +702,8 @@ def _upsert_link(
     target_ref_key: Optional[str],
     status: str,
     last_error: Optional[str],
-) -> None:
-    _upsert_sync_link(
+) -> bool:
+    return _upsert_sync_link(
         db,
         SyncLink,
         source_doctype="manufacture",
@@ -870,6 +879,10 @@ def export_manufactures_to_1c(
         recovered.append(entry)
     if recovered:
         already_linked.extend(recovered)
+        stamp_external_production_metadata(
+            db, mutation_kind="manufacture_export_recovered",
+            product_ids=tuple(int(entry.product_id) for entry in recovered),
+        )
         db.commit()
     eligible = pending
     summary["manufactures_already_linked"] = len(already_linked)
@@ -932,6 +945,18 @@ def export_manufactures_to_1c(
         upsert_link=lambda **kwargs: _upsert_link(db, **kwargs),
         on_success=_mark_success,
         on_error=_mark_error,
+        before_commit=lambda entry, status: stamp_external_production_metadata(
+            db,
+            mutation_kind=f"manufacture_export_{status}",
+            product_ids=(int(entry.product_id),),
+        ),
+        read_link_semantic=lambda entry: (
+            (lambda link: None if link is None else (
+                str(link.target_number or ""), str(link.payload_hash or ""),
+                str(link.target_ref_key or ""), str(link.status or ""),
+                str(link.last_error or ""), int(link.ledger_generation_id or 0),
+            ))(_existing_link(db, int(entry.manufacture_id)))
+        ),
         log_error=lambda entry: (
             f"[1C manufacture export] manufacture_id={entry.manufacture_id} failed: {entry.error}"
         ),

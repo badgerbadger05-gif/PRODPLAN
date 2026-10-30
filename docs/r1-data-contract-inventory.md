@@ -99,11 +99,19 @@ fact_id)`. Возврат поставщику следует решению §1
 | assembly/shelf (`assembly_queue_line`, `assembly_readiness`, `drum_schedule`, `shelf_projection`) | saved current read-model projection | queue/readiness/drum/shelf workers | routers/UI/export |
 | supplier/output provenance (`stock_ledger_supplier_receipt_provenance`, `assembly_output_fact_decision`, `assembly_output_allocation`, `stock_bin`) | fact provenance and fold cache | replay/ingest/output allocators | physical visibility, audit/read-model |
 | `assembly_output_repair_job.source_generation_id`, `phase1_generation_id`; target `published_generation_id` | repair audit state | output repair workflow | repair gate/audit |
+| `accepted_production_mutation.accepted_generation_id` | compactable affected-scope coordination metadata, never quantity | accepted command writers | physical/obligation final CAS and bounded catch-up |
 
 Все перечисленные `ledger_generation_id` имеют FK на
 `ledger_generation.id` с `RESTRICT`, кроме audit-полей repair job, которые
 сейчас являются typed technical references без ORM FK. Это различие должно быть
 сохранено в R3 mapping, а не замаскировано копированием строк.
+
+`accepted_production_mutation_state` is the compact monotonic HWM owner. Its
+issued/consumed epochs are never reset by GC. Pending rows with epoch above
+`last_consumed_epoch` block destructive clear/rebuild; consumed rows may be
+deleted atomically with HWM advance. The FK to `ledger_generation` is
+`RESTRICT`: coordination provenance cannot silently cascade with generation
+cleanup and does not own any business quantity.
 
 ### 3.2 `parent_generation_id` и JSON
 

@@ -110,6 +110,58 @@ class CurrentReplenishmentResult:
     basis_correction_reason: str = ""
 
 
+class PreparedCurrentReplenishmentBasisConflict(CurrentReplenishmentError):
+    """Accepted replenishment changed after a lock-free preparation."""
+
+
+@dataclass(frozen=True)
+class TargetReservationView:
+    """Immutable target execution overlay keyed by stable reservation identity."""
+
+    current_identity: str
+    reservation_id: int
+    ledger_generation_id: int
+    item_id: int
+    run_id: int | None
+    requirement_id: int
+    realization_mode: str
+    planning_stock_pool: str
+    reserved_qty: Decimal
+    covered_from_stock_at_freeze_qty: Decimal
+    replenishment_required_qty: Decimal
+    replenishment_received_qty: Decimal
+    realized_qty: Decimal
+    priority_period_from: Any
+    priority_period_to: Any
+
+
+@dataclass(frozen=True)
+class PreparedCurrentReplenishmentChange:
+    generation_id: int
+    source_key: str
+    source_revision: int
+    scope_key: str
+    scope_checksum: str
+    distribution_scope: DistributionScope
+    plan: AllocationChangePlan
+    facts: tuple[Fact, ...]
+    reserves: tuple[Reserve, ...]
+    target_reservations: tuple[TargetReservationView, ...]
+    generation_basis: tuple[str, int]
+    pointer_generation_id: int | None
+    state_basis: tuple[Any, ...] | None
+    allocation_basis: tuple[tuple[Any, ...], ...]
+    reservation_basis: tuple[tuple[Any, ...], ...]
+    entry_id_by_identity: tuple[tuple[str, int], ...]
+    confirmed_empty_reason: str
+    basis_correction_reason: str
+    audit_reason: str
+    basis_fact_ids: tuple[int, ...]
+    baseline_fact_ids: tuple[int, ...]
+    baseline_dropped: tuple[tuple[str, str], ...]
+    idempotent_result: CurrentReplenishmentResult | None = None
+
+
 @dataclass(frozen=True)
 class BoundedMakeReplenishmentResult:
     """Evidence returned by the bounded current-owner make adapter.
@@ -182,6 +234,45 @@ class BoundedBuyReceiptDeltaManifest:
     backdate_from: datetime | None = None
     # Typed document exclusions are evidence only, never receipt quantities.
     excluded_supplier_entries: tuple[tuple[int, str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedBoundedMakeReplenishment:
+    target_generation_id: int
+    parent_generation_id: int
+    source_revision: int
+    affected_scopes: tuple[DistributionScope, ...]
+    scope_history_rows: int
+    changes: tuple[PreparedCurrentReplenishmentChange, ...]
+    netted_internal_transfer_rows: int = 0
+    scopes_confirmed_empty_by_netting: int = 0
+
+
+@dataclass(frozen=True)
+class PreparedBoundedBuyReplenishment:
+    target_generation_id: int
+    parent_generation_id: int
+    source_revision: int
+    affected_scopes: tuple[DistributionScope, ...]
+    delta_fact_rows: int
+    scope_replay_rows: int
+    changes: tuple[PreparedCurrentReplenishmentChange, ...]
+
+
+@dataclass(frozen=True)
+class PreparedAcceptedGenerationReplenishment:
+    generation_id: int
+    source_revision: int
+    changes: tuple[PreparedCurrentReplenishmentChange, ...]
+
+    @property
+    def target_reservations(self) -> tuple[TargetReservationView, ...]:
+        by_identity = {
+            row.current_identity: row
+            for change in self.changes
+            for row in change.target_reservations
+        }
+        return tuple(by_identity[key] for key in sorted(by_identity))
 
 
 def _decimal(value: object) -> Decimal:
@@ -1104,7 +1195,74 @@ def _previous_revision(
     return publishing_generation, True
 
 
-def apply_current_replenishment(
+def _replenishment_state_basis(
+    state: models.CurrentReplenishmentState | None,
+) -> tuple[Any, ...] | None:
+    if state is None:
+        return None
+    return (
+        int(state.id), _text(state.scope_key), _text(state.source_key),
+        int(state.ledger_generation_id), int(state.source_revision),
+        _text(state.scope_checksum), _text(state.writer_key), _text(state.status),
+    )
+
+
+def _replenishment_allocation_basis(
+    row: models.ReservationConsumptionAllocation,
+) -> tuple[Any, ...]:
+    return (
+        int(row.id), int(row.ledger_generation_id), int(row.reservation_id),
+        int(row.sle_id), _decimal(row.allocated_qty), _text(row.match_rule),
+        bool(row.is_current), _text(row.idempotency_key),
+    )
+
+
+def _replenishment_reservation_basis(row: models.ReservationEntry) -> tuple[Any, ...]:
+    return (
+        int(row.id), int(row.ledger_generation_id), _text(row.current_identity),
+        _text(row.owner_kind), bool(row.is_current), _text(row.lifecycle_status),
+        _decimal(row.replenishment_required_qty),
+        _decimal(row.replenishment_received_qty), _decimal(row.realized_qty),
+    )
+
+
+def _target_reservation_view(
+    entry: models.ReservationEntry,
+    received: Decimal,
+    *,
+    current_identity: str | None = None,
+) -> TargetReservationView:
+    value = min(
+        max(_decimal(received), Decimal("0")),
+        _decimal(entry.replenishment_required_qty),
+    )
+    return TargetReservationView(
+        current_identity=(
+            _text(current_identity) or _text(entry.current_identity)
+            or reservation_business_identity(
+                int(entry.requirement_id), _text(entry.realization_mode)
+            )
+        ),
+        reservation_id=int(entry.id),
+        ledger_generation_id=int(entry.ledger_generation_id),
+        item_id=int(entry.item_id),
+        run_id=int(entry.run_id) if entry.run_id is not None else None,
+        requirement_id=int(entry.requirement_id),
+        realization_mode=_text(entry.realization_mode),
+        planning_stock_pool=_text(entry.planning_stock_pool),
+        reserved_qty=_decimal(entry.reserved_qty),
+        covered_from_stock_at_freeze_qty=_decimal(
+            entry.covered_from_stock_at_freeze_qty
+        ),
+        replenishment_required_qty=_decimal(entry.replenishment_required_qty),
+        replenishment_received_qty=value,
+        realized_qty=value,
+        priority_period_from=entry.priority_period_from,
+        priority_period_to=entry.priority_period_to,
+    )
+
+
+def prepare_current_replenishment(
     db: Session,
     *,
     generation_id: int,
@@ -1125,8 +1283,8 @@ def apply_current_replenishment(
     proven_zero_net_fact_ids: Iterable[int] = (),
     revision_basis: RevisionBasis = "explicit",
     basis_correction_reason: str = "",
-) -> CurrentReplenishmentResult:
-    """Apply one complete accepted-fact scope atomically.
+) -> PreparedCurrentReplenishmentChange:
+    """Plan one complete accepted-fact scope without locks or accepted-owner DML.
 
     The caller owns the surrounding transaction (the function intentionally
     does not commit).  PostgreSQL locks the generation row and all existing
@@ -1202,7 +1360,6 @@ def apply_current_replenishment(
     generation = (
         db.query(models.LedgerGeneration)
         .filter(models.LedgerGeneration.id == int(generation_id))
-        .with_for_update()
         .one_or_none()
     )
     if generation is None:
@@ -1216,7 +1373,6 @@ def apply_current_replenishment(
     state = (
         db.query(models.CurrentReplenishmentState)
         .filter(models.CurrentReplenishmentState.scope_key == canonical_scope_key)
-        .with_for_update()
         .one_or_none()
     )
     if state is not None:
@@ -1229,8 +1385,6 @@ def apply_current_replenishment(
         # A row written under a documented legacy spelling is the same stream;
         # rewrite it in place so the alias disappears on first write instead
         # of needing a data migration.  Idempotent.
-        if _text(state.source_key) != canonical_key:
-            state.source_key = canonical_key
         previous_revision, legacy_marker = _previous_revision(state, revision_basis)
         if revision < previous_revision:
             raise CurrentReplenishmentError(
@@ -1261,22 +1415,12 @@ def apply_current_replenishment(
                 # An acknowledged basis correction: reopen the marker and let
                 # the replay below rewrite this scope under the same pointer.
                 basis_corrected = True
-                state.status = "applying"
-                db.flush()
             generation_changed = (
                 not drifted
                 and int(state.ledger_generation_id) != int(generation.id)
             )
-            if not drifted and (generation_changed or legacy_marker):
-                # A legacy marker re-published by its own generation is the
-                # same publication: only its revision spelling is brought to
-                # the generation rule, so the alias disappears on first write.
-                state.ledger_generation_id = int(generation.id)
-                state.source_revision = revision
-                state.updated_at = datetime.now(timezone.utc)
-                db.flush()
             if not drifted:
-                return CurrentReplenishmentResult(
+                idempotent_result = CurrentReplenishmentResult(
                     generation_id=int(generation.id),
                     source_key=canonical_key,
                     source_revision=revision,
@@ -1287,18 +1431,56 @@ def apply_current_replenishment(
                     audit_events=0,
                     idempotent=not (generation_changed or legacy_marker),
                 )
+                noop_entries = (
+                    db.query(models.ReservationEntry)
+                    .filter(models.ReservationEntry.id.in_(
+                        sorted({int(row.reserve_id) for row in reserve_rows})
+                    ))
+                    .all()
+                    if reserve_rows else []
+                )
+                return PreparedCurrentReplenishmentChange(
+                    generation_id=int(generation.id), source_key=canonical_key,
+                    source_revision=revision, scope_key=canonical_scope_key,
+                    scope_checksum=input_checksum, distribution_scope=distribution_scope,
+                    plan=AllocationChangePlan(
+                        insertions=(), updates=(), deletions=(),
+                        result=ReplayResult(
+                            allocations=(), realizations=(), surplus=(),
+                            fact_qty=Decimal("0"), allocated_qty=Decimal("0"),
+                            surplus_qty=Decimal("0"),
+                        ),
+                    ),
+                    facts=fact_rows, reserves=reserve_rows,
+                    target_reservations=tuple(
+                        _target_reservation_view(
+                            entry, _decimal(entry.replenishment_received_qty),
+                        )
+                        for entry in noop_entries
+                    ),
+                    generation_basis=(_text(generation.status), int(generation.id)),
+                    pointer_generation_id=(
+                        int(pointer.current_generation_id)
+                        if (pointer := db.get(models.PlanningTruthState, 1)) is not None
+                        and pointer.current_generation_id is not None else None
+                    ),
+                    state_basis=_replenishment_state_basis(state),
+                    allocation_basis=(),
+                    reservation_basis=tuple(
+                        _replenishment_reservation_basis(entry)
+                        for entry in noop_entries
+                    ),
+                    entry_id_by_identity=tuple(
+                        (_text(entry.current_identity), int(entry.id))
+                        for entry in noop_entries
+                    ),
+                    confirmed_empty_reason="", basis_correction_reason="",
+                    audit_reason="current_replay", basis_fact_ids=(),
+                    baseline_fact_ids=(), baseline_dropped=(),
+                    idempotent_result=idempotent_result,
+                )
     else:
-        state = models.CurrentReplenishmentState(
-            scope_key=canonical_scope_key,
-            source_key=canonical_key,
-            ledger_generation_id=int(generation.id),
-            source_revision=revision,
-            scope_checksum=input_checksum,
-            writer_key=WRITER_KEY,
-            status="applying",
-        )
-        db.add(state)
-        db.flush()
+        state = None
 
     allocations = (
         db.query(models.ReservationConsumptionAllocation)
@@ -1319,7 +1501,6 @@ def apply_current_replenishment(
                 scope_modes(distribution_scope[4])
             ),
         )
-        .with_for_update()
         .order_by(models.ReservationConsumptionAllocation.id.asc())
         .all()
     )
@@ -1344,7 +1525,6 @@ def apply_current_replenishment(
                 scope_modes(distribution_scope[4])
             ),
         )
-        .with_for_update()
         .all()
     )
     allocation_entries = (
@@ -1356,7 +1536,6 @@ def apply_current_replenishment(
                 })
             )
         )
-        .with_for_update()
         .all()
         if allocations or reserve_rows
         else []
@@ -1630,193 +1809,416 @@ def apply_current_replenishment(
     audit_events = 0
 
     baseline_fact_ids = tuple(sorted({int(fact_id) for fact_id, _reserve in baseline_dropped}))
-    for old in plan.deletions:
-        row = allocation_by_key[(old.fact_id, old.reserve_id)]
-        entry = entry_by_identity.get(old.reserve_id)
-        if entry is None:
-            raise CurrentReplenishmentError(
-                f"allocation references missing reservation {old.reserve_id}"
-            )
-        by_baseline = (str(old.fact_id), str(old.reserve_id)) in baseline_dropped
-        if by_baseline:
-            # Kept as history of what the owner was once credited with; the
-            # fact now counts once, as the owner's frozen stock.
-            row.is_current = False
-        else:
-            db.delete(row)
-        _audit_change(
-            db,
-            state=state,
-            generation=generation,
-            entry=entry,
-            fact_id=old.fact_id,
-            scope_key=canonical_scope_key,
-            source_revision=revision,
-            operation="retire" if by_baseline else "delete",
-            before=old,
-            after=None,
-            reason=FREEZE_BASELINE_REASON if by_baseline else audit_reason,
-            basis_fact_ids=baseline_fact_ids if by_baseline else basis_fact_ids,
-        )
-        audit_events += 1
-
-    for update in plan.updates:
-        row = allocation_by_key[(update.before.fact_id, update.before.reserve_id)]
-        entry = entry_by_identity.get(update.after.reserve_id)
-        if entry is None:
-            raise CurrentReplenishmentError(
-                f"allocation references missing reservation {update.after.reserve_id}"
-            )
-        row.allocated_qty = update.after.qty
-        row.match_rule = update.after.match_rule
-        row.ledger_generation_id = int(generation.id)
-        _audit_change(
-            db,
-            state=state,
-            generation=generation,
-            entry=entry,
-            fact_id=update.after.fact_id,
-            scope_key=canonical_scope_key,
-            source_revision=revision,
-            operation="update",
-            before=update.before,
-            after=update.after,
-            reason=audit_reason,
-            basis_fact_ids=basis_fact_ids,
-        )
-        audit_events += 1
-
-    for insertion in plan.insertions:
-        fact = fact_by_id.get(insertion.fact_id)
-        reserve = reserve_by_id.get(insertion.reserve_id)
-        entry = entry_by_identity.get(insertion.reserve_id)
-        if fact is None or reserve is None or entry is None:
-            raise CurrentReplenishmentError("allocation scope references unknown fact or reservation")
-        key = (insertion.fact_id, insertion.reserve_id)
-        row = legacy_by_key.get(key)
-        if row is None:
-            row = models.ReservationConsumptionAllocation(
-                ledger_generation_id=int(generation.id),
-                reservation_id=int(entry.id),
-                sle_id=int(fact.fact_id),
-                requirement_id=int(entry.requirement_id),
-                allocated_qty=insertion.qty,
-                match_rule=insertion.match_rule,
-                fact_ref=_text(fact.fact_id),
-                fact_line_ref="",
-                item_id=int(entry.item_id),
-                characteristic_ref=_text(entry.characteristic_ref),
-                organization_ref=_text(entry.organization_ref),
-                planning_stock_pool=_text(reserve.planning_stock_pool) or "default",
-                idempotency_key=(
-                    f"r4:{canonical_key}:{revision}:{insertion.fact_id}:{insertion.reserve_id}"
-                ),
-                allocation_role="replenishment_receipt",
-                is_current=True,
-                event_at=fact.posting_at,
-            )
-            db.add(row)
-        else:
-            # A pre-R4 generation copy is promoted in place.  Its row ID is
-            # retained; no duplicate current allocation is created.
-            row.is_current = True
-            row.ledger_generation_id = int(generation.id)
-            row.allocated_qty = insertion.qty
-            row.match_rule = insertion.match_rule
-            row.idempotency_key = (
-                f"r4:{source_key}:{revision}:{insertion.fact_id}:{insertion.reserve_id}"
-            )
-            row.planning_stock_pool = _text(reserve.planning_stock_pool) or "default"
-        _audit_change(
-            db,
-            state=state,
-            generation=generation,
-            entry=entry,
-            fact_id=insertion.fact_id,
-            scope_key=canonical_scope_key,
-            source_revision=revision,
-            operation="insert",
-            before=None,
-            after=insertion,
-            reason=audit_reason,
-            basis_fact_ids=basis_fact_ids,
-        )
-        audit_events += 1
-
-    db.flush()
-    if fail_after == "assignments":
-        raise CurrentReplenishmentError("injected failure after assignments")
-
     realization_by_reserve = {
         str(row.reserve_id): _decimal(row.realized_qty)
         for row in plan.result.realizations
     }
+    target_identities = (
+        set(reserve_by_id)
+        | {str(row.reserve_id) for row in plan.result.realizations}
+        | {str(row.reserve_id) for row in plan.insertions}
+        | {str(row.reserve_id) for row in plan.deletions}
+        | {str(row.after.reserve_id) for row in plan.updates}
+    )
+    target_reservations = tuple(
+        _target_reservation_view(
+            entry,
+            realization_by_reserve.get(
+                identity, _decimal(entry.replenishment_received_qty)
+            ),
+            current_identity=identity,
+        )
+        for identity, entry in sorted(entry_by_identity.items())
+        if identity in target_identities
+    )
+    target_entries = tuple(
+        entry for identity, entry in sorted(entry_by_identity.items())
+        if identity in target_identities
+    )
+    target_allocations = tuple(
+        row for row in allocations
+        if reservation_identity_by_id.get(str(int(row.reservation_id)), "")
+        in target_identities
+    )
+    target_legacy_allocations = tuple(
+        row for row in legacy_allocations
+        if reservation_identity_by_id.get(str(int(row.reservation_id)), "")
+        in target_identities
+    )
+    return PreparedCurrentReplenishmentChange(
+        generation_id=int(generation.id),
+        source_key=canonical_key,
+        source_revision=revision,
+        scope_key=canonical_scope_key,
+        scope_checksum=input_checksum,
+        distribution_scope=distribution_scope,
+        plan=plan,
+        facts=fact_rows,
+        reserves=reserve_rows_for_plan,
+        target_reservations=target_reservations,
+        generation_basis=(_text(generation.status), int(generation.id)),
+        pointer_generation_id=(
+            int(pointer.current_generation_id)
+            if (pointer := db.get(models.PlanningTruthState, 1)) is not None
+            and pointer.current_generation_id is not None else None
+        ),
+        state_basis=_replenishment_state_basis(state),
+        allocation_basis=tuple(
+            _replenishment_allocation_basis(row)
+            for row in (*target_allocations, *target_legacy_allocations)
+        ),
+        reservation_basis=tuple(
+            _replenishment_reservation_basis(entry) for entry in target_entries
+        ),
+        entry_id_by_identity=tuple(
+            (identity, int(entry.id))
+            for identity, entry in sorted(entry_by_identity.items())
+            if identity in target_identities
+        ),
+        confirmed_empty_reason=_text(confirmed_empty_reason),
+        basis_correction_reason=(
+            _text(basis_correction_reason) if basis_corrected else ""
+        ),
+        audit_reason=audit_reason,
+        basis_fact_ids=basis_fact_ids,
+        baseline_fact_ids=baseline_fact_ids,
+        baseline_dropped=tuple(sorted(baseline_dropped)),
+    )
+
+def install_prepared_current_replenishment(
+    db: Session,
+    prepared: PreparedCurrentReplenishmentChange,
+    *,
+    reservation_owner_ids: Mapping[str, int] | None = None,
+    closed_reservation_identities: Iterable[str] = (),
+    fail_after: Literal["assignments", "execution", "marker"] | None = None,
+) -> CurrentReplenishmentResult:
+    """Apply a precomputed R4 change after the caller holds pointer/epoch locks."""
+    closed_identities = {
+        _text(identity) for identity in closed_reservation_identities
+        if _text(identity)
+    }
+    target_identities = {identity for identity, _row_id in prepared.entry_id_by_identity}
+    overlap = sorted(closed_identities.intersection(target_identities))
+    if overlap:
+        raise PreparedCurrentReplenishmentBasisConflict(
+            "closed reservation proof overlaps R4 target identities: "
+            + ",".join(overlap[:4])
+        )
+    generation = (
+        db.query(models.LedgerGeneration)
+        .filter(models.LedgerGeneration.id == prepared.generation_id)
+        .populate_existing().with_for_update().one_or_none()
+    )
+    fresh_generation_basis = (
+        (_text(generation.status), int(generation.id))
+        if generation is not None else None
+    )
+    pointer = db.get(models.PlanningTruthState, 1)
+    pointer_generation_id = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None else None
+    )
+    accepted_unpublished_transition = (
+        prepared.generation_basis == ("building", prepared.generation_id)
+        and fresh_generation_basis == ("accepted", prepared.generation_id)
+        and pointer_generation_id == prepared.pointer_generation_id
+        and pointer_generation_id != prepared.generation_id
+    )
+    if (
+        generation is None
+        or (
+            fresh_generation_basis != prepared.generation_basis
+            and not accepted_unpublished_transition
+        )
+    ):
+        raise PreparedCurrentReplenishmentBasisConflict(
+            "replenishment generation basis changed after preparation"
+        )
+    state = (
+        db.query(models.CurrentReplenishmentState)
+        .filter(models.CurrentReplenishmentState.scope_key == prepared.scope_key)
+        .populate_existing().with_for_update().one_or_none()
+    )
+    if _replenishment_state_basis(state) != prepared.state_basis:
+        raise PreparedCurrentReplenishmentBasisConflict(
+            "replenishment source marker changed after preparation"
+        )
+    reservation_ids = [int(row[0]) for row in prepared.reservation_basis]
+    pending_entries = {
+        int(value.id): value
+        for value in tuple(db.new) + tuple(db.dirty)
+        if isinstance(value, models.ReservationEntry)
+        and int(value.id or 0) in reservation_ids
+    }
+    fresh_reservation_ids = [
+        row_id for row_id in reservation_ids if row_id not in pending_entries
+    ]
+    entries = list(pending_entries.values())
+    if fresh_reservation_ids:
+        entries.extend(
+            db.query(models.ReservationEntry)
+            .filter(models.ReservationEntry.id.in_(fresh_reservation_ids))
+            .populate_existing().with_for_update().all()
+        )
+    fresh_reservation_basis = tuple(sorted(
+        (_replenishment_reservation_basis(row) for row in entries),
+        key=lambda value: int(value[0]),
+    ))
+    expected_reservation_basis = tuple(sorted(
+        prepared.reservation_basis, key=lambda value: int(value[0])
+    ))
+    if reservation_owner_ids is not None:
+        # R11 owns the accepted-generation rebind as well as the current
+        # marker and copied execution quantities.  The explicit identity map
+        # authorizes those fields only; R4 still verifies row id, stable
+        # identity, lifecycle and immutable required denominator.
+        stable_indexes = (0, 2, 5, 6)
+        reservation_basis_matches = tuple(
+            tuple(row[index] for index in stable_indexes)
+            for row in fresh_reservation_basis
+        ) == tuple(
+            tuple(row[index] for index in stable_indexes)
+            for row in expected_reservation_basis
+        )
+    else:
+        reservation_basis_matches = (
+            fresh_reservation_basis == expected_reservation_basis
+        )
+    if not reservation_basis_matches:
+        raise PreparedCurrentReplenishmentBasisConflict(
+                "replenishment reservation basis changed after preparation"
+        )
+    allocation_ids = [int(row[0]) for row in prepared.allocation_basis]
+    allocations = (
+        db.query(models.ReservationConsumptionAllocation)
+        .filter(models.ReservationConsumptionAllocation.id.in_(allocation_ids))
+        .populate_existing().with_for_update().all()
+        if allocation_ids else []
+    )
+    if tuple(sorted(
+        (_replenishment_allocation_basis(row) for row in allocations),
+        key=lambda value: int(value[0]),
+    )) != tuple(sorted(prepared.allocation_basis, key=lambda value: int(value[0]))):
+        raise PreparedCurrentReplenishmentBasisConflict(
+            "replenishment allocation basis changed after preparation"
+        )
+    if prepared.idempotent_result is not None:
+        if state is not None and (
+            int(state.ledger_generation_id) != prepared.generation_id
+            or int(state.source_revision) != prepared.source_revision
+            or _text(state.source_key) != prepared.source_key
+        ):
+            state.ledger_generation_id = prepared.generation_id
+            state.source_revision = prepared.source_revision
+            state.source_key = prepared.source_key
+            state.updated_at = datetime.now(timezone.utc)
+            db.flush()
+        return prepared.idempotent_result
+
+    if state is None:
+        state = models.CurrentReplenishmentState(
+            scope_key=prepared.scope_key,
+            source_key=prepared.source_key,
+            ledger_generation_id=prepared.generation_id,
+            source_revision=prepared.source_revision,
+            scope_checksum=prepared.scope_checksum,
+            writer_key=WRITER_KEY,
+            status="applying",
+        )
+        db.add(state)
+        db.flush()
+    else:
+        state.status = "applying"
+        state.source_key = prepared.source_key
+        db.flush()
+
+    entry_by_physical_id = {int(row.id): row for row in entries}
+    owner_ids = dict(prepared.entry_id_by_identity)
+    if reservation_owner_ids is not None:
+        owner_ids.update({str(key): int(value) for key, value in reservation_owner_ids.items()})
+    entry_by_identity: dict[str, models.ReservationEntry] = {}
+    for identity, row_id in owner_ids.items():
+        entry = entry_by_physical_id.get(int(row_id))
+        if entry is None:
+            entry = (
+                db.query(models.ReservationEntry)
+                .filter(models.ReservationEntry.id == int(row_id))
+                .populate_existing().with_for_update().one_or_none()
+            )
+        entry_identity = _text(entry.current_identity) if entry is not None else ""
+        if entry is None or (
+            entry_identity and entry_identity != str(identity)
+        ) or (
+            reservation_owner_ids is not None
+            and str(identity) in reservation_owner_ids
+            and entry_identity != str(identity)
+        ):
+            raise PreparedCurrentReplenishmentBasisConflict(
+                f"reservation owner rebind changed for {identity}"
+            )
+        entry_by_identity[str(identity)] = entry
+    identity_by_entry_id = {
+        int(entry.id): identity for identity, entry in entry_by_identity.items()
+    }
+    allocation_by_key = {
+        (str(int(row.sle_id)), identity_by_entry_id[int(row.reservation_id)]): row
+        for row in allocations
+        if bool(row.is_current) and int(row.reservation_id) in identity_by_entry_id
+    }
+    legacy_by_key = {
+        (str(int(row.sle_id)), identity_by_entry_id[int(row.reservation_id)]): row
+        for row in allocations
+        if not bool(row.is_current) and int(row.reservation_id) in identity_by_entry_id
+    }
+    fact_by_id = {str(row.fact_id): row for row in prepared.facts}
+    reserve_by_id = {str(row.reserve_id): row for row in prepared.reserves}
+    baseline_dropped = set(prepared.baseline_dropped)
+    audit_events = 0
+    for old in prepared.plan.deletions:
+        row = allocation_by_key[(old.fact_id, old.reserve_id)]
+        entry = entry_by_identity[old.reserve_id]
+        by_baseline = (str(old.fact_id), str(old.reserve_id)) in baseline_dropped
+        if by_baseline:
+            row.is_current = False
+        else:
+            db.delete(row)
+        _audit_change(
+            db, state=state, generation=generation, entry=entry,
+            fact_id=old.fact_id, scope_key=prepared.scope_key,
+            source_revision=prepared.source_revision,
+            operation="retire" if by_baseline else "delete",
+            before=old, after=None,
+            reason=FREEZE_BASELINE_REASON if by_baseline else prepared.audit_reason,
+            basis_fact_ids=(
+                prepared.baseline_fact_ids if by_baseline else prepared.basis_fact_ids
+            ),
+        )
+        audit_events += 1
+    for update in prepared.plan.updates:
+        row = allocation_by_key[(update.before.fact_id, update.before.reserve_id)]
+        entry = entry_by_identity[update.after.reserve_id]
+        row.allocated_qty = update.after.qty
+        row.match_rule = update.after.match_rule
+        row.ledger_generation_id = prepared.generation_id
+        _audit_change(
+            db, state=state, generation=generation, entry=entry,
+            fact_id=update.after.fact_id, scope_key=prepared.scope_key,
+            source_revision=prepared.source_revision, operation="update",
+            before=update.before, after=update.after,
+            reason=prepared.audit_reason, basis_fact_ids=prepared.basis_fact_ids,
+        )
+        audit_events += 1
+    for insertion in prepared.plan.insertions:
+        fact = fact_by_id[insertion.fact_id]
+        reserve = reserve_by_id[insertion.reserve_id]
+        entry = entry_by_identity[insertion.reserve_id]
+        row = legacy_by_key.get((insertion.fact_id, insertion.reserve_id))
+        if row is None:
+            row = models.ReservationConsumptionAllocation(
+                ledger_generation_id=prepared.generation_id,
+                reservation_id=int(entry.id), sle_id=int(fact.fact_id),
+                requirement_id=int(entry.requirement_id), allocated_qty=insertion.qty,
+                match_rule=insertion.match_rule, fact_ref=_text(fact.fact_id),
+                fact_line_ref="", item_id=int(entry.item_id),
+                characteristic_ref=_text(entry.characteristic_ref),
+                organization_ref=_text(entry.organization_ref),
+                planning_stock_pool=_text(reserve.planning_stock_pool) or "default",
+                idempotency_key=(
+                    f"r4:{prepared.source_key}:{prepared.source_revision}:"
+                    f"{insertion.fact_id}:{insertion.reserve_id}"
+                ),
+                allocation_role="replenishment_receipt", is_current=True,
+                event_at=fact.posting_at,
+            )
+            db.add(row)
+        else:
+            row.is_current = True
+            row.ledger_generation_id = prepared.generation_id
+            row.allocated_qty = insertion.qty
+            row.match_rule = insertion.match_rule
+            row.idempotency_key = (
+                f"r4:{prepared.source_key}:{prepared.source_revision}:"
+                f"{insertion.fact_id}:{insertion.reserve_id}"
+            )
+            row.planning_stock_pool = _text(reserve.planning_stock_pool) or "default"
+        _audit_change(
+            db, state=state, generation=generation, entry=entry,
+            fact_id=insertion.fact_id, scope_key=prepared.scope_key,
+            source_revision=prepared.source_revision, operation="insert",
+            before=None, after=insertion, reason=prepared.audit_reason,
+            basis_fact_ids=prepared.basis_fact_ids,
+        )
+        audit_events += 1
+    db.flush()
+    if fail_after == "assignments":
+        raise CurrentReplenishmentError("injected failure after assignments")
+    target_by_identity = {
+        row.current_identity: row for row in prepared.target_reservations
+    }
     received_changed = False
-    for reserve_id, realized in realization_by_reserve.items():
-        entry = entry_by_identity.get(reserve_id)
-        reserve = reserve_by_id.get(reserve_id)
-        if entry is None or reserve is None:
-            raise CurrentReplenishmentError(f"realization references unknown reservation {reserve_id}")
-        received = min(max(realized, Decimal("0")), _decimal(entry.replenishment_required_qty))
-        if _decimal(entry.replenishment_received_qty) != received:
-            entry.replenishment_received_qty = received
-            entry.realized_qty = received
+    for identity, target in target_by_identity.items():
+        entry = entry_by_identity[identity]
+        if _decimal(entry.replenishment_received_qty) != target.replenishment_received_qty:
+            entry.replenishment_received_qty = target.replenishment_received_qty
+            entry.realized_qty = target.realized_qty
             received_changed = True
     db.flush()
     if fail_after == "execution":
         raise CurrentReplenishmentError("injected failure after execution")
-
     state.status = "completed"
-    state.ledger_generation_id = int(generation.id)
-    state.source_revision = revision
-    state.scope_checksum = input_checksum
-    state.changed_pairs = len(plan.insertions) + len(plan.updates) + len(plan.deletions)
+    state.ledger_generation_id = prepared.generation_id
+    state.source_revision = prepared.source_revision
+    state.scope_checksum = prepared.scope_checksum
+    state.changed_pairs = (
+        len(prepared.plan.insertions) + len(prepared.plan.updates)
+        + len(prepared.plan.deletions)
+    )
     state.updated_at = datetime.now(timezone.utc)
     db.flush()
     if fail_after == "marker":
         raise CurrentReplenishmentError("injected failure after marker")
-
-    # An accepted-pointer correction can change BUY fulfillment without a new
-    # physical delta (and even without changing any allocation pair).  The
-    # purchase journal reuses untouched parent rows during bounded refresh;
-    # mark that persisted result unavailable in this same transaction so the
-    # next no-op tick rebuilds it from this canonical current owner.  BUILDING
-    # publication constructs its purchase payload later in the same pipeline.
-    if distribution_scope[4] == "buy" and (audit_events or received_changed):
+    if prepared.distribution_scope[4] == "buy" and (audit_events or received_changed):
         pointer = db.get(models.PlanningTruthState, 1)
         if (
-            _text(generation.status) == "accepted"
-            and pointer is not None
+            _text(generation.status) == "accepted" and pointer is not None
             and int(pointer.current_generation_id or -1) == int(generation.id)
         ):
             from .current_execution import invalidate_current_execution_scope
-
             invalidate_current_execution_scope(
-                db,
-                entity_kind="purchase_control_journal",
+                db, entity_kind="purchase_control_journal",
                 scope_key="purchase:all-live-plans",
                 source_revision=(
-                    f"replenishment:{canonical_scope_key}:{revision}:"
-                    f"{input_checksum[:12]}"
-                ),
-                reason="buy_replenishment_changed",
+                    f"replenishment:{prepared.scope_key}:{prepared.source_revision}:"
+                    f"{prepared.scope_checksum[:12]}"
+                ), reason="buy_replenishment_changed",
             )
-
     return CurrentReplenishmentResult(
-        generation_id=int(generation.id),
-        source_key=canonical_key,
-        source_revision=revision,
-        inserted=len(plan.insertions),
-        updated=len(plan.updates),
-        deleted=len(plan.deletions),
-        changed_pairs=len(plan.insertions) + len(plan.updates) + len(plan.deletions),
+        generation_id=prepared.generation_id, source_key=prepared.source_key,
+        source_revision=prepared.source_revision,
+        inserted=len(prepared.plan.insertions), updated=len(prepared.plan.updates),
+        deleted=len(prepared.plan.deletions),
+        changed_pairs=(len(prepared.plan.insertions) + len(prepared.plan.updates)
+                       + len(prepared.plan.deletions)),
         audit_events=audit_events,
-        confirmed_empty_reason=_text(confirmed_empty_reason),
-        basis_correction_reason=_text(basis_correction_reason) if basis_corrected else "",
+        confirmed_empty_reason=prepared.confirmed_empty_reason,
+        basis_correction_reason=prepared.basis_correction_reason,
     )
 
 
-def apply_current_receipt_replay(
+def apply_current_replenishment(
+    db: Session,
+    **kwargs: Any,
+) -> CurrentReplenishmentResult:
+    """Backward-compatible prepare/install composition."""
+    fail_after = kwargs.pop("fail_after", None)
+    prepared = prepare_current_replenishment(db, fail_after=fail_after, **kwargs)
+    return install_prepared_current_replenishment(
+        db, prepared, fail_after=fail_after
+    )
+
+
+def prepare_current_receipt_replay(
     db: Session,
     *,
     generation_id: int,
@@ -1834,8 +2236,8 @@ def apply_current_receipt_replay(
     confirmed_empty_reason: str = "",
     revision_basis: RevisionBasis = "explicit",
     basis_correction_reason: str = "",
-) -> CurrentReplenishmentResult:
-    """Publish signed correction/return replay through the R4 current writer."""
+) -> PreparedCurrentReplenishmentChange:
+    """Prepare signed correction/return replay through the R4 current owner."""
 
     from .supplier_receipt_allocation import replay_supplier_receipt_basis
     from .physical_visibility import visible_sles_for_generation
@@ -1951,7 +2353,7 @@ def apply_current_receipt_replay(
         for row in rows
         if _decimal(row.signed_qty) > 0
     )
-    return apply_current_replenishment(
+    return prepare_current_replenishment(
         db,
         generation_id=int(generation_id),
         source_key=source_key,
@@ -1970,6 +2372,12 @@ def apply_current_receipt_replay(
         revision_basis=revision_basis,
         basis_correction_reason=basis_correction_reason,
     )
+
+
+def apply_current_receipt_replay(db: Session, **kwargs: Any) -> CurrentReplenishmentResult:
+    fail_after = kwargs.pop("fail_after", None)
+    prepared = prepare_current_receipt_replay(db, fail_after=fail_after, **kwargs)
+    return install_prepared_current_replenishment(db, prepared, fail_after=fail_after)
 
 
 def read_current_replenishment(
@@ -2069,7 +2477,7 @@ def _adapter_revision(
     return revision, "explicit"
 
 
-def apply_current_replenishment_for_accepted_generation(
+def prepare_current_replenishment_for_accepted_generation(
     db: Session,
     *,
     generation_id: int,
@@ -2077,13 +2485,14 @@ def apply_current_replenishment_for_accepted_generation(
     allow_building: bool = False,
     retained_run_ids: Iterable[int] = (),
     basis_correction_reason: str = "",
-) -> tuple[CurrentReplenishmentResult, ...]:
-    """Publish current supplier-receipt replenishment at physical acceptance.
+    target_reservation_rows: Iterable[object] | None = None,
+) -> PreparedAcceptedGenerationReplenishment:
+    """Prepare supplier-receipt replenishment for one generation without DML.
 
     This is the production orchestration adapter: it reads only the accepted
-    generation's positive receipt facts and its frozen buy reservations, then
-    delegates all persistence to :func:`apply_current_replenishment` in the
-    caller's transaction.  A single item cannot be silently fanned out to
+    generation's typed receipt prefix and frozen buy reservations, then
+    prepares every canonical scope without touching accepted owners.  A
+    single item cannot be silently fanned out to
     multiple pools because the physical receipt has no pool identity; such an
     ambiguous input fails closed.
 
@@ -2127,34 +2536,83 @@ def apply_current_replenishment_for_accepted_generation(
             if retained else staged
         )
     else:
-        pointer = db.get(models.PlanningTruthState, 1)
-        if pointer is None or int(pointer.current_generation_id or 0) != int(generation_id):
-            # Pre-owner fixtures have no populated current_identity/is_current
-            # rows yet.  Once the owner migration has published any current
-            # row, an accepted generation must match the exact pointer.
-            if db.query(models.ReservationEntry.id).filter(
+        if target_reservation_rows is None:
+            pointer = db.get(models.PlanningTruthState, 1)
+            if pointer is None or int(pointer.current_generation_id or 0) != int(generation_id):
+                # Pre-owner fixtures have no populated current_identity/is_current
+                # rows yet.  Once the owner migration has published any current
+                # row, an accepted generation must match the exact pointer.
+                if db.query(models.ReservationEntry.id).filter(
+                    models.ReservationEntry.is_current.is_(True),
+                ).first() is not None:
+                    raise CurrentReplenishmentError(
+                        "accepted reservation publication is not the exact planning truth pointer"
+                    )
+            # Rows created before the owner migration have an empty identity.  This
+            # compatibility branch is removed by the migration backfill; it is not
+            # a runtime legacy fallback once current_identity is populated.
+            reservation_query = reservation_query.filter(or_(
                 models.ReservationEntry.is_current.is_(True),
-            ).first() is not None:
-                raise CurrentReplenishmentError(
-                    "accepted reservation publication is not the exact planning truth pointer"
-                )
-        # Rows created before the owner migration have an empty identity.  This
-        # compatibility branch is removed by the migration backfill; it is not
-        # a runtime legacy fallback once current_identity is populated.
-        reservation_query = reservation_query.filter(or_(
-            models.ReservationEntry.is_current.is_(True),
-            and_(
-                models.ReservationEntry.current_identity == "",
-                models.ReservationEntry.ledger_generation_id == int(generation_id),
-            ),
-        ))
-    reservations = tuple(
-        reservation_query
-        .order_by(models.ReservationEntry.id.asc())
-        .all()
-    )
+                and_(
+                    models.ReservationEntry.current_identity == "",
+                    models.ReservationEntry.ledger_generation_id == int(generation_id),
+                ),
+            ))
+    if target_reservation_rows is None:
+        reservations = tuple(
+            reservation_query.order_by(models.ReservationEntry.id.asc()).all()
+        )
+    else:
+        requested = tuple(target_reservation_rows)
+        requested_ids = sorted({
+                int(getattr(
+                    row, "reservation_id",
+                    getattr(row, "stage_reservation_id", getattr(row, "id", 0)),
+                ) or 0)
+            for row in requested
+        })
+        if requested and (
+            not requested_ids or len(requested_ids) != len(requested)
+        ):
+            raise CurrentReplenishmentError(
+                "target reservation view has malformed or duplicate owner ids"
+            )
+        reservations = tuple(
+            db.query(models.ReservationEntry)
+            .filter(models.ReservationEntry.id.in_(requested_ids))
+            .order_by(models.ReservationEntry.id.asc()).all()
+        )
+        if len(reservations) != len(requested_ids):
+            raise CurrentReplenishmentError(
+                "target reservation view references unavailable owners"
+            )
+        reservations = tuple(
+            row for row in reservations
+            if _text(row.lifecycle_status) == "active"
+            and _text(row.realization_mode) == "buy"
+            and _decimal(row.replenishment_required_qty) > 0
+        )
+        expected_identity = {
+            int(getattr(
+                row, "reservation_id",
+                getattr(row, "stage_reservation_id", getattr(row, "id", 0)),
+            )):
+            _text(getattr(row, "current_identity", ""))
+            for row in requested
+        }
+        if any(
+            expected_identity[int(row.id)]
+            and expected_identity[int(row.id)] != _text(row.current_identity)
+            for row in reservations
+        ):
+            raise CurrentReplenishmentError(
+                "target reservation view stable identity mismatch"
+            )
     if not reservations:
-        return ()
+        revision, _basis = _adapter_revision(source_revision, int(generation.id))
+        return PreparedAcceptedGenerationReplenishment(
+            generation_id=int(generation.id), source_revision=revision, changes=(),
+        )
     item_scopes: dict[int, set[DistributionScope]] = {}
     for row in reservations:
         item_scopes.setdefault(int(row.item_id), set()).add(
@@ -2302,7 +2760,7 @@ def apply_current_replenishment_for_accepted_generation(
         )
     revision, basis = _adapter_revision(source_revision, int(generation.id))
     baselines = freeze_baselines_by_reservation(db, reservations)
-    result: list[CurrentReplenishmentResult] = []
+    changes: list[PreparedCurrentReplenishmentChange] = []
     for item_id, scope_set in sorted(item_scopes.items()):
         scope = next(iter(scope_set))
         reserve_rows = tuple(
@@ -2338,8 +2796,8 @@ def apply_current_replenishment_for_accepted_generation(
             for fact in typed_facts
             if int(fact.item_id) == item_id
         )
-        result.append(
-            apply_current_receipt_replay(
+        changes.append(
+            prepare_current_receipt_replay(
                 db,
                 generation_id=int(generation_id),
                 # The visible prefix is already in hand; without it every
@@ -2359,10 +2817,39 @@ def apply_current_replenishment_for_accepted_generation(
                 basis_correction_reason=basis_correction_reason,
             )
         )
-    return tuple(result)
+    return PreparedAcceptedGenerationReplenishment(
+        generation_id=int(generation.id),
+        source_revision=revision,
+        changes=tuple(changes),
+    )
 
 
-def apply_current_replenishment_for_bounded_make_scopes(
+def install_prepared_accepted_generation_replenishment(
+    db: Session,
+    prepared: PreparedAcceptedGenerationReplenishment,
+    *,
+    reservation_owner_ids: Mapping[str, int] | None = None,
+    closed_reservation_identities: Iterable[str] = (),
+) -> tuple[CurrentReplenishmentResult, ...]:
+    return tuple(
+        install_prepared_current_replenishment(
+            db, change,
+            reservation_owner_ids=reservation_owner_ids,
+            closed_reservation_identities=closed_reservation_identities,
+        )
+        for change in prepared.changes
+    )
+
+
+def apply_current_replenishment_for_accepted_generation(
+    db: Session, **kwargs: Any
+) -> tuple[CurrentReplenishmentResult, ...]:
+    return install_prepared_accepted_generation_replenishment(
+        db, prepare_current_replenishment_for_accepted_generation(db, **kwargs)
+    )
+
+
+def prepare_current_replenishment_for_bounded_make_scopes(
     db: Session,
     *,
     target_generation_id: int,
@@ -2372,7 +2859,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
     source_revision: int | None = None,
     at_accepted_pointer: bool = False,
     basis_correction_reason: str = "",
-) -> BoundedMakeReplenishmentResult:
+) -> PreparedBoundedMakeReplenishment:
     """Apply bounded ``assembly_in`` facts to stable current MAKE owners.
 
     This is intentionally a current-owner adapter, not a generation
@@ -2710,7 +3197,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
             for row in owners
         )
 
-    results: list[CurrentReplenishmentResult] = []
+    changes: list[PreparedCurrentReplenishmentChange] = []
     scopes_confirmed_empty_by_netting = 0
     for scope in scopes:
         # A scope whose every visible ``assembly_in`` line nets to zero is
@@ -2736,8 +3223,8 @@ def apply_current_replenishment_for_bounded_make_scopes(
         qualified_facts = attach_pre_freeze_physical_availability(
             db, facts_by_scope[scope], reserves_by_scope[scope]
         )
-        results.append(
-            apply_current_replenishment(
+        changes.append(
+            prepare_current_replenishment(
                 db,
                 generation_id=int(target.id),
                 source_key=ASSEMBLY_OUTPUT_SOURCE_KEY,
@@ -2753,15 +3240,50 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 proven_zero_net_fact_ids=tuple(sorted(zero_net_fact_ids_by_scope.get(scope, ()))),
             )
         )
-    return BoundedMakeReplenishmentResult(
+    return PreparedBoundedMakeReplenishment(
         target_generation_id=int(target.id),
         parent_generation_id=int(parent.id),
         source_revision=revision,
         affected_scopes=tuple(scopes),
         scope_history_rows=sum(len(rows) for rows in facts_by_scope.values()),
-        results=tuple(results),
+        changes=tuple(changes),
         netted_internal_transfer_rows=int(netted_internal_transfer_rows),
         scopes_confirmed_empty_by_netting=int(scopes_confirmed_empty_by_netting),
+    )
+
+
+def install_prepared_bounded_make_replenishment(
+    db: Session,
+    prepared: PreparedBoundedMakeReplenishment,
+    *,
+    reservation_owner_ids: Mapping[str, int] | None = None,
+    closed_reservation_identities: Iterable[str] = (),
+) -> BoundedMakeReplenishmentResult:
+    results = tuple(
+        install_prepared_current_replenishment(
+            db, change,
+            reservation_owner_ids=reservation_owner_ids,
+            closed_reservation_identities=closed_reservation_identities,
+        )
+        for change in prepared.changes
+    )
+    return BoundedMakeReplenishmentResult(
+        target_generation_id=prepared.target_generation_id,
+        parent_generation_id=prepared.parent_generation_id,
+        source_revision=prepared.source_revision,
+        affected_scopes=prepared.affected_scopes,
+        scope_history_rows=prepared.scope_history_rows,
+        results=results,
+        netted_internal_transfer_rows=prepared.netted_internal_transfer_rows,
+        scopes_confirmed_empty_by_netting=prepared.scopes_confirmed_empty_by_netting,
+    )
+
+
+def apply_current_replenishment_for_bounded_make_scopes(
+    db: Session, **kwargs: Any
+) -> BoundedMakeReplenishmentResult:
+    return install_prepared_bounded_make_replenishment(
+        db, prepare_current_replenishment_for_bounded_make_scopes(db, **kwargs)
     )
 
 
@@ -3435,7 +3957,7 @@ def _ensure_bounded_supplier_evidence(
     db.flush()
 
 
-def apply_current_replenishment_for_bounded_buy_scopes(
+def prepare_current_replenishment_for_bounded_buy_scopes(
     db: Session,
     *,
     target_generation_id: int,
@@ -3445,7 +3967,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
     delta_manifest: BoundedBuyReceiptDeltaManifest | Mapping[str, object],
     source_revision: int | None = None,
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
-) -> BoundedBuyReplenishmentResult:
+) -> PreparedBoundedBuyReplenishment:
     """Apply typed supplier receipts to stable current BUY owners only.
 
     Forward receipts use the current allocation basis plus the explicit typed
@@ -3506,14 +4028,14 @@ def apply_current_replenishment_for_bounded_buy_scopes(
         or manifest.scope_receipt_facts
         or manifest.supersession_edge_ids
     ):
-        return BoundedBuyReplenishmentResult(
+        return PreparedBoundedBuyReplenishment(
             target_generation_id=int(target.id),
             parent_generation_id=int(parent.id),
             source_revision=revision,
             affected_scopes=scopes,
             delta_fact_rows=0,
             scope_replay_rows=0,
-            results=(),
+            changes=(),
         )
 
     scope_facts, delta_by_id, superseded_ids = _bounded_buy_manifest_facts(
@@ -3555,7 +4077,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
         _bounded_buy_fact_scope(fact, scopes_by_item_pool)
         for fact in manifest.receipt_facts
     }
-    results: list[CurrentReplenishmentResult] = []
+    changes: list[PreparedCurrentReplenishmentChange] = []
     replay_rows = 0
     for scope in scopes:
         explicit = tuple(scope_facts[scope])
@@ -3654,8 +4176,8 @@ def apply_current_replenishment_for_bounded_buy_scopes(
         )
         replay_rows += len(full_facts)
         visible_ids = {int(fact.sle_id) for fact in full_facts}
-        results.append(
-            apply_current_receipt_replay(
+        changes.append(
+            prepare_current_receipt_replay(
                 db,
                 generation_id=int(target.id),
                 source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
@@ -3672,12 +4194,46 @@ def apply_current_replenishment_for_bounded_buy_scopes(
                 revision_basis=basis,
             )
         )
-    return BoundedBuyReplenishmentResult(
+    return PreparedBoundedBuyReplenishment(
         target_generation_id=int(target.id),
         parent_generation_id=int(parent.id),
         source_revision=revision,
         affected_scopes=scopes,
         delta_fact_rows=len(delta_by_id),
         scope_replay_rows=replay_rows,
-        results=tuple(results),
+        changes=tuple(changes),
+    )
+
+
+def install_prepared_bounded_buy_replenishment(
+    db: Session,
+    prepared: PreparedBoundedBuyReplenishment,
+    *,
+    reservation_owner_ids: Mapping[str, int] | None = None,
+    closed_reservation_identities: Iterable[str] = (),
+) -> BoundedBuyReplenishmentResult:
+    results = tuple(
+        install_prepared_current_replenishment(
+            db, change,
+            reservation_owner_ids=reservation_owner_ids,
+            closed_reservation_identities=closed_reservation_identities,
+        )
+        for change in prepared.changes
+    )
+    return BoundedBuyReplenishmentResult(
+        target_generation_id=prepared.target_generation_id,
+        parent_generation_id=prepared.parent_generation_id,
+        source_revision=prepared.source_revision,
+        affected_scopes=prepared.affected_scopes,
+        delta_fact_rows=prepared.delta_fact_rows,
+        scope_replay_rows=prepared.scope_replay_rows,
+        results=results,
+    )
+
+
+def apply_current_replenishment_for_bounded_buy_scopes(
+    db: Session, **kwargs: Any
+) -> BoundedBuyReplenishmentResult:
+    return install_prepared_bounded_buy_replenishment(
+        db, prepare_current_replenishment_for_bounded_buy_scopes(db, **kwargs)
     )

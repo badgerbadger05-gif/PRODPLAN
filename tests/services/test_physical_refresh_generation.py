@@ -123,6 +123,7 @@ def test_create_physical_refresh_generation_reuses_current_accepted_prefix(db_se
         "generation_kind": GENERATION_KIND,
         "from_cutoff": parent.cutoff.replace(tzinfo=timezone.utc).isoformat(),
         "replay_from": parent.source_watermarks["replay_from"],
+        "accepted_production_mutation_epoch": 0,
     }
     assert candidate.capabilities == {}
     assert candidate.algorithm_version == "ledger-physical-refresh-generation/1"

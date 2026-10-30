@@ -16,7 +16,10 @@ from sqlalchemy.orm import Session
 from app import models
 from .production_control_common import to_float as _to_float
 from .production_material_custody import MaterialCustodyState, ProductMaterialCustody
-from .production_material_custody_events import stable_physical_sle_identity
+from .production_material_custody_events import (
+    CandidateCustodyEventSpec,
+    stable_physical_sle_identity,
+)
 from .item_ledger.physical_visibility import visible_sle_query
 
 
@@ -104,6 +107,51 @@ class _CustodyCutoffSeed:
         yield self.generation_id
         yield self.manifest
         yield self.generation
+
+
+class PreparedCurrentMaterialCustodyBasisConflict(MaterialCustodySnapshotUnavailable):
+    """The compact custody owner changed after lock-free preparation."""
+
+
+@dataclass(frozen=True)
+class _CustodyProjectionRowBasis:
+    row_id: int
+    ledger_generation_id: int
+    key: ProjectionRowKey
+    reserved_qty: Decimal
+    source_event_high_watermark_id: int
+    is_current: bool
+
+
+@dataclass(frozen=True)
+class _CustodyManifestBasis:
+    ledger_generation_id: int
+    baseline_generation_id: int | None
+    cutoff: datetime
+    status: str
+    is_baseline: bool
+    source_event_high_watermark_id: int
+
+
+@dataclass(frozen=True)
+class PreparedCurrentMaterialCustodyChange:
+    """Precomputed current-custody promotion and its optimistic read basis."""
+
+    ledger_generation_id: int
+    pointer_generation_id: int | None
+    generation_status: str
+    generation_cutoff: datetime
+    target_manifest_basis: _CustodyManifestBasis | None
+    old_manifest_basis: _CustodyManifestBasis | None
+    event_high_watermark_id: int
+    observed_cutoff_high_watermark_id: int
+    projection_basis: tuple[_CustodyProjectionRowBasis, ...]
+    desired_rows: tuple[tuple[ProjectionRowKey, Decimal], ...]
+    published_watermark: int
+    old_current_row_ids: tuple[int, ...]
+    old_baseline_row_ids: tuple[int, ...]
+    stale_history_row_ids: tuple[int, ...]
+    cleanup_generation_basis: tuple[tuple[int, str, bool | None], ...]
 
 
 def _custody_cell_predicate(model: Any, keys: set[ProjectionRowKey]) -> Any:
@@ -623,7 +671,7 @@ def _custody_fold_anchor(
         if event.issue_id is None or event.effective_at is None:
             continue
         key = (int(event.issue_id), int(event.component_item_id))
-        moment = event.effective_at.replace(microsecond=0)
+        moment = _moscow_wall_time(event.effective_at).replace(microsecond=0)
         current = anchors.get(key)
         if current is None or moment < current:
             anchors[key] = moment
@@ -631,8 +679,10 @@ def _custody_fold_anchor(
 
 
 def _custody_fold_order_key(
-    event: models.ProductionMaterialCustodyEvent,
+    event: Any,
     anchors: Mapping[tuple[int, int], datetime],
+    *,
+    candidate_id_base: int = 0,
 ) -> tuple[Any, ...]:
     """Порядок свёртки: строка заявки целиком, внутри — открытие перед расходом.
 
@@ -642,7 +692,7 @@ def _custody_fold_order_key(
     свёртка уходила в минус, проекция падала закрыто и уносила с собой всю
     сборку поколения Ledger.
     """
-    effective = event.effective_at
+    effective = _moscow_wall_time(event.effective_at)
     truncated = (
         effective.replace(microsecond=0) if effective is not None else effective
     )
@@ -656,7 +706,11 @@ def _custody_fold_order_key(
         0 if str(event.source_kind or "") == "issue_created" else 1,
         truncated,
         effective,
-        int(event.id),
+        (
+            int(event.id)
+            if getattr(event, "id", None) is not None
+            else int(candidate_id_base) + int(getattr(event, "virtual_ordinal"))
+        ),
     )
 
 
@@ -993,6 +1047,7 @@ def _build_projection_from_seed_and_events(
     target_high_watermark_id: int,
     selected_keys: set[ProjectionRowKey] | None = None,
     baseline_seed_rows: Mapping[ProjectionRowKey, float] | None = None,
+    candidate_events: Sequence[Any] = (),
 ) -> tuple[MaterialCustodyState, dict[ProjectionRowKey, float]]:
     if baseline_seed_rows is None:
         baseline_query = (
@@ -1023,6 +1078,21 @@ def _build_projection_from_seed_and_events(
         target_high_watermark_id=target_high_watermark_id,
         selected_keys=selected_keys,
     )
+    if candidate_events:
+        candidates = [
+            event for event in candidate_events
+            if (selected_keys is None or (
+                int(event.product_id), int(event.component_item_id),
+                str(event.location_kind), str(event.warehouse_ref1c or ""),
+            ) in selected_keys)
+        ]
+        anchors = _custody_fold_anchor([*events, *candidates])
+        events = sorted(
+            [*events, *candidates],
+            key=lambda event: _custody_fold_order_key(
+                event, anchors, candidate_id_base=int(target_high_watermark_id),
+            ),
+        )
 
     terminal_query = db.query(models.ProductionMaterialCustodyEvent).filter(
         models.ProductionMaterialCustodyEvent.source_kind == "terminal_release",
@@ -1165,6 +1235,98 @@ def _build_projection_from_seed_and_events(
             state.by_product_warehouse_item[product_cell] = product_warehouse_qty
 
     return state, projection_rows
+
+
+def fold_candidate_custody_event_specs(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    baseline_generation_id: int,
+    baseline_high_watermark_id: int,
+    baseline_cutoff: datetime,
+    baseline_rows: Mapping[ProjectionRowKey, float],
+    candidate_events: Sequence[Any],
+    target_high_watermark_id: int | None = None,
+) -> dict[ProjectionRowKey, float]:
+    """Simulate candidate specs through the one canonical projection kernel."""
+    _, rows = _build_projection_from_seed_and_events(
+        db,
+        generation=generation,
+        baseline_generation_id=baseline_generation_id,
+        baseline_high_watermark_id=baseline_high_watermark_id,
+        baseline_cutoff=baseline_cutoff,
+        target_high_watermark_id=(
+            int(baseline_high_watermark_id)
+            if target_high_watermark_id is None
+            else int(target_high_watermark_id)
+        ),
+        baseline_seed_rows=baseline_rows,
+        candidate_events=candidate_events,
+    )
+    return rows
+
+
+def material_custody_state_from_values(
+    rows: Mapping[ProjectionRowKey, float],
+) -> MaterialCustodyState:
+    """Typed adapter into the canonical availability kernel."""
+    return _state_from_projection_values(rows)
+
+
+def install_precomputed_current_material_custody(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    rows: Mapping[ProjectionRowKey, float],
+    affected_keys: set[ProjectionRowKey],
+    source_event_high_watermark_id: int,
+) -> None:
+    """Atomic persistence half of the canonical pure fold.
+
+    The caller has already validated/folded physical and terminal specs outside
+    the final pointer lock. This function performs no replay, BOM, routing or
+    history scan: only affected compact-row DML and the manifest marker.
+    """
+    current = {
+        _projection_row_key(row): row
+        for row in db.query(models.ProductionMaterialCustodyProjection)
+        .filter(models.ProductionMaterialCustodyProjection.is_current.is_(True))
+        .filter(_custody_cell_predicate(
+            models.ProductionMaterialCustodyProjection, affected_keys,
+        )).with_for_update().all()
+    } if affected_keys else {}
+    watermark = int(source_event_high_watermark_id)
+    for key in sorted(affected_keys):
+        qty = float(rows.get(key, 0.0))
+        row = current.get(key)
+        if qty <= _EPSILON:
+            if row is not None:
+                db.delete(row)
+            continue
+        if row is None:
+            db.add(models.ProductionMaterialCustodyProjection(
+                ledger_generation_id=int(parent_generation_id),
+                product_id=key[0], component_item_id=key[1],
+                location_kind=key[2], warehouse_ref1c=key[3],
+                reserved_qty=qty, source_event_high_watermark_id=watermark,
+                is_current=True,
+            ))
+        else:
+            row.reserved_qty = qty
+            row.source_event_high_watermark_id = watermark
+    db.query(models.ProductionMaterialCustodyProjection).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True),
+    ).update(
+        {models.ProductionMaterialCustodyProjection.source_event_high_watermark_id: watermark},
+        synchronize_session=False,
+    )
+    manifest = (
+        db.query(models.ProductionMaterialCustodyProjectionManifest)
+        .filter_by(ledger_generation_id=int(parent_generation_id))
+        .populate_existing().with_for_update().one()
+    )
+    manifest.source_event_high_watermark_id = watermark
+    db.flush()
 
 
 def replay_bounded_material_custody_cells(
@@ -1443,6 +1605,36 @@ def _append_terminal_custody_releases(
     not authorize release. The preceding fold has already applied visible
     consumption and returns; only its remaining cell balance is released.
     """
+    specs = build_terminal_custody_event_specs(
+        db, generation=generation, cells=cells,
+        allow_same_current_repair=allow_same_current_repair,
+    )
+    for spec in specs:
+        db.add(models.ProductionMaterialCustodyEvent(
+            product_id=spec.product_id,
+            component_item_id=spec.component_item_id,
+            source_kind=spec.source_kind,
+            effective_at=spec.effective_at,
+            location_kind=spec.location_kind,
+            warehouse_ref1c=spec.warehouse_ref1c,
+            source_ref1c=spec.source_ref1c,
+            source_ref2c=spec.source_ref2c,
+            document_number=spec.document_number,
+            delta_qty=spec.delta_qty,
+            idempotency_key=spec.idempotency_key,
+        ))
+    db.flush()
+    return len(specs)
+
+
+def build_terminal_custody_event_specs(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    cells: Mapping[ProjectionRowKey, float],
+    allow_same_current_repair: bool = False,
+) -> tuple[CandidateCustodyEventSpec, ...]:
+    """Pure terminal observation planner shared by simulation/materialization."""
     from .production_control_common import DONE_STATE_KEY
 
     accepted_cutoff = db.query(func.max(models.LedgerGeneration.cutoff)).filter(
@@ -1453,11 +1645,11 @@ def _append_terminal_custody_releases(
         and accepted_cutoff is not None
         and not _after_1c_timestamp(generation.cutoff, accepted_cutoff)
     ):
-        return 0
+        return ()
     cutoff_wall = _moscow_wall_time(generation.cutoff)
     product_ids = {key[0] for key in cells}
     if not product_ids:
-        return 0
+        return ()
     observations = {}
     rows = db.query(models.ProductionProduct, models.ProductionOrder).join(
         models.ProductionOrder,
@@ -1473,31 +1665,44 @@ def _append_terminal_custody_releases(
             and _moscow_wall_time(observed_at) <= cutoff_wall
         ):
             observations[int(product.product_id)] = order
-    count = 0
+    specs: list[CandidateCustodyEventSpec] = []
     for key, balance in sorted(cells.items()):
         product_id, component_id, location, warehouse = key
         order = observations.get(product_id)
         if order is None or balance <= _EPSILON:
             continue
-        coordinates = f"{generation.cutoff.isoformat()}|{key}|{balance}|{order.updated_at.isoformat()}"
+        canonical_balance = format(Decimal(str(balance)).normalize(), "f")
+        coordinates = (
+            f"{generation.cutoff.isoformat()}|{key}|{canonical_balance}|"
+            f"{order.updated_at.isoformat()}"
+        )
         event_key = "custody-terminal:" + hashlib.sha256(coordinates.encode()).hexdigest()
         if db.query(models.ProductionMaterialCustodyEvent.id).filter_by(
             idempotency_key=event_key,
         ).first() is not None:
             continue
-        db.add(models.ProductionMaterialCustodyEvent(
-            product_id=product_id, component_item_id=component_id,
-            source_kind="terminal_release", effective_at=generation.cutoff,
-            location_kind=location, warehouse_ref1c=warehouse,
+        specs.append(CandidateCustodyEventSpec(
+            issue_id=None,
+            product_id=product_id,
+            component_item_id=component_id,
+            source_kind="terminal_release",
+            source_sle_id=None,
+            source_sle_identity=None,
+            effective_at=generation.cutoff,
+            location_kind=location,
+            warehouse_ref1c=warehouse,
             source_ref1c=order.order_ref1c,
-            source_ref2c="order-terminal-v1:" + ("deleted" if order.deletion_mark else "done")
+            source_ref2c="order-terminal-v1:"
+            + ("deleted" if order.deletion_mark else "done")
             + ":" + order.updated_at.isoformat(),
+            delta_qty=-Decimal(canonical_balance),
+            idempotency_key=event_key,
             document_number=order.order_number,
-            delta_qty=-balance, idempotency_key=event_key,
+            document_line_no=None,
+            physical_line_no=None,
+            virtual_ordinal=len(specs) + 1,
         ))
-        count += 1
-    db.flush()
-    return count
+    return tuple(specs)
 
 
 def validate_material_custody_projection(
@@ -1594,10 +1799,41 @@ def validate_material_custody_projection(
     }
 
 
-def publish_current_material_custody(
+def _projection_row_basis(
+    row: models.ProductionMaterialCustodyProjection,
+) -> _CustodyProjectionRowBasis:
+    return _CustodyProjectionRowBasis(
+        row_id=int(row.id),
+        ledger_generation_id=int(row.ledger_generation_id),
+        key=_projection_row_key(row),
+        reserved_qty=Decimal(str(row.reserved_qty or 0)),
+        source_event_high_watermark_id=int(row.source_event_high_watermark_id or 0),
+        is_current=bool(row.is_current),
+    )
+
+
+def _manifest_basis(
+    manifest: models.ProductionMaterialCustodyProjectionManifest | None,
+) -> _CustodyManifestBasis | None:
+    if manifest is None:
+        return None
+    return _CustodyManifestBasis(
+        ledger_generation_id=int(manifest.ledger_generation_id),
+        baseline_generation_id=(
+            int(manifest.baseline_generation_id)
+            if manifest.baseline_generation_id is not None else None
+        ),
+        cutoff=manifest.cutoff.replace(tzinfo=None),
+        status=str(manifest.status),
+        is_baseline=bool(manifest.is_baseline),
+        source_event_high_watermark_id=int(manifest.source_event_high_watermark_id or 0),
+    )
+
+
+def prepare_current_material_custody(
     db: Session, *, ledger_generation_id: int
-) -> int:
-    """Promote one validated building custody projection atomically.
+) -> PreparedCurrentMaterialCustodyChange:
+    """Compute a custody promotion without locks, writes or baseline mutation.
 
     Candidate rows stay ``is_current=false`` while a generation is building.
     The acceptance transaction calls this only after all gates pass; obsolete
@@ -1606,7 +1842,7 @@ def publish_current_material_custody(
     events alone cannot reconstruct a deleted baseline projection.
     """
     generation_id = int(ledger_generation_id)
-    pointer = lock_current_custody_marker(db)
+    pointer = db.get(models.PlanningTruthState, 1)
     generation = db.get(models.LedgerGeneration, generation_id)
     manifest = _read_manifest(db, generation_id=generation_id)
     candidate = db.query(models.ProductionMaterialCustodyProjection).filter_by(
@@ -1712,60 +1948,30 @@ def publish_current_material_custody(
                 stored_generation_id=current_generation_id,
                 reason="future-local custody tail would make published current state negative",
             )
-        row = candidate_by_key.get(key)
         if next_qty == 0:
             candidate_values.pop(key, None)
-            if row is not None:
-                # Keep the same ORM cell until the complete tail is folded:
-                # a later local hold can reuse this key after a full release.
-                row.reserved_qty = 0
-        elif row is not None:
-            row.reserved_qty = next_qty
-            candidate_values[key] = next_qty
         else:
-            row = models.ProductionMaterialCustodyProjection(
-                ledger_generation_id=generation_id,
-                product_id=key[0],
-                component_item_id=key[1],
-                location_kind=key[2],
-                warehouse_ref1c=key[3],
-                reserved_qty=next_qty,
-                source_event_high_watermark_id=int(candidate_seed.cutoff_high_watermark_id),
-                is_current=False,
-            )
-            db.add(row)
-            candidate_by_key[key] = row
             candidate_values[key] = next_qty
-
-    for key in tuple(candidate_by_key):
-        if key not in candidate_values:
-            row = candidate_by_key.pop(key)
-            if row in db.new:
-                db.expunge(row)
-            else:
-                db.delete(row)
 
     published_watermark = max(
         int(candidate_seed.cutoff_high_watermark_id),
         int(old_seed.live_high_watermark_id) if old_seed is not None else 0,
     )
-    if manifest is not None:
-        manifest.source_event_high_watermark_id = published_watermark
-    for row in candidate_by_key.values():
-        row.source_event_high_watermark_id = published_watermark
-    db.flush()
-    candidate = list(candidate_by_key.values())
 
     old = db.query(models.ProductionMaterialCustodyProjection).filter(
         models.ProductionMaterialCustodyProjection.is_current.is_(True),
         models.ProductionMaterialCustodyProjection.ledger_generation_id != generation_id,
     ).all()
-    for row in old:
-        manifest = _read_manifest(db, generation_id=int(row.ledger_generation_id))
-        if manifest is not None and bool(manifest.is_baseline):
-            row.is_current = False
-        else:
-            db.delete(row)
+    old_baseline_row_ids = tuple(sorted(
+        int(row.id) for row in old
+        if (
+            (old_row_manifest := _read_manifest(
+                db, generation_id=int(row.ledger_generation_id)
+            )) is not None
+            and bool(old_row_manifest.is_baseline)
+        )
+    ))
+    old_current_row_ids = tuple(sorted(int(row.id) for row in old))
     # Migration may leave non-current copies from accepted/failed generations.
     # They are not reconstructable rewind bases unless their manifest is an
     # explicit baseline; remove them at the next accepted publication while
@@ -1794,15 +2000,278 @@ def publish_current_material_custody(
         )
         .all()
     )
-    for row in stale_history:
-        db.delete(row)
-    # Clear retained baseline markers before promoting the candidate so the
-    # partial unique current-cell index is valid on SQLite as well as PG.
+    projection_rows = (
+        db.query(models.ProductionMaterialCustodyProjection)
+        .order_by(models.ProductionMaterialCustodyProjection.id.asc())
+        .all()
+    )
+    event_high_watermark_id = int(
+        db.query(func.max(models.ProductionMaterialCustodyEvent.id)).scalar() or 0
+    )
+    cleanup_generation_ids = sorted({
+        int(row.ledger_generation_id)
+        for row in projection_rows
+        if not bool(row.is_current) and int(row.ledger_generation_id) != generation_id
+    })
+    return PreparedCurrentMaterialCustodyChange(
+        ledger_generation_id=generation_id,
+        pointer_generation_id=current_generation_id,
+        generation_status=str(generation.status),
+        generation_cutoff=generation.cutoff,
+        target_manifest_basis=_manifest_basis(manifest),
+        old_manifest_basis=_manifest_basis(
+            _read_manifest(db, generation_id=current_generation_id)
+            if current_generation_id is not None and current_generation_id != generation_id
+            else None
+        ),
+        event_high_watermark_id=event_high_watermark_id,
+        observed_cutoff_high_watermark_id=int(observed_cutoff_watermark),
+        projection_basis=tuple(_projection_row_basis(row) for row in projection_rows),
+        desired_rows=tuple(sorted(candidate_values.items())),
+        published_watermark=published_watermark,
+        old_current_row_ids=old_current_row_ids,
+        old_baseline_row_ids=old_baseline_row_ids,
+        stale_history_row_ids=tuple(sorted(int(row.id) for row in stale_history)),
+        cleanup_generation_basis=tuple(
+            (
+                cleanup_generation_id,
+                str(db.get(models.LedgerGeneration, cleanup_generation_id).status),
+                (
+                    bool(cleanup_manifest.is_baseline)
+                    if (cleanup_manifest := _read_manifest(
+                        db, generation_id=cleanup_generation_id
+                    )) is not None else None
+                ),
+            )
+            for cleanup_generation_id in cleanup_generation_ids
+        ),
+    )
+
+
+def _prepared_custody_basis_conflict(
+    prepared: PreparedCurrentMaterialCustodyChange,
+    reason: str,
+    *,
+    stored_generation_id: int | None = None,
+) -> PreparedCurrentMaterialCustodyBasisConflict:
+    return PreparedCurrentMaterialCustodyBasisConflict(
+        expected_generation_id=int(prepared.ledger_generation_id),
+        stored_generation_id=stored_generation_id,
+        reason=reason,
+    )
+
+
+def install_prepared_current_material_custody(
+    db: Session,
+    prepared: PreparedCurrentMaterialCustodyChange,
+) -> int:
+    """Install one precomputed custody promotion under the pointer/epoch lock."""
+    pointer = (
+        db.query(models.PlanningTruthState)
+        .filter(models.PlanningTruthState.id == 1)
+        .populate_existing()
+        .with_for_update()
+        .one_or_none()
+    )
+    pointer_generation_id = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None else None
+    )
+    if pointer_generation_id != prepared.pointer_generation_id:
+        raise _prepared_custody_basis_conflict(
+            prepared,
+            "current custody pointer changed after preparation",
+            stored_generation_id=pointer_generation_id,
+        )
+    generation = next(
+        (
+            value for value in tuple(db.new) + tuple(db.dirty)
+            if isinstance(value, models.LedgerGeneration)
+            and int(value.id or 0) == int(prepared.ledger_generation_id)
+        ),
+        None,
+    )
+    if generation is None:
+        generation = (
+            db.query(models.LedgerGeneration)
+            .filter(models.LedgerGeneration.id == int(prepared.ledger_generation_id))
+            .populate_existing()
+            .one_or_none()
+        )
+    if (
+        generation is None
+        or str(generation.status) != prepared.generation_status
+        or generation.cutoff is None
+        or not _same_1c_timestamp(generation.cutoff, prepared.generation_cutoff)
+    ):
+        raise _prepared_custody_basis_conflict(
+            prepared, "target custody generation changed after preparation"
+        )
+    target_manifest = next(
+        (
+            value for value in tuple(db.new) + tuple(db.dirty)
+            if isinstance(value, models.ProductionMaterialCustodyProjectionManifest)
+            and int(value.ledger_generation_id or 0) == prepared.ledger_generation_id
+        ),
+        None,
+    )
+    if target_manifest is None:
+        target_manifest = (
+            db.query(models.ProductionMaterialCustodyProjectionManifest)
+            .filter_by(ledger_generation_id=int(prepared.ledger_generation_id))
+            .populate_existing()
+            .with_for_update()
+            .one_or_none()
+        )
+    if _manifest_basis(target_manifest) != prepared.target_manifest_basis:
+        raise _prepared_custody_basis_conflict(
+            prepared, "target custody manifest changed after preparation"
+        )
+    old_manifest = None
+    if (
+        prepared.pointer_generation_id is not None
+        and prepared.pointer_generation_id != prepared.ledger_generation_id
+    ):
+        old_manifest = next(
+            (
+                value for value in tuple(db.new) + tuple(db.dirty)
+                if isinstance(value, models.ProductionMaterialCustodyProjectionManifest)
+                and int(value.ledger_generation_id or 0)
+                == int(prepared.pointer_generation_id)
+            ),
+            None,
+        )
+        if old_manifest is None:
+            old_manifest = (
+                db.query(models.ProductionMaterialCustodyProjectionManifest)
+                .filter_by(ledger_generation_id=int(prepared.pointer_generation_id))
+                .populate_existing()
+                .with_for_update()
+                .one_or_none()
+            )
+    if _manifest_basis(old_manifest) != prepared.old_manifest_basis:
+        raise _prepared_custody_basis_conflict(
+            prepared,
+            "accepted custody manifest changed after preparation",
+            stored_generation_id=prepared.pointer_generation_id,
+        )
+    projection_rows = (
+        db.query(models.ProductionMaterialCustodyProjection)
+        .populate_existing()
+        .order_by(models.ProductionMaterialCustodyProjection.id.asc())
+        .with_for_update()
+        .all()
+    )
+    fresh_projection_basis = tuple(
+        _projection_row_basis(row) for row in projection_rows
+    )
+    if fresh_projection_basis != prepared.projection_basis:
+        raise _prepared_custody_basis_conflict(
+            prepared, "current custody rows changed after preparation",
+            stored_generation_id=pointer_generation_id,
+        )
+    event_high_watermark_id = int(
+        db.query(func.max(models.ProductionMaterialCustodyEvent.id)).scalar() or 0
+    )
+    if event_high_watermark_id != prepared.event_high_watermark_id:
+        raise _prepared_custody_basis_conflict(
+            prepared, "custody event watermark changed after preparation",
+            stored_generation_id=pointer_generation_id,
+        )
+    observed_cutoff_watermark = _event_high_watermark_id_at_cutoff(
+        db, cutoff=generation.cutoff,
+    )
+    if observed_cutoff_watermark != prepared.observed_cutoff_high_watermark_id:
+        raise _prepared_custody_basis_conflict(
+            prepared, "custody cutoff watermark changed after preparation"
+        )
+    fresh_cleanup_basis: list[tuple[int, str, bool | None]] = []
+    for cleanup_generation_id, _status, _is_baseline in prepared.cleanup_generation_basis:
+        cleanup_generation = (
+            db.query(models.LedgerGeneration)
+            .filter(models.LedgerGeneration.id == cleanup_generation_id)
+            .populate_existing()
+            .one()
+        )
+        cleanup_manifest = (
+            db.query(models.ProductionMaterialCustodyProjectionManifest)
+            .filter_by(ledger_generation_id=cleanup_generation_id)
+            .populate_existing()
+            .one_or_none()
+        )
+        fresh_cleanup_basis.append((
+            cleanup_generation_id,
+            str(cleanup_generation.status),
+            bool(cleanup_manifest.is_baseline) if cleanup_manifest is not None else None,
+        ))
+    if tuple(fresh_cleanup_basis) != prepared.cleanup_generation_basis:
+        raise _prepared_custody_basis_conflict(
+            prepared, "custody cleanup basis changed after preparation"
+        )
+
+    row_by_id = {int(row.id): row for row in projection_rows}
+    desired = dict(prepared.desired_rows)
+    target_candidates = {
+        _projection_row_key(row): row
+        for row in projection_rows
+        if int(row.ledger_generation_id) == prepared.ledger_generation_id
+        and not bool(row.is_current)
+    }
+    for key, row in tuple(target_candidates.items()):
+        qty = desired.get(key)
+        if qty is None:
+            db.delete(row)
+            target_candidates.pop(key)
+            continue
+        row.reserved_qty = qty
+        row.source_event_high_watermark_id = prepared.published_watermark
+    for key, qty in desired.items():
+        if key in target_candidates:
+            continue
+        row = models.ProductionMaterialCustodyProjection(
+            ledger_generation_id=prepared.ledger_generation_id,
+            product_id=key[0],
+            component_item_id=key[1],
+            location_kind=key[2],
+            warehouse_ref1c=key[3],
+            reserved_qty=qty,
+            source_event_high_watermark_id=prepared.published_watermark,
+            is_current=False,
+        )
+        db.add(row)
+        target_candidates[key] = row
+    if target_manifest is not None:
+        target_manifest.source_event_high_watermark_id = prepared.published_watermark
+
+    baseline_ids = set(prepared.old_baseline_row_ids)
+    for row_id in prepared.old_current_row_ids:
+        row = row_by_id[row_id]
+        if row_id in baseline_ids:
+            row.is_current = False
+        else:
+            db.delete(row)
+    for row_id in prepared.stale_history_row_ids:
+        row = row_by_id.get(row_id)
+        if row is not None and row not in db.deleted:
+            db.delete(row)
+    # Demote/delete old current rows before promoting candidate cells so the
+    # partial unique current-cell index remains valid on SQLite and PostgreSQL.
     db.flush()
-    for row in candidate:
+    for row in target_candidates.values():
         row.is_current = True
     db.flush()
-    return len(candidate_by_key)
+    return len(desired)
+
+
+def publish_current_material_custody(
+    db: Session, *, ledger_generation_id: int
+) -> int:
+    """Backward-compatible locked prepare/install composition."""
+    lock_current_custody_marker(db)
+    prepared = prepare_current_material_custody(
+        db, ledger_generation_id=int(ledger_generation_id)
+    )
+    return install_prepared_current_material_custody(db, prepared)
 
 
 def apply_local_custody_event_to_current(

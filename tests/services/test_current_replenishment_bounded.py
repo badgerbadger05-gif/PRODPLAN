@@ -310,18 +310,32 @@ def test_bounded_make_failure_after_one_scope_is_rollbackable_by_caller(
     parent, target, items, _owners, _facts = _world(db_session)
     import app.services.item_ledger.current_replenishment as module
 
-    original = module.apply_current_replenishment
-    calls = 0
+    original_prepare = module.prepare_current_replenishment
+    original_install = module.install_prepared_current_replenishment
+    prepared_calls = 0
+    install_calls = 0
 
-    def fail_on_second(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        result = original(*args, **kwargs)
-        if calls == 2:
+    def track_prepare(*args, **kwargs):
+        nonlocal prepared_calls
+        result = original_prepare(*args, **kwargs)
+        prepared_calls += 1
+        return result
+
+    def fail_on_second_install(*args, **kwargs):
+        nonlocal install_calls
+        # The bounded adapter must finish every heavy scope preparation before
+        # the first accepted-owner DML begins.
+        assert prepared_calls == 2
+        install_calls += 1
+        result = original_install(*args, **kwargs)
+        if install_calls == 2:
             raise CurrentReplenishmentError("injected bounded scope failure")
         return result
 
-    monkeypatch.setattr(module, "apply_current_replenishment", fail_on_second)
+    monkeypatch.setattr(module, "prepare_current_replenishment", track_prepare)
+    monkeypatch.setattr(
+        module, "install_prepared_current_replenishment", fail_on_second_install
+    )
     with pytest.raises(CurrentReplenishmentError, match="injected bounded scope failure"):
         apply_current_replenishment_for_bounded_make_scopes(
             db_session,

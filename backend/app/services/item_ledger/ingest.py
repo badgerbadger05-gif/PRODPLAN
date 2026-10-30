@@ -26,7 +26,7 @@ touched ledger key. Anchor guard skips lines at/under the active anchor T0.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -117,6 +117,7 @@ class DeferredCustodyFinalizeResult:
 
 
 DEFERRED_CUSTODY_KEY = "deferred_custody_recorders"
+DEFERRED_CUSTODY_SPECS_KEY = "deferred_custody_candidate_specs"
 
 
 class HistoricalPullValidationError(ValueError):
@@ -975,10 +976,11 @@ def project_deferred_custody_for_target(
         identities.append(identity)
 
     from app.services.production_material_custody_events import (
-        project_transfer_custody_events_for_recorder,
+        build_transfer_custody_event_specs_for_recorder,
+        candidate_custody_spec_to_payload,
     )
 
-    appended = 0
+    specs = []
     for kind, ref in sorted(set(identities)):
         rows = (
             session.query(models.StockLedgerEntry)
@@ -991,17 +993,28 @@ def project_deferred_custody_for_target(
             .order_by(models.StockLedgerEntry.line_no, models.StockLedgerEntry.id)
             .all()
         )
-        appended += int(project_transfer_custody_events_for_recorder(
+        specs.extend(build_transfer_custody_event_specs_for_recorder(
             session,
             recorder_type=kind,
             recorder_ref=ref,
             stock_ledger_entries=rows,
-            invalidate_current=False,
         ))
+    ordered = sorted(specs, key=lambda spec: (
+        spec.effective_at,
+        0 if spec.source_kind == "issue_created" else 1,
+        str(spec.source_ref2c or ""),
+        str(spec.physical_line_no or ""),
+        str(spec.source_sle_identity or ""),
+        spec.idempotency_key,
+    ))
+    marks[DEFERRED_CUSTODY_SPECS_KEY] = [
+        candidate_custody_spec_to_payload(replace(spec, virtual_ordinal=ordinal))
+        for ordinal, spec in enumerate(ordered, start=1)
+    ]
     marks.pop(DEFERRED_CUSTODY_KEY, None)
     generation.source_watermarks = marks
     session.flush()
-    return appended
+    return len(ordered)
 
 
 # ---------------------------------------------------------------------------

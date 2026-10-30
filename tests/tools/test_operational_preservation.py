@@ -44,8 +44,14 @@ def test_empty_removed_anchor_preserves_all_operational_rows_and_reports_absence
     event.listen(engine, "before_cursor_execute", lambda conn, cursor, statement, parameters, context, executemany: statements.append(statement))
     report = verify_preservation(engine, before)
     assert report["status"] == "passed"
-    assert len(report["checks"]) == 17
+    assert len(report["checks"]) == 19
     assert report["checks"]["production_order_lines"] == {"preserved": True, "source_absent": True}
+    assert report["checks"]["accepted_production_mutation_state"] == {
+        "preserved": True, "source_absent": True,
+    }
+    assert report["checks"]["accepted_production_mutation"] == {
+        "preserved": True, "source_absent": True,
+    }
     assert "schema_rule" in report["checks"]["purchase_export_batch"]
     assert all(not statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP")) for statement in statements)
 

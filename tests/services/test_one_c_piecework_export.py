@@ -818,6 +818,8 @@ def test_idempotent_retry_never_writes_order_state(db_session, monkeypatch):
     piecework_patch_count = sum("СдельныйНаряд" in path for path, _ in fake.patches)
 
     _publish_accepted_output_fact(db, m, qty=4.0)
+    state = db.get(models.AcceptedProductionMutationState, 1)
+    epoch_before_retry = int(state.last_issued_epoch or 0) if state is not None else 0
     second = exporter.export_piecework_to_1c(
         db,
         [m.manufacture_id],
@@ -832,6 +834,8 @@ def test_idempotent_retry_never_writes_order_state(db_session, monkeypatch):
         piecework_patch_count
     )
     assert all("ЗаказНаПроизводство" not in path for path, _ in fake.patches)
+    state = db.get(models.AcceptedProductionMutationState, 1)
+    assert (int(state.last_issued_epoch or 0) if state is not None else 0) == epoch_before_retry
     db.refresh(m.order)
     assert m.order.order_state_key is None
 

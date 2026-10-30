@@ -12,11 +12,6 @@ from typing import Any
 
 from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
-
-
-_COMMAND_PUBLICATION_LOCK_TIMEOUT_MS = 3_000
 
 
 def run_command(action: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -59,43 +54,9 @@ def _execute(db, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _lock_command_publication(db, *, action: str) -> None:
-    """Wait briefly for the current-owner boundary before any command writes."""
-    from app import models
-    try:
-        is_postgresql = db.get_bind().dialect.name == "postgresql"
-        if is_postgresql:
-            db.execute(text(
-                f"SET LOCAL lock_timeout = '{_COMMAND_PUBLICATION_LOCK_TIMEOUT_MS}ms'"
-            ))
-        db.query(models.PlanningTruthState).filter_by(id=1).with_for_update().one()
-        if is_postgresql:
-            db.execute(text("SET LOCAL lock_timeout = DEFAULT"))
-    except DBAPIError as exc:
-        if getattr(exc.orig, "pgcode", None) != "55P03":
-            raise
-        message = (
-            "Идёт публикация нового состояния журнала. Запуск не выполнен, "
-            "исполнительный заказ не создан. Повторите запуск после обновления журнала."
-            if action == "materialize"
-            else "Идёт публикация нового состояния журнала. Команда не выполнена, "
-            "изменения не сохранены. Повторите команду после обновления журнала."
-        )
-        raise HTTPException(409, detail={
-            "code": "production_ledger_publication_busy",
-            "message": message,
-        }) from exc
-
-
 def execute(db, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
-        # Quantity-specific material previews hold the production manifest
-        # boundary and exact current row themselves.  Let them keep reading
-        # the old committed scope while a long physical publication prepares
-        # its successor; every domain-changing command retains the global
-        # PlanningTruthState boundary below.
-        if action != "materials":
-            _lock_command_publication(db, action=action)
+        # Writers own short pointer -> epoch -> current-owner boundaries.
         return _execute(db, action, arguments)
     except Exception:
         db.rollback()

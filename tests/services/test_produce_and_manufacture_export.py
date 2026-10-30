@@ -1432,6 +1432,12 @@ def test_export_blocked_when_1c_unit_balance_insufficient(db_session, monkeypatc
 
     entry = result["entries"][0]
     assert entry["error"] and "Недостаточно остатков в 1С" in entry["error"]
+    state = db.get(models.AcceptedProductionMutationState, 1)
+    epoch = int(state.last_issued_epoch or 0) if state is not None else 0
+    repeated = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
+    assert repeated["manufactures_blocked"] == 1
+    state = db.get(models.AcceptedProductionMutationState, 1)
+    assert (int(state.last_issued_epoch or 0) if state is not None else 0) == epoch
 
 
 def test_export_blocked_when_component_absent_on_unit(db_session, monkeypatch):

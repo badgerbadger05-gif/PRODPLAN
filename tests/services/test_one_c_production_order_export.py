@@ -800,6 +800,8 @@ def test_second_export_is_noop_due_to_existing_link(db_session, monkeypatch):
 
     exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
     assert len(fake.posts) == 1
+    state = db.get(models.AcceptedProductionMutationState, 1)
+    epoch = int(state.last_issued_epoch or 0) if state is not None else 0
 
     # Re-call. Same order, success link already there -> entries[].status='existing',
     # no new POST and orders_created=0.
@@ -807,6 +809,8 @@ def test_second_export_is_noop_due_to_existing_link(db_session, monkeypatch):
     assert result["orders_created"] == 0
     assert result["orders_already_linked"] == 1
     assert len(fake.posts) == 1  # no additional POST
+    state = db.get(models.AcceptedProductionMutationState, 1)
+    assert (int(state.last_issued_epoch or 0) if state is not None else 0) == epoch
 
 
 def test_empty_local_link_recovers_document_from_1c_origin_marker(db_session, monkeypatch):

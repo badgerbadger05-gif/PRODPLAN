@@ -1001,6 +1001,7 @@ def preview_materials_bulk(
     *,
     ledger_generation_id: int,
     _current_only: bool = False,
+    _custody_override: Any | None = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Preview bounded production products with shared Ledger read context.
 
@@ -1033,6 +1034,7 @@ def preview_materials_bulk(
         products_by_id,
         ledger_generation_id=int(ledger_generation_id),
         _current_only=_current_only,
+        _custody_override=_custody_override,
     )
 
 
@@ -1042,6 +1044,7 @@ def _preview_material_products_bulk(
     *,
     ledger_generation_id: int,
     _current_only: bool = False,
+    _custody_override: Any | None = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Render already-resolved product objects through one shared read context."""
     ids = tuple(products_by_id)
@@ -1086,7 +1089,9 @@ def _preview_material_products_bulk(
         ledger_generation_id=generation_id,
         allow_building_read=not _current_only,
     )
-    if _current_only:
+    if _custody_override is not None:
+        custody = _custody_override
+    elif _current_only:
         from .production_material_custody_projection import load_compact_current_material_custody
         custody_generation, custody = load_compact_current_material_custody(db, consumer="production.current_materials_bulk")
         if custody_generation != generation_id:
@@ -1216,6 +1221,7 @@ def preview_make_work_items_materials_bulk(
     ledger_generation_id: int,
     _current_only: bool = False,
     _allow_synthetic_ids: bool = False,
+    _custody_override: Any | None = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Render detailed MAKE snapshots with one transaction-bounded read context.
 
@@ -1282,6 +1288,7 @@ def preview_make_work_items_materials_bulk(
         products_by_id,
         ledger_generation_id=int(ledger_generation_id),
         _current_only=_current_only,
+        _custody_override=_custody_override,
     )
     result: Dict[int, Dict[str, Any]] = {}
     for product_id, payload in previews.items():
@@ -1299,6 +1306,7 @@ def preview_make_work_items_coverage(
     *,
     ledger_generation_id: int,
     _current_only: bool = False,
+    _custody_override: Any | None = None,
 ) -> Dict[int, Dict[str, str]]:
     """Calculate proposal material coverage in bulk for one Ledger generation.
 
@@ -1420,7 +1428,9 @@ def preview_make_work_items_coverage(
         ledger_generation_id=int(ledger_generation_id),
         allow_building_read=not _current_only,
     )
-    if _current_only:
+    if _custody_override is not None:
+        custody = _custody_override
+    elif _current_only:
         from .production_material_custody_projection import (
             load_compact_current_material_custody,
         )

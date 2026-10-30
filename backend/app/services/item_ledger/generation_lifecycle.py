@@ -1122,6 +1122,8 @@ def _reservation_owner_promotion_checkpoint(
 def validate_obligation_refresh_build(
     db: Session,
     generation_id: int,
+    *,
+    prepared_current_reservations: object | None = None,
 ) -> dict[str, Any]:
     """Structural gate for the obligation-refresh publisher.
 
@@ -1178,7 +1180,32 @@ def validate_obligation_refresh_build(
     # Last: everything above proves the candidate itself, and a candidate that
     # is structurally broken should say so rather than blame the publication
     # step.  This one proves the publication actually happened.
-    promoted_owner_count = _reservation_owner_promotion_checkpoint(db, generation)
+    if prepared_current_reservations is None:
+        promoted_owner_count = _reservation_owner_promotion_checkpoint(db, generation)
+    else:
+        if int(getattr(prepared_current_reservations, "generation_id", 0)) != int(generation.id):
+            raise GenerationValidationError(
+                "prepared current-reservation proof belongs to another generation"
+            )
+        prepared_identities = set(getattr(
+            prepared_current_reservations, "activation_identities", (),
+        )) or {
+            str(row.current_identity)
+            for row in getattr(prepared_current_reservations, "target_reservations", ())
+            if getattr(row, "accepted_owner_id", None) is None
+        }
+        staged_identities = {
+            str(value)
+            for (value,) in db.query(models.ReservationEntry.current_identity).filter(
+                models.ReservationEntry.ledger_generation_id == int(generation.id),
+                models.ReservationEntry.owner_kind == "building",
+            ).all()
+        }
+        if prepared_identities != staged_identities:
+            raise GenerationValidationError(
+                "prepared current-reservation proof does not cover BUILDING owners"
+            )
+        promoted_owner_count = len(prepared_identities)
     return {
         "ledger_generation_id": int(generation.id),
         "physical_facts": len(visible),

@@ -17,6 +17,7 @@ from app.services.item_ledger.obligation_generation import ObligationGenerationE
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.obligation_refresh_publish import ObligationRefreshPublishError
 from app.services.planning_pool_resolver import PlanningPoolConfigurationError
+from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
 
 
 def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка", period_from=date(2026, 8, 1)):
@@ -1289,18 +1290,20 @@ def test_refresh_that_skips_the_promotion_is_rejected_before_acceptance(
     """The gate: a candidate with unpublished staging owners cannot become truth."""
     accepted, plan, _line, _item, _parent, _cutoff = _world(db_session, qty=5)
 
-    # ``raising=False`` on purpose: the point of the gate is that a build which
-    # never promoted cannot be accepted, however it came to skip it.
+    from dataclasses import replace
+    real_prepare = workflow.prepare_current_reservations
     monkeypatch.setattr(
         workflow,
-        "publish_current_reservations",
-        lambda db, **kwargs: {},
-        raising=False,
+        "prepare_current_reservations",
+        lambda db, **kwargs: replace(
+            real_prepare(db, **kwargs), target_reservations=(),
+            activation_identities=(),
+        ),
     )
 
     with pytest.raises(
         workflow.ObligationRefreshOrchestratorError,
-        match="publish_current_reservations must run",
+        match="prepared current-reservation proof does not cover",
     ):
         _run(db_session, accepted, "orch-skip-promotion", replace=[plan.id])
 
@@ -1596,7 +1599,10 @@ def test_a_bounded_physical_refresh_after_an_obligation_refresh_is_accepted(
     db_session.flush()
     target = models.LedgerGeneration(
         generation_key="orch-then-physical-target", status="building",
-        cutoff=target_cutoff, source_watermarks={"parent_generation_id": int(parent.id)},
+        cutoff=target_cutoff, source_watermarks={
+            "parent_generation_id": int(parent.id),
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db_session),
+        },
         capabilities={}, physical_import_batch_id=int(batch.id), algorithm_version="test",
     )
     db_session.add(target)
@@ -1630,7 +1636,19 @@ def test_a_bounded_physical_refresh_after_an_obligation_refresh_is_accepted(
         },
     )
     monkeypatch.setattr(
-        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+        publisher, "prepare_current_obligation_views_from_generation",
+        lambda *a, **kw: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        publisher, "install_prepared_current_obligation_views",
+        lambda *a, **kw: {
+            "purchase_control_journal": SimpleNamespace(changed_rows=0, idempotent=True),
+            "mrp_result": SimpleNamespace(changed_rows=0, idempotent=True),
+            "period_plan_execution": SimpleNamespace(changed_rows=0, idempotent=True),
+        },
+    )
+    monkeypatch.setattr(
+        publisher, "install_verified_material_custody_handoff", lambda *a, **kw: None,
     )
     monkeypatch.setattr(
         publisher, "build_compact_current_production_control_payload",
@@ -2226,7 +2244,10 @@ def test_a_bounded_refresh_after_an_obligation_refresh_rewrites_no_unchanged_row
     db_session.flush()
     target = models.LedgerGeneration(
         generation_key="orch-28a-target", status="building", cutoff=target_cutoff,
-        source_watermarks={"parent_generation_id": int(parent.id)}, capabilities={},
+            source_watermarks={
+                "parent_generation_id": int(parent.id),
+                "accepted_production_mutation_epoch": 0,
+            }, capabilities={},
         physical_import_batch_id=int(batch.id), algorithm_version="test",
     )
     other = models.Item(item_code="ORCH-28A-OTHER", item_name="untouched by the plan")
@@ -2244,7 +2265,7 @@ def test_a_bounded_refresh_after_an_obligation_refresh_rewrites_no_unchanged_row
     db_session.add(sle)
     db_session.commit()
     monkeypatch.setattr(
-        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+        publisher, "install_verified_material_custody_handoff", lambda *a, **kw: None,
     )
 
     publisher.publish_forward_physical_refresh_current(
@@ -2320,7 +2341,10 @@ def test_a_make_owner_folds_the_same_receipt_on_both_paths(db_session, monkeypat
     db_session.flush()
     target = models.LedgerGeneration(
         generation_key="orch-29a-target", status="building", cutoff=target_cutoff,
-        source_watermarks={"parent_generation_id": int(parent.id)}, capabilities={},
+        source_watermarks={
+            "parent_generation_id": int(parent.id),
+            "accepted_production_mutation_epoch": 0,
+        }, capabilities={},
         physical_import_batch_id=int(batch.id), algorithm_version="test",
     )
     db_session.add(target)
@@ -2337,7 +2361,7 @@ def test_a_make_owner_folds_the_same_receipt_on_both_paths(db_session, monkeypat
     db_session.add(delta)
     db_session.commit()
     monkeypatch.setattr(
-        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+        publisher, "install_verified_material_custody_handoff", lambda *a, **kw: None,
     )
     publisher.publish_forward_physical_refresh_current(
         db_session, target_generation_id=int(target.id),

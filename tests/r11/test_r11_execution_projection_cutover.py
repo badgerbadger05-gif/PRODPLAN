@@ -152,10 +152,23 @@ def test_runtime_cleanup_is_after_both_current_publications_and_has_fail_closed_
     refresh = (
         REPO / "backend/app/services/obligation_refresh_publish.py"
     ).read_text(encoding="utf-8")
-    for source in (lifecycle, refresh):
-        publication = source.index("publish_current_obligation_views_from_generation")
-        cleanup = source.index("prune_retired_execution_projections", publication)
-        assert cleanup > publication
+    lifecycle_publication = lifecycle.index(
+        "publish_current_obligation_views_from_generation"
+    )
+    lifecycle_cleanup = lifecycle.index(
+        "prune_retired_execution_projections", lifecycle_publication
+    )
+    assert lifecycle_cleanup > lifecycle_publication
+
+    # Obligation refresh prepares complete immutable views before cleanup, then
+    # installs them under the final pointer boundary.  Cleanup and install are
+    # in the same caller-owned transaction, so any basis conflict rolls both
+    # back and the accepted owner is never partially visible.
+    prepared = refresh.index("prepare_current_obligation_views_from_generation")
+    cleanup = refresh.index("prune_retired_execution_projections", prepared)
+    installed = refresh.index("install_prepared_current_obligation_views", cleanup)
+    pointer = refresh.index("move_pointer_to_generation", installed)
+    assert prepared < cleanup < installed < pointer
     service = SERVICE.read_text(encoding="utf-8")
     assert "requires the exact accepted truth pointer" in service
     assert "current_execution_scope" in service

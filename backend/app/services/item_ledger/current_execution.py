@@ -8,7 +8,7 @@ business change when the saved result is unchanged.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
 import hashlib
@@ -405,6 +405,85 @@ class CurrentExecutionPublishResult:
     changed_rows: int
     closed_rows: int
     idempotent: bool
+
+
+class CurrentExecutionPreparedBasisConflict(CurrentExecutionUnavailable):
+    """The current scope changed after a lock-free publication preparation."""
+
+
+@dataclass(frozen=True)
+class _CurrentExecutionScopeBasis:
+    entity_kind: str
+    row_id: int | None
+    source_revision: str | None
+    source_generation_id: int | None
+    result_ready: bool | None
+    content_hash: str | None
+    summary: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _CurrentExecutionRowBasis:
+    row_id: int
+    entity_kind: str
+    business_identity: str
+    source_revision: str
+    source_generation_id: int | None
+    result_status: str
+    result_ready: bool
+    content_hash: str
+    payload: dict[str, Any]
+    manual_input: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _PreparedCurrentExecutionRowChange:
+    entity_kind: str
+    business_identity: str
+    operation: str
+    expected_row_id: int | None
+    content_hash: str | None = None
+    payload: dict[str, Any] | None = None
+    manual_input: dict[str, Any] | None = None
+    before_payload: dict[str, Any] | None = None
+    after_payload: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class PreparedCurrentExecutionScopeChange:
+    """Fully normalized current-scope DML recipe built outside publication locks."""
+
+    source_revision: str
+    source_generation_id: int | None
+    scope_key: str
+    result_ready: bool
+    complete_scope: bool
+    summary: dict[str, Any] | None
+    normalized_rows: tuple[dict[str, Any], ...]
+    scope_hashes: tuple[tuple[str, str], ...]
+    scope_basis: tuple[_CurrentExecutionScopeBasis, ...]
+    row_basis: tuple[_CurrentExecutionRowBasis, ...]
+    row_changes: tuple[_PreparedCurrentExecutionRowChange, ...]
+    changed_rows: int
+    closed_rows: int
+
+
+@dataclass(frozen=True)
+class PreparedCurrentObligationViews:
+    """Ordered, fully prepared obligation current scopes for one generation."""
+
+    changes: tuple[tuple[str, PreparedCurrentExecutionScopeChange], ...]
+
+
+@dataclass(frozen=True)
+class PreparedCompactCurrentExecutionViews:
+    """Queue/dependent compact scopes with deferred numeric queue owner IDs."""
+
+    queue: PreparedCurrentExecutionScopeChange
+    readiness: PreparedCurrentExecutionScopeChange
+    drum: PreparedCurrentExecutionScopeChange
+    shelf: PreparedCurrentExecutionScopeChange
+    deferred_queue_owners: tuple[tuple[str, str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -845,7 +924,55 @@ def _source_generation(db: Session, source_generation_id: int | None) -> models.
     return generation
 
 
-def publish_current_execution_scope(
+def _current_execution_scope_basis(
+    entity_kind: str,
+    manifest: models.CurrentExecutionScope | None,
+) -> _CurrentExecutionScopeBasis:
+    if manifest is None:
+        return _CurrentExecutionScopeBasis(
+            entity_kind=entity_kind,
+            row_id=None,
+            source_revision=None,
+            source_generation_id=None,
+            result_ready=None,
+            content_hash=None,
+            summary=None,
+        )
+    return _CurrentExecutionScopeBasis(
+        entity_kind=entity_kind,
+        row_id=int(manifest.id),
+        source_revision=str(manifest.source_revision),
+        source_generation_id=(
+            int(manifest.source_generation_id)
+            if manifest.source_generation_id is not None else None
+        ),
+        result_ready=bool(manifest.result_ready),
+        content_hash=str(manifest.content_hash),
+        summary=_jsonable(dict(manifest.summary or {})),
+    )
+
+
+def _current_execution_row_basis(
+    row: models.CurrentExecutionRow,
+) -> _CurrentExecutionRowBasis:
+    return _CurrentExecutionRowBasis(
+        row_id=int(row.id),
+        entity_kind=str(row.entity_kind),
+        business_identity=str(row.business_identity),
+        source_revision=str(row.source_revision),
+        source_generation_id=(
+            int(row.source_generation_id)
+            if row.source_generation_id is not None else None
+        ),
+        result_status=str(row.result_status),
+        result_ready=bool(row.result_ready),
+        content_hash=str(row.content_hash),
+        payload=_jsonable(dict(row.payload or {})),
+        manual_input=_jsonable(dict(row.manual_input or {})),
+    )
+
+
+def _prepare_current_execution_scope(
     db: Session,
     *,
     source_revision: str,
@@ -856,8 +983,9 @@ def publish_current_execution_scope(
     complete_scope: bool = True,
     entity_kinds: Iterable[str] | None = None,
     summary: dict[str, Any] | None = None,
-) -> CurrentExecutionPublishResult:
-    """Publish one complete current scope with stable IDs and no-op semantics."""
+    lock_basis: bool,
+) -> PreparedCurrentExecutionScopeChange:
+    """Build the canonical normalized diff, optionally locking its read basis."""
 
     revision = str(source_revision or "").strip()
     scope = str(scope_key or "").strip()
@@ -903,6 +1031,8 @@ def publish_current_execution_scope(
         expected_kinds = set(actual_kinds)
     if not expected_kinds:
         raise CurrentExecutionUnavailable("empty complete scope requires explicit entity kinds")
+    scope_hashes: list[tuple[str, str]] = []
+    scope_basis: list[_CurrentExecutionScopeBasis] = []
     for kind in sorted(expected_kinds):
         entries = [
             (identity, semantic_by_key[(entry_kind, identity)], manual)
@@ -911,31 +1041,15 @@ def publish_current_execution_scope(
             if entry_kind == kind
         ]
         scope_hash = _hash(entries)
-        manifest = db.query(models.CurrentExecutionScope).filter(
+        manifest_query = db.query(models.CurrentExecutionScope).filter(
             models.CurrentExecutionScope.entity_kind == kind,
             models.CurrentExecutionScope.scope_key == scope,
-        ).with_for_update().one_or_none()
-        if manifest is None:
-            db.add(models.CurrentExecutionScope(
-                entity_kind=kind,
-                scope_key=scope,
-                source_revision=revision,
-                source_generation_id=source_generation_id,
-                result_ready=True,
-                content_hash=scope_hash,
-                summary=_jsonable(summary or {}),
-            ))
-        else:
-            # The manifest is both the valid-empty marker and the accepted
-            # semantic pointer.  Technical generation/revision provenance is
-            # advanced even when the business payload is unchanged; current
-            # rows and their change audit remain byte-stable in that case.
-            manifest.source_revision = revision
-            manifest.source_generation_id = source_generation_id
-            manifest.result_ready = True
-            manifest.content_hash = scope_hash
-            if summary is not None:
-                manifest.summary = _jsonable(summary)
+        )
+        if lock_basis:
+            manifest_query = manifest_query.with_for_update()
+        manifest = manifest_query.one_or_none()
+        scope_hashes.append((kind, scope_hash))
+        scope_basis.append(_current_execution_scope_basis(kind, manifest))
     existing_query = db.query(models.CurrentExecutionRow).filter(
         models.CurrentExecutionRow.scope_key == scope,
     )
@@ -950,11 +1064,12 @@ def publish_current_execution_scope(
             ),
         ),
     )
-    existing = existing_query.with_for_update().all()
+    if lock_basis:
+        existing_query = existing_query.with_for_update()
+    existing = existing_query.all()
     existing_by_key = {(str(row.entity_kind), str(row.business_identity)): row for row in existing}
 
-    changed = 0
-    closed = 0
+    changes: list[_PreparedCurrentExecutionRowChange] = []
     for key, (payload, manual, content_hash, manual_supplied) in incoming.items():
         row = existing_by_key.get(key)
         if row is not None and not manual_supplied and row.manual_input:
@@ -982,47 +1097,32 @@ def publish_current_execution_scope(
                 # treating it as an update would churn every row and its audit
                 # each time a specification import touched the current scope.
                 if not bool(row.result_ready):
-                    row.result_ready = True
+                    changes.append(_PreparedCurrentExecutionRowChange(
+                        entity_kind=key[0],
+                        business_identity=key[1],
+                        operation="ready",
+                        expected_row_id=int(row.id),
+                    ))
                 continue
         if row is None:
-            row = models.CurrentExecutionRow(
-                entity_kind=key[0],
-                business_identity=key[1],
-                scope_key=scope,
-                source_revision=revision,
-                source_generation_id=source_generation_id,
-                result_status="accepted",
-                result_ready=True,
-                content_hash=content_hash,
-                payload=_jsonable(payload),
-                manual_input=_jsonable(manual),
-            )
-            db.add(row)
-            db.flush()
             operation = "insert"
+            expected_row_id = None
             before = None
         else:
-            before = dict(row.payload or {})
-            row.source_revision = revision
-            row.source_generation_id = source_generation_id
-            row.result_status = "accepted"
-            row.result_ready = True
-            row.content_hash = content_hash
-            row.payload = _jsonable(payload)
-            row.manual_input = _jsonable(manual)
             operation = "update"
-        db.add(models.CurrentExecutionChange(
-            current_row_id=int(row.id),
+            expected_row_id = int(row.id)
+            before = dict(row.payload or {})
+        changes.append(_PreparedCurrentExecutionRowChange(
             entity_kind=key[0],
             business_identity=key[1],
-            scope_key=scope,
-            source_revision=revision,
             operation=operation,
-            reason="recalculation",
+            expected_row_id=expected_row_id,
+            content_hash=content_hash,
+            payload=_jsonable(payload),
+            manual_input=_jsonable(manual),
             before_payload=compact_audit_payload(before, key[0]),
             after_payload=compact_audit_payload(payload, key[0]),
         ))
-        changed += 1
 
     if complete_scope:
         incoming_keys = set(incoming)
@@ -1030,28 +1130,454 @@ def publish_current_execution_scope(
             key = (str(row.entity_kind), str(row.business_identity))
             if key in incoming_keys or str(row.result_status) == "closed":
                 continue
-            before = dict(row.payload or {})
-            row.result_status = "closed"
-            row.result_ready = False
-            row.source_revision = revision
-            db.add(models.CurrentExecutionChange(
-                current_row_id=int(row.id),
-                entity_kind=str(row.entity_kind),
-                business_identity=str(row.business_identity),
-                scope_key=scope,
-                source_revision=revision,
+            changes.append(_PreparedCurrentExecutionRowChange(
+                entity_kind=key[0],
+                business_identity=key[1],
                 operation="close",
-                reason="scope_rebuild",
-                before_payload=compact_audit_payload(before, str(row.entity_kind)),
-                after_payload=None,
+                expected_row_id=int(row.id),
+                before_payload=compact_audit_payload(
+                    dict(row.payload or {}), str(row.entity_kind)
+                ),
             ))
-            closed += 1
-    db.flush()
-    return CurrentExecutionPublishResult(
+    changed = sum(change.operation in {"insert", "update"} for change in changes)
+    closed = sum(change.operation == "close" for change in changes)
+    return PreparedCurrentExecutionScopeChange(
+        source_revision=revision,
+        source_generation_id=source_generation_id,
+        scope_key=scope,
+        result_ready=True,
+        complete_scope=bool(complete_scope),
+        summary=_jsonable(summary) if summary is not None else None,
+        normalized_rows=tuple(
+            {
+                "entity_kind": kind,
+                "business_identity": identity,
+                "scope_key": scope,
+                "payload": _jsonable(payload),
+                "manual_input": _jsonable(manual),
+            }
+            for (kind, identity), (payload, manual, _hash_value, _manual_supplied)
+            in incoming.items()
+        ),
+        scope_hashes=tuple(scope_hashes),
+        scope_basis=tuple(scope_basis),
+        row_basis=tuple(_current_execution_row_basis(row) for row in existing),
+        row_changes=tuple(changes),
         changed_rows=changed,
         closed_rows=closed,
-        idempotent=(changed == 0 and closed == 0),
     )
+
+
+def prepare_current_execution_scope(
+    db: Session,
+    *,
+    source_revision: str,
+    scope_key: str,
+    rows: Iterable[dict[str, Any]],
+    source_generation_id: int | None = None,
+    result_ready: bool = True,
+    complete_scope: bool = True,
+    entity_kinds: Iterable[str] | None = None,
+    summary: dict[str, Any] | None = None,
+) -> PreparedCurrentExecutionScopeChange:
+    """Normalize and diff a complete scope without publication locks or writes."""
+    return _prepare_current_execution_scope(
+        db,
+        source_revision=source_revision,
+        scope_key=scope_key,
+        rows=rows,
+        source_generation_id=source_generation_id,
+        result_ready=result_ready,
+        complete_scope=complete_scope,
+        entity_kinds=entity_kinds,
+        summary=summary,
+        lock_basis=False,
+    )
+
+
+def install_prepared_current_execution_scope(
+    db: Session,
+    prepared: PreparedCurrentExecutionScopeChange,
+) -> CurrentExecutionPublishResult:
+    """Install a prepared scope while the caller holds its pointer/epoch lock."""
+    expected_scopes = {basis.entity_kind: basis for basis in prepared.scope_basis}
+    fresh_scopes: dict[str, models.CurrentExecutionScope | None] = {}
+    for entity_kind, _scope_hash in prepared.scope_hashes:
+        manifest = (
+            db.query(models.CurrentExecutionScope)
+            .populate_existing()
+            .filter(
+                models.CurrentExecutionScope.entity_kind == entity_kind,
+                models.CurrentExecutionScope.scope_key == prepared.scope_key,
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        if _current_execution_scope_basis(entity_kind, manifest) != expected_scopes[entity_kind]:
+            raise CurrentExecutionPreparedBasisConflict(
+                f"current execution scope basis changed: {entity_kind}:{prepared.scope_key}"
+            )
+        fresh_scopes[entity_kind] = manifest
+
+    expected_rows = {
+        (basis.entity_kind, basis.business_identity): basis
+        for basis in prepared.row_basis
+    }
+    identities = sorted({basis.business_identity for basis in prepared.row_basis})
+    row_query = db.query(models.CurrentExecutionRow).filter(
+        models.CurrentExecutionRow.scope_key == prepared.scope_key,
+        models.CurrentExecutionRow.entity_kind.in_(sorted(expected_scopes)),
+        or_(
+            models.CurrentExecutionRow.result_status != "closed",
+            models.CurrentExecutionRow.business_identity.in_(identities),
+        ),
+    )
+    fresh_rows = row_query.populate_existing().with_for_update().all()
+    fresh_row_basis = {
+        (basis.entity_kind, basis.business_identity): basis
+        for basis in (_current_execution_row_basis(row) for row in fresh_rows)
+    }
+    if fresh_row_basis != expected_rows:
+        raise CurrentExecutionPreparedBasisConflict(
+            f"current execution rows basis changed: {prepared.scope_key}"
+        )
+    rows_by_key = {
+        (str(row.entity_kind), str(row.business_identity)): row for row in fresh_rows
+    }
+
+    for entity_kind, scope_hash in prepared.scope_hashes:
+        manifest = fresh_scopes[entity_kind]
+        if manifest is None:
+            db.add(models.CurrentExecutionScope(
+                entity_kind=entity_kind,
+                scope_key=prepared.scope_key,
+                source_revision=prepared.source_revision,
+                source_generation_id=prepared.source_generation_id,
+                result_ready=prepared.result_ready,
+                content_hash=scope_hash,
+                summary=prepared.summary or {},
+            ))
+        else:
+            manifest.source_revision = prepared.source_revision
+            manifest.source_generation_id = prepared.source_generation_id
+            manifest.result_ready = prepared.result_ready
+            manifest.content_hash = scope_hash
+            if prepared.summary is not None:
+                manifest.summary = prepared.summary
+
+    for change in prepared.row_changes:
+        key = (change.entity_kind, change.business_identity)
+        row = rows_by_key.get(key)
+        if change.operation == "ready":
+            if row is None:
+                raise CurrentExecutionPreparedBasisConflict(
+                    f"current execution row disappeared: {change.entity_kind}:{change.business_identity}"
+                )
+            row.result_ready = True
+            continue
+        if change.operation == "insert":
+            row = models.CurrentExecutionRow(
+                entity_kind=change.entity_kind,
+                business_identity=change.business_identity,
+                scope_key=prepared.scope_key,
+                source_revision=prepared.source_revision,
+                source_generation_id=prepared.source_generation_id,
+                result_status="accepted",
+                result_ready=True,
+                content_hash=str(change.content_hash),
+                payload=change.payload or {},
+                manual_input=change.manual_input or {},
+            )
+            db.add(row)
+            db.flush()
+            rows_by_key[key] = row
+            reason = "recalculation"
+        elif change.operation == "update":
+            if row is None or int(row.id) != int(change.expected_row_id or 0):
+                raise CurrentExecutionPreparedBasisConflict(
+                    f"current execution row changed: {change.entity_kind}:{change.business_identity}"
+                )
+            row.source_revision = prepared.source_revision
+            row.source_generation_id = prepared.source_generation_id
+            row.result_status = "accepted"
+            row.result_ready = True
+            row.content_hash = str(change.content_hash)
+            row.payload = change.payload or {}
+            row.manual_input = change.manual_input or {}
+            reason = "recalculation"
+        elif change.operation == "close":
+            if row is None or int(row.id) != int(change.expected_row_id or 0):
+                raise CurrentExecutionPreparedBasisConflict(
+                    f"current execution row changed: {change.entity_kind}:{change.business_identity}"
+                )
+            row.result_status = "closed"
+            row.result_ready = False
+            row.source_revision = prepared.source_revision
+            reason = "scope_rebuild"
+        else:
+            raise AssertionError(f"unknown prepared current execution operation: {change.operation}")
+        db.add(models.CurrentExecutionChange(
+            current_row_id=int(row.id),
+            entity_kind=change.entity_kind,
+            business_identity=change.business_identity,
+            scope_key=prepared.scope_key,
+            source_revision=prepared.source_revision,
+            operation=change.operation,
+            reason=reason,
+            before_payload=change.before_payload,
+            after_payload=change.after_payload,
+        ))
+    db.flush()
+    return CurrentExecutionPublishResult(
+        changed_rows=prepared.changed_rows,
+        closed_rows=prepared.closed_rows,
+        idempotent=(prepared.changed_rows == 0 and prepared.closed_rows == 0),
+    )
+
+
+def publish_current_execution_scope(
+    db: Session,
+    *,
+    source_revision: str,
+    scope_key: str,
+    rows: Iterable[dict[str, Any]],
+    source_generation_id: int | None = None,
+    result_ready: bool = True,
+    complete_scope: bool = True,
+    entity_kinds: Iterable[str] | None = None,
+    summary: dict[str, Any] | None = None,
+) -> CurrentExecutionPublishResult:
+    """Publish one complete current scope with stable IDs and no-op semantics."""
+    prepared = _prepare_current_execution_scope(
+        db,
+        source_revision=source_revision,
+        scope_key=scope_key,
+        rows=rows,
+        source_generation_id=source_generation_id,
+        result_ready=result_ready,
+        complete_scope=complete_scope,
+        entity_kinds=entity_kinds,
+        summary=summary,
+        lock_basis=True,
+    )
+    return install_prepared_current_execution_scope(db, prepared)
+
+
+def _compact_payload_member(payload: Any, name: str, default: Any = None) -> Any:
+    if isinstance(payload, Mapping):
+        return payload.get(name, default)
+    return getattr(payload, name, default)
+
+
+def _prepare_queue_dependent_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    current_queue_ids: Mapping[str, int],
+    consumer: str,
+) -> tuple[tuple[dict[str, Any], ...], tuple[tuple[str, str, str], ...]]:
+    prepared_rows: list[dict[str, Any]] = []
+    deferred: list[tuple[str, str, str]] = []
+    for raw in rows:
+        row = dict(raw)
+        payload = dict(row.get("payload") or {})
+        business_identity = str(row.get("business_identity") or "").strip()
+        if str(row.get("entity_kind") or "") == "drum_schedule":
+            prepared_rows.append(row)
+            continue
+        owner_identity = str(payload.get("queue_owner_identity") or "").strip()
+        if not owner_identity:
+            plan_line_id = payload.get("plan_line_id")
+            if plan_line_id is None:
+                raise CurrentExecutionUnavailable(
+                    f"{consumer} row lacks queue owner identity"
+                )
+            owner_identity = f"plan-line:{int(plan_line_id)}"
+        owner_id = current_queue_ids.get(owner_identity)
+        if owner_id is None:
+            payload["queue_line_id"] = 0
+            deferred.append((consumer, business_identity, owner_identity))
+        else:
+            payload["queue_line_id"] = int(owner_id)
+        row["payload"] = payload
+        prepared_rows.append(row)
+    return tuple(prepared_rows), tuple(deferred)
+
+
+def prepare_compact_current_execution_views(
+    db: Session,
+    *,
+    generation_id: int,
+    source_revision: str,
+    assembly_payload: Any,
+    drum_payload: Any,
+    shelf_payload: Any,
+) -> PreparedCompactCurrentExecutionViews:
+    """Prepare compact queue/readiness/drum/shelf business payloads read-only."""
+    generation = _source_generation(db, int(generation_id))
+    if generation is None:
+        raise CurrentExecutionUnavailable("compact current publication generation is missing")
+    queue_rows = tuple(_compact_payload_member(assembly_payload, "queue_rows", ()) or ())
+    queue = prepare_current_execution_scope(
+        db,
+        source_revision=str(source_revision),
+        source_generation_id=int(generation.id),
+        scope_key="assembly:all-live-plans",
+        rows=queue_rows,
+        entity_kinds=("assembly_queue",),
+        summary=assembly_queue_scope_summary(queue_rows),
+    )
+    queue_identities = [
+        str(row.get("business_identity") or "") for row in queue.normalized_rows
+    ]
+    current_queue_ids = {
+        str(row.business_identity): int(row.id)
+        for row in db.query(models.CurrentExecutionRow).filter(
+            models.CurrentExecutionRow.entity_kind == "assembly_queue",
+            models.CurrentExecutionRow.scope_key == "assembly:all-live-plans",
+            models.CurrentExecutionRow.business_identity.in_(queue_identities),
+        ).all()
+    }
+    readiness_rows, readiness_deferred = _prepare_queue_dependent_rows(
+        tuple(_compact_payload_member(assembly_payload, "readiness_rows", ()) or ()),
+        current_queue_ids=current_queue_ids,
+        consumer="readiness",
+    )
+    readiness = prepare_current_execution_scope(
+        db,
+        source_revision=str(source_revision),
+        source_generation_id=int(generation.id),
+        scope_key="assembly:all-live-plans",
+        rows=readiness_rows,
+        entity_kinds=("assembly_readiness",),
+        summary=dict(_compact_payload_member(assembly_payload, "readiness_metrics", {}) or {}),
+    )
+    drum_rows, drum_deferred = _prepare_queue_dependent_rows(
+        tuple(_compact_payload_member(drum_payload, "rows", ()) or ()),
+        current_queue_ids=current_queue_ids,
+        consumer="drum",
+    )
+    drum = prepare_current_execution_scope(
+        db,
+        source_revision=str(source_revision),
+        source_generation_id=int(generation.id),
+        scope_key="drum:all-live-plans",
+        rows=drum_rows,
+        entity_kinds=("drum_schedule", "drum_slot", "drum_gap", "drum_excluded"),
+        summary=dict(_compact_payload_member(drum_payload, "metrics", {}) or {}),
+    )
+    shelf = prepare_current_execution_scope(
+        db,
+        source_revision=str(source_revision),
+        source_generation_id=int(generation.id),
+        scope_key="shelf:all-live-mrps",
+        rows=tuple(_compact_payload_member(shelf_payload, "rows", ()) or ()),
+        entity_kinds=("shelf_projection",),
+        summary=dict(_compact_payload_member(shelf_payload, "metrics", {}) or {}),
+    )
+    return PreparedCompactCurrentExecutionViews(
+        queue=queue,
+        readiness=readiness,
+        drum=drum,
+        shelf=shelf,
+        deferred_queue_owners=readiness_deferred + drum_deferred,
+    )
+
+
+def _finalize_deferred_queue_owner_ids(
+    prepared: PreparedCurrentExecutionScopeChange,
+    owner_ids_by_business_identity: Mapping[str, int],
+) -> PreparedCurrentExecutionScopeChange:
+    if not owner_ids_by_business_identity:
+        return prepared
+    normalized_rows: list[dict[str, Any]] = []
+    for raw in prepared.normalized_rows:
+        row = dict(raw)
+        identity = str(row["business_identity"])
+        owner_id = owner_ids_by_business_identity.get(identity)
+        if owner_id is not None:
+            payload = dict(row.get("payload") or {})
+            payload["queue_line_id"] = int(owner_id)
+            row["payload"] = payload
+        normalized_rows.append(row)
+    row_by_key = {
+        (str(row["entity_kind"]), str(row["business_identity"])): row
+        for row in normalized_rows
+    }
+    changes: list[_PreparedCurrentExecutionRowChange] = []
+    for change in prepared.row_changes:
+        owner_id = owner_ids_by_business_identity.get(change.business_identity)
+        if owner_id is None:
+            changes.append(change)
+            continue
+        if change.operation != "insert":
+            raise CurrentExecutionPreparedBasisConflict(
+                f"deferred queue owner target is not new: {change.entity_kind}:{change.business_identity}"
+            )
+        payload = dict(change.payload or {})
+        payload["queue_line_id"] = int(owner_id)
+        manual = dict(change.manual_input or {})
+        content_hash = _hash({
+            "payload": _semantic_view(payload, change.entity_kind),
+            "manual_input": manual,
+        })
+        changes.append(replace(
+            change,
+            payload=_jsonable(payload),
+            content_hash=content_hash,
+            after_payload=compact_audit_payload(payload, change.entity_kind),
+        ))
+    scope_hashes: list[tuple[str, str]] = []
+    for entity_kind, _old_hash in prepared.scope_hashes:
+        entries = [
+            (
+                str(row["business_identity"]),
+                _semantic_view(dict(row.get("payload") or {}), entity_kind),
+                dict(row.get("manual_input") or {}),
+            )
+            for row in normalized_rows
+            if str(row["entity_kind"]) == entity_kind
+        ]
+        scope_hashes.append((entity_kind, _hash(entries)))
+    return replace(
+        prepared,
+        normalized_rows=tuple(normalized_rows),
+        row_changes=tuple(changes),
+        scope_hashes=tuple(scope_hashes),
+    )
+
+
+def install_prepared_compact_current_execution_views(
+    db: Session,
+    prepared: PreparedCompactCurrentExecutionViews,
+) -> dict[str, CurrentExecutionPublishResult]:
+    """Install a compact bundle, resolving only new numeric queue row IDs late."""
+    results = {"assembly_queue": install_prepared_current_execution_scope(db, prepared.queue)}
+    queue_ids = {
+        str(row.business_identity): int(row.id)
+        for row in db.query(models.CurrentExecutionRow).filter(
+            models.CurrentExecutionRow.entity_kind == "assembly_queue",
+            models.CurrentExecutionRow.scope_key == "assembly:all-live-plans",
+            models.CurrentExecutionRow.result_status == "accepted",
+        ).all()
+    }
+    deferred_by_consumer: dict[str, dict[str, int]] = {"readiness": {}, "drum": {}}
+    for consumer, business_identity, owner_identity in prepared.deferred_queue_owners:
+        owner_id = queue_ids.get(owner_identity)
+        if owner_id is None:
+            raise CurrentExecutionPreparedBasisConflict(
+                f"new queue owner was not installed: {owner_identity}"
+            )
+        deferred_by_consumer[consumer][business_identity] = owner_id
+    readiness = _finalize_deferred_queue_owner_ids(
+        prepared.readiness, deferred_by_consumer["readiness"]
+    )
+    drum = _finalize_deferred_queue_owner_ids(
+        prepared.drum, deferred_by_consumer["drum"]
+    )
+    results["assembly_readiness"] = install_prepared_current_execution_scope(db, readiness)
+    results["drum"] = install_prepared_current_execution_scope(db, drum)
+    results["shelf"] = install_prepared_current_execution_scope(db, prepared.shelf)
+    return results
 
 
 def load_current_execution_rows(
@@ -1306,6 +1832,14 @@ def invalidate_current_execution_scope(
     reason: str,
 ) -> bool:
     """Mark a persisted result unavailable until the worker republishes it."""
+    mutation_boundary = None
+    if (
+        str(entity_kind) == "production_control_journal"
+        and str(scope_key) == "production:all-live-orders"
+        and db.get(models.PlanningTruthState, 1) is not None
+    ):
+        from app.services.accepted_command_mutation import lock_accepted_mutation_state
+        mutation_boundary = lock_accepted_mutation_state(db)
     manifest = db.query(models.CurrentExecutionScope).filter(
         models.CurrentExecutionScope.entity_kind == str(entity_kind),
         models.CurrentExecutionScope.scope_key == str(scope_key),
@@ -1313,7 +1847,22 @@ def invalidate_current_execution_scope(
     if manifest is None:
         return False
     if not bool(manifest.result_ready):
-        return False
+        if str(manifest.source_revision or "") == str(source_revision):
+            return False
+        manifest.source_revision = str(source_revision)
+        db.flush()
+        if mutation_boundary is not None:
+            from app.services.accepted_command_mutation import (
+                record_locked_accepted_production_mutation,
+            )
+            record_locked_accepted_production_mutation(
+                db,
+                pointer=mutation_boundary[0],
+                state=mutation_boundary[1],
+                mutation_kind="production_invalidation",
+                full_scope=True,
+            )
+        return True
     manifest.result_ready = False
     manifest.source_revision = str(source_revision)
     db.query(models.CurrentExecutionRow).filter(
@@ -1322,6 +1871,17 @@ def invalidate_current_execution_scope(
         models.CurrentExecutionRow.result_status == "accepted",
     ).update({"result_ready": False}, synchronize_session=False)
     db.flush()
+    if mutation_boundary is not None:
+        from app.services.accepted_command_mutation import (
+            record_locked_accepted_production_mutation,
+        )
+        record_locked_accepted_production_mutation(
+            db,
+            pointer=mutation_boundary[0],
+            state=mutation_boundary[1],
+            mutation_kind="production_invalidation",
+            full_scope=True,
+        )
     return True
 
 
@@ -1890,12 +2450,12 @@ def publish_current_execution_from_generation(
     }
 
 
-def publish_current_purchase_control_from_payload(
+def prepare_current_purchase_control_from_payload(
     db: Session,
     generation_id: int,
     payload: Mapping[str, Any],
-) -> CurrentExecutionPublishResult:
-    """Publish the purchase journal directly from its canonical candidate payload.
+) -> PreparedCurrentExecutionScopeChange:
+    """Prepare the purchase journal from its canonical candidate payload.
 
     Purchase current state is owned by ``CurrentExecutionScope`` and does not
     require an intermediate historical read model.  The caller
@@ -1957,7 +2517,7 @@ def publish_current_purchase_control_from_payload(
     # present even for a valid empty publication.
     summary["meta"] = dict(meta)
     summary["total_rows"] = len(current_rows)
-    return publish_current_execution_scope(
+    return prepare_current_execution_scope(
         db,
         source_revision=f"accepted:g{int(generation.id)}:purchase_control_journal",
         source_generation_id=int(generation.id),
@@ -1968,14 +2528,26 @@ def publish_current_purchase_control_from_payload(
     )
 
 
-def publish_current_production_control_from_payload(
+def publish_current_purchase_control_from_payload(
+    db: Session,
+    generation_id: int,
+    payload: Mapping[str, Any],
+) -> CurrentExecutionPublishResult:
+    """Publish the prepared purchase journal into its compact current owner."""
+    return install_prepared_current_execution_scope(
+        db,
+        prepare_current_purchase_control_from_payload(db, generation_id, payload),
+    )
+
+
+def prepare_current_production_control_from_payload(
     db: Session,
     generation_id: int,
     payload: Mapping[str, Any],
     *,
     source_revision: str | None = None,
-) -> CurrentExecutionPublishResult:
-    """Publish the production journal directly into its compact current owner."""
+) -> PreparedCurrentExecutionScopeChange:
+    """Normalize and prepare the production journal without current-owner DML."""
     generation = db.get(models.LedgerGeneration, int(generation_id))
     if generation is None or str(generation.status or "") != "accepted":
         raise CurrentExecutionUnavailable(
@@ -2056,7 +2628,7 @@ def publish_current_production_control_from_payload(
     if isinstance(payload.get("summary"), Mapping):
         summary["summary"] = dict(payload["summary"])
     summary["total_rows"] = len(current_rows)
-    return publish_current_execution_scope(
+    return prepare_current_execution_scope(
         db,
         source_revision=source_revision or f"accepted:g{int(generation.id)}:production_control_journal",
         source_generation_id=int(generation.id),
@@ -2065,6 +2637,23 @@ def publish_current_production_control_from_payload(
         entity_kinds=("production_control_journal",),
         summary=summary,
     )
+
+
+def publish_current_production_control_from_payload(
+    db: Session,
+    generation_id: int,
+    payload: Mapping[str, Any],
+    *,
+    source_revision: str | None = None,
+) -> CurrentExecutionPublishResult:
+    """Publish the production journal directly into its compact current owner."""
+    prepared = prepare_current_production_control_from_payload(
+        db,
+        generation_id,
+        payload,
+        source_revision=source_revision,
+    )
+    return install_prepared_current_execution_scope(db, prepared)
 
 
 def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
@@ -2317,17 +2906,17 @@ def _normalize_mrp_current_payloads(
     return rows, {"total_rows": len(rows), "runs": runs}
 
 
-def publish_current_mrp_results_from_payloads(
+def prepare_current_mrp_results_from_payloads(
     db: Session,
     generation_id: int,
     mrp_payloads: Mapping[str, Any],
-) -> CurrentExecutionPublishResult:
-    """Publish all MRP result rows directly into the current owner."""
+) -> PreparedCurrentExecutionScopeChange:
+    """Prepare all normalized MRP result rows without current-owner DML."""
     generation = db.get(models.LedgerGeneration, int(generation_id))
     if generation is None or str(generation.status or "") != "accepted":
         raise CurrentExecutionUnavailable("current MRP publication requires an accepted generation")
     rows, summary = _normalize_mrp_current_payloads(mrp_payloads)
-    return publish_current_execution_scope(
+    return prepare_current_execution_scope(
         db,
         source_revision=f"accepted:g{int(generation.id)}:mrp_result",
         source_generation_id=int(generation.id),
@@ -2338,7 +2927,19 @@ def publish_current_mrp_results_from_payloads(
     )
 
 
-def _publish_current_obligation_views(
+def publish_current_mrp_results_from_payloads(
+    db: Session,
+    generation_id: int,
+    mrp_payloads: Mapping[str, Any],
+) -> CurrentExecutionPublishResult:
+    """Publish all MRP result rows directly into the current owner."""
+    return install_prepared_current_execution_scope(
+        db,
+        prepare_current_mrp_results_from_payloads(db, generation_id, mrp_payloads),
+    )
+
+
+def _prepare_current_obligation_views(
     db: Session,
     generation_id: int,
     *,
@@ -2346,8 +2947,9 @@ def _publish_current_obligation_views(
     production_payload: Mapping[str, Any],
     mrp_payloads: Mapping[str, Any],
     period_payloads: Mapping[str, Any],
-) -> dict[str, CurrentExecutionPublishResult]:
-    """Promote accepted obligation/read-model snapshots to compact current rows.
+    publish_production: bool = True,
+) -> PreparedCurrentObligationViews:
+    """Prepare accepted obligation/read-model snapshots outside pointer locks.
 
     The immutable snapshots remain publication evidence.  User reads use these
     rows, so a technical generation id is provenance only and never a current
@@ -2358,9 +2960,9 @@ def _publish_current_obligation_views(
     if generation is None or str(generation.status or "") != "accepted":
         raise CurrentExecutionUnavailable("current obligation views require an accepted generation")
 
-    results: dict[str, CurrentExecutionPublishResult] = {}
+    changes: list[tuple[str, PreparedCurrentExecutionScopeChange]] = []
 
-    def _publish(
+    def _prepare(
         *,
         consumer: str,
         entity_kind: str,
@@ -2368,7 +2970,7 @@ def _publish_current_obligation_views(
         rows: list[dict[str, Any]],
         summary: dict[str, Any] | None = None,
     ) -> None:
-        results[consumer] = publish_current_execution_scope(
+        changes.append((consumer, prepare_current_execution_scope(
             db,
             source_revision=f"accepted:g{int(generation.id)}:{consumer}",
             source_generation_id=int(generation.id),
@@ -2376,19 +2978,23 @@ def _publish_current_obligation_views(
             rows=rows,
             entity_kinds=(entity_kind,),
             summary=summary,
+        )))
+
+    production_prepared = None
+    if publish_production:
+        production_prepared = prepare_current_production_control_from_payload(
+            db,
+            int(generation.id),
+            production_payload,
         )
+        changes.append(("production_control_journal", production_prepared))
 
-    results["production_control_journal"] = publish_current_production_control_from_payload(
-        db,
-        int(generation.id),
-        production_payload,
-    )
-
-    results["purchase_control_journal"] = publish_current_purchase_control_from_payload(
+    purchase_prepared = prepare_current_purchase_control_from_payload(
         db,
         int(generation.id),
         purchase_payload,
     )
+    changes.append(("purchase_control_journal", purchase_prepared))
     purchase_rows = [
         {
             "entity_kind": "purchase_control_journal",
@@ -2403,14 +3009,11 @@ def _publish_current_obligation_views(
         if isinstance(row, dict)
     ]
 
-    mrp_rows, mrp_metadata = _normalize_mrp_current_payloads(mrp_payloads)
-    _publish(
-        consumer="mrp_result",
-        entity_kind="mrp_result",
-        scope_key="mrp:all-live-plans",
-        rows=mrp_rows,
-        summary=mrp_metadata,
+    mrp_prepared = prepare_current_mrp_results_from_payloads(
+        db, int(generation.id), mrp_payloads
     )
+    changes.append(("mrp_result", mrp_prepared))
+    mrp_rows = list(mrp_prepared.normalized_rows)
 
     # Period work-item links resolve against the identities that this same
     # publication is about to expose.  Technical product/order/purchase IDs
@@ -2420,10 +3023,27 @@ def _publish_current_obligation_views(
     def _catalog(key: tuple[Any, ...], identity: str) -> None:
         target_catalog.setdefault(key, []).append(str(identity))
 
-    production_rows = load_current_execution_rows(
-        db,
-        entity_kind="production_control_journal",
-        scope_key="production:all-live-orders",
+    production_rows = (
+        [
+            SimpleNamespace(
+                business_identity=str(row.get("business_identity") or ""),
+                payload=dict(row.get("payload") or {}),
+            )
+            for row in list(production_prepared.normalized_rows)
+        ]
+        if production_prepared is not None
+        else [
+            SimpleNamespace(
+                business_identity=str(
+                    row.get("current_identity")
+                    or (row.get("payload") or {}).get("current_identity")
+                    or ""
+                ),
+                payload=dict(row.get("payload") or row),
+            )
+            for row in list(production_payload.get("rows") or [])
+            if isinstance(row, Mapping)
+        ]
     )
     for entry in production_rows:
         payload = dict(entry.payload or {})
@@ -2520,17 +3140,53 @@ def _publish_current_obligation_views(
                 "scope_key": "period-plan:all-live-plans",
                 "payload": row_payload,
             })
-    _publish(
+    _prepare(
         consumer="period_plan_execution",
         entity_kind="period_plan_execution",
         scope_key="period-plan:all-live-plans",
         rows=execution_rows,
         summary={"total_rows": len(execution_rows), "snapshots": execution_metadata},
     )
-    return results
+    return PreparedCurrentObligationViews(changes=tuple(changes))
 
 
-def publish_current_obligation_views_from_generation(
+def install_prepared_current_obligation_views(
+    db: Session,
+    prepared: PreparedCurrentObligationViews,
+) -> dict[str, CurrentExecutionPublishResult]:
+    """Install an ordered obligation bundle under the caller's pointer/epoch lock."""
+    return {
+        consumer: install_prepared_current_execution_scope(db, change)
+        for consumer, change in prepared.changes
+    }
+
+
+def _publish_current_obligation_views(
+    db: Session,
+    generation_id: int,
+    *,
+    purchase_payload: Mapping[str, Any],
+    production_payload: Mapping[str, Any],
+    mrp_payloads: Mapping[str, Any],
+    period_payloads: Mapping[str, Any],
+    publish_production: bool = True,
+) -> dict[str, CurrentExecutionPublishResult]:
+    """Backward-compatible prepare/install composition for obligation views."""
+    return install_prepared_current_obligation_views(
+        db,
+        _prepare_current_obligation_views(
+            db,
+            generation_id,
+            purchase_payload=purchase_payload,
+            production_payload=production_payload,
+            mrp_payloads=mrp_payloads,
+            period_payloads=period_payloads,
+            publish_production=publish_production,
+        ),
+    )
+
+
+def prepare_current_obligation_views_from_generation(
     db: Session,
     generation_id: int,
     *,
@@ -2539,8 +3195,9 @@ def publish_current_obligation_views_from_generation(
     mrp_payloads: Mapping[str, Any] | None = None,
     period_payloads: Mapping[str, Any] | None = None,
     period_run_ids: Iterable[int] | None = None,
-) -> dict[str, CurrentExecutionPublishResult]:
-    """Publish runtime current views with explicit obligation candidates.
+    publish_production: bool = True,
+) -> PreparedCurrentObligationViews:
+    """Validate and prepare runtime current views with explicit candidates.
 
     Purchase and production payloads are mandatory by design.  Runtime
     publication cannot discover or synthesize them from historical
@@ -2574,11 +3231,39 @@ def publish_current_obligation_views_from_generation(
             else live_plan_run_ids(db, generation)
         ),
     )
-    return _publish_current_obligation_views(
+    return _prepare_current_obligation_views(
         db,
         generation_id,
         purchase_payload=purchase_payload,
         production_payload=production_payload,
         mrp_payloads=mrp_payloads,
         period_payloads=period_current_payloads,
+        publish_production=publish_production,
+    )
+
+
+def publish_current_obligation_views_from_generation(
+    db: Session,
+    generation_id: int,
+    *,
+    purchase_payload: Mapping[str, Any] | None = None,
+    production_payload: Mapping[str, Any] | None = None,
+    mrp_payloads: Mapping[str, Any] | None = None,
+    period_payloads: Mapping[str, Any] | None = None,
+    period_run_ids: Iterable[int] | None = None,
+    publish_production: bool = True,
+) -> dict[str, CurrentExecutionPublishResult]:
+    """Backward-compatible prepare/install composition for runtime views."""
+    return install_prepared_current_obligation_views(
+        db,
+        prepare_current_obligation_views_from_generation(
+            db,
+            generation_id,
+            purchase_payload=purchase_payload,
+            production_payload=production_payload,
+            mrp_payloads=mrp_payloads,
+            period_payloads=period_payloads,
+            period_run_ids=period_run_ids,
+            publish_production=publish_production,
+        ),
     )

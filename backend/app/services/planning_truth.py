@@ -435,6 +435,31 @@ def publish_generation(
         pointer = models.PlanningTruthState(id=1)
         db.add(pointer)
         db.flush()
+    mutation_state = (
+        db.query(models.AcceptedProductionMutationState)
+        .filter_by(id=1)
+        .populate_existing()
+        .with_for_update()
+        .one_or_none()
+    )
+    if mutation_state is None:
+        mutation_state = models.AcceptedProductionMutationState(id=1)
+        db.add(mutation_state)
+        db.flush()
+    marks = dict(generation.source_watermarks or {})
+    captured_epoch = marks.get("accepted_production_mutation_epoch")
+    if captured_epoch is None:
+        if pointer.current_generation_id is not None:
+            raise PlanningTruthPublishConflict(
+                "generation lacks accepted production mutation basis"
+            )
+        captured_epoch = 0
+        marks["accepted_production_mutation_epoch"] = 0
+        generation.source_watermarks = marks
+    if int(captured_epoch) != int(mutation_state.last_issued_epoch or 0):
+        raise PlanningTruthPublishConflict(
+            "accepted production mutations changed during generation build"
+        )
     current_id = (
         int(pointer.current_generation_id)
         if pointer.current_generation_id is not None
@@ -448,6 +473,13 @@ def publish_generation(
                 f"planning truth pointer is {current_id}, expected parent {expected}"
             )
     move_pointer_to_generation(db, pointer, generation)
+    mutation_state.last_consumed_epoch = max(
+        int(mutation_state.last_consumed_epoch or 0), int(captured_epoch),
+    )
+    db.query(models.AcceptedProductionMutation).filter(
+        models.AcceptedProductionMutation.epoch
+        <= int(mutation_state.last_consumed_epoch)
+    ).delete(synchronize_session=False)
     # A long-lived worker session may already have resolved the relationship to
     # the previous generation. Force the readiness read to follow the new FK.
     db.expire(pointer, ["current_generation"])

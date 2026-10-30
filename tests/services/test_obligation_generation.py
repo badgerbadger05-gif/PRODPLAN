@@ -113,6 +113,7 @@ def test_fork_reuses_exact_prefix_and_materializes_bins_without_publishing(db_se
         "parent_generation_id": parent.id,
         "generation_kind": GENERATION_KIND,
         "replay_from": parent.source_watermarks["replay_from"],
+        "accepted_production_mutation_epoch": 0,
     }
     assert candidate.capabilities == {}
     assert candidate.algorithm_version == ALGORITHM_VERSION

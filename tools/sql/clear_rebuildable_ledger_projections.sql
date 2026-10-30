@@ -155,6 +155,29 @@ BEGIN
 END
 $detach_rebuildable_fks$;
 
+DO $accepted_mutation_guard$
+DECLARE
+    issued bigint;
+    consumed bigint;
+BEGIN
+    SELECT last_issued_epoch, last_consumed_epoch
+      INTO issued, consumed
+      FROM accepted_production_mutation_state
+     WHERE id = 1
+     FOR UPDATE;
+    IF issued IS NULL OR consumed IS NULL THEN
+        RAISE EXCEPTION 'accepted production mutation state is missing';
+    END IF;
+    IF issued > consumed OR EXISTS (
+        SELECT 1 FROM accepted_production_mutation WHERE epoch > consumed
+    ) THEN
+        RAISE EXCEPTION
+            'pending accepted production mutations block destructive clear';
+    END IF;
+    DELETE FROM accepted_production_mutation WHERE epoch <= consumed;
+END
+$accepted_mutation_guard$;
+
 UPDATE production_orders
 SET source_run_id = NULL
 WHERE source_run_id IS NOT NULL;

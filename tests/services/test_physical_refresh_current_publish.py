@@ -14,6 +14,7 @@ from app.services.item_ledger import current_execution
 from app.services.item_ledger import physical_refresh_current_publish as publisher
 from app.services.item_ledger import physical_refresh_stock_bin as stock_bin
 from app.services.item_ledger.physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+from app.services.production_control_common import DONE_STATE_KEY
 
 
 def _generations(db_session):
@@ -36,7 +37,11 @@ def _generations(db_session):
     )
     target = models.LedgerGeneration(
         generation_key="current-publish-target", status="building",
-        cutoff=target_cutoff, source_watermarks={}, capabilities={},
+        cutoff=target_cutoff, source_watermarks={
+            "parent_generation_id": 1,
+            "generation_kind": "physical_refresh",
+            "accepted_production_mutation_epoch": 0,
+        }, capabilities={},
         physical_import_batch=target_batch, algorithm_version="test",
     )
     db_session.add_all([parent_batch, target_batch, parent])
@@ -46,6 +51,11 @@ def _generations(db_session):
     db_session.add(target)
     db_session.flush()
     db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    db_session.add(models.AcceptedProductionMutationState(id=1))
+    db_session.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=int(parent.id), baseline_generation_id=int(parent.id),
+        cutoff=parent_cutoff, status="complete", source_event_high_watermark_id=0,
+    ))
     db_session.commit()
     return parent, target
 
@@ -60,8 +70,18 @@ def _patch_safe_pipeline(monkeypatch, phases):
         lambda *a, **kw: phases.append("stock") or SimpleNamespace(changed_keys=1),
     )
     monkeypatch.setattr(
-        publisher, "apply_current_replenishment_for_bounded_make_scopes",
-        lambda *a, **kw: phases.append("make") or SimpleNamespace(fact_rows=1),
+        publisher, "prepare_current_replenishment_for_bounded_make_scopes",
+        lambda *a, **kw: phases.append("make") or SimpleNamespace(
+            scope_history_rows=1, changes=(),
+        ),
+    )
+    monkeypatch.setattr(
+        publisher, "install_prepared_bounded_make_replenishment",
+        lambda *a, **kw: SimpleNamespace(fact_rows=1),
+    )
+    monkeypatch.setattr(
+        publisher, "install_prepared_bounded_buy_replenishment",
+        lambda *a, **kw: SimpleNamespace(replayed_rows=1),
     )
     monkeypatch.setattr(
         publisher, "apply_bounded_assembly_output_plan_execution",
@@ -94,7 +114,7 @@ def _patch_safe_pipeline(monkeypatch, phases):
         lambda *a, **kw: phases.append("build_purchase") or {"rows": [], "meta": {}},
     )
     monkeypatch.setattr(
-        publisher, "handoff_current_physical_refresh_provenance",
+        publisher, "install_verified_material_custody_handoff",
         lambda *a, **kw: phases.append("provenance") or SimpleNamespace(),
     )
     monkeypatch.setattr(
@@ -122,9 +142,21 @@ def _patch_safe_pipeline(monkeypatch, phases):
             "period_plan_execution": Result(),
         },
     )
+    monkeypatch.setattr(
+        publisher, "prepare_current_obligation_views_from_generation",
+        lambda *a, **kw: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        publisher, "install_prepared_current_obligation_views",
+        lambda *a, **kw: {
+            "purchase_control_journal": Result(),
+            "mrp_result": Result(),
+            "period_plan_execution": Result(),
+        },
+    )
     monkeypatch.setattr(publisher, "publish_generation", lambda db, target, **kw: phases.append("pointer"))
     monkeypatch.setattr(
-        publisher, "publish_current_future_supply", lambda db, generation_id: {},
+        publisher, "publish_current_future_supply", lambda db, generation_id, **_kwargs: {},
     )
     monkeypatch.setattr(publisher, "_fixed_run_ids", lambda db: (1,))
 
@@ -182,6 +214,7 @@ def test_bounded_publish_recomputes_materials_for_generated_terminal_release(
     product_item = models.Item(item_code="TERMINAL-ROOT", item_name="root")
     order = models.ProductionOrder(
         order_number="TERMINAL-ORDER", order_date=parent.cutoff,
+        order_state_key=DONE_STATE_KEY, updated_at=target.cutoff,
     )
     db_session.add_all([physical_item, component, product_item, order])
     db_session.flush()
@@ -191,6 +224,12 @@ def test_bounded_publish_recomputes_materials_for_generated_terminal_release(
     )
     db_session.add(product)
     db_session.flush()
+    db_session.add(models.ProductionMaterialCustodyProjection(
+        ledger_generation_id=int(parent.id), product_id=int(product.product_id),
+        component_item_id=int(component.item_id), location_kind="workshop",
+        warehouse_ref1c="WH", reserved_qty=1,
+        source_event_high_watermark_id=0, is_current=True,
+    ))
     sle = models.StockLedgerEntry(
         ingest_batch_id=target.physical_import_batch_id,
         source_content_hash="terminal-publish-sle",
@@ -208,6 +247,11 @@ def test_bounded_publish_recomputes_materials_for_generated_terminal_release(
     _patch_safe_pipeline(monkeypatch, phases)
 
     def custody(db, **_kwargs):
+        db.query(models.ProductionMaterialCustodyProjection).filter_by(
+            product_id=int(product.product_id),
+            component_item_id=int(component.item_id),
+            is_current=True,
+        ).delete(synchronize_session=False)
         db.add(models.ProductionMaterialCustodyEvent(
             product_id=product.product_id, component_item_id=component.item_id,
             source_kind="terminal_release", source_sle_id=None,
@@ -243,6 +287,69 @@ def test_bounded_publish_recomputes_materials_for_generated_terminal_release(
     )
 
     assert int(component.item_id) in captured["affected_item_ids"]
+
+
+def test_below_hwm_event_becoming_target_visible_is_not_lost(
+    db_session, monkeypatch,
+):
+    parent, target = _generations(db_session)
+    item = models.Item(item_code="PREFIX-VISIBLE", item_name="prefix visible")
+    order = models.ProductionOrder(order_number="PREFIX", order_date=parent.cutoff)
+    db_session.add_all((item, order))
+    db_session.flush()
+    product = models.ProductionProduct(
+        order_id=int(order.order_id), item_id=int(item.item_id),
+        quantity=1, produced_qty=0, remaining_qty=1,
+    )
+    db_session.add(product)
+    db_session.flush()
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=int(target.physical_import_batch_id),
+        source_content_hash="prefix-visible", business_identity="prefix-visible",
+        item_id=int(item.item_id), characteristic_ref="", organization_ref="",
+        warehouse_ref1c="SHOP", qty=Decimal("2"), posting_at=target.cutoff,
+        record_type="Receipt", movement_kind="transfer_in",
+        recorder_type="Document_Transfer", recorder_ref="prefix-visible",
+        line_no="1", ingest_source="test", active=True,
+    )
+    db_session.add(sle)
+    db_session.flush()
+    event = models.ProductionMaterialCustodyEvent(
+        product_id=int(product.product_id), component_item_id=int(item.item_id),
+        source_kind="transfer_posted", source_sle_id=int(sle.id),
+        effective_at=target.cutoff, location_kind="workshop",
+        warehouse_ref1c="SHOP", delta_qty=Decimal("2"),
+        idempotency_key="prefix-visible-event",
+    )
+    db_session.add(event)
+    db_session.flush()
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
+    )
+    manifest.source_event_high_watermark_id = int(event.id)
+    db_session.commit()
+
+    real_handoff = publisher.install_verified_material_custody_handoff
+    phases = []
+    _patch_safe_pipeline(monkeypatch, phases)
+    monkeypatch.setattr(
+        publisher, "install_verified_material_custody_handoff", real_handoff,
+    )
+    before_count = db_session.query(models.ProductionMaterialCustodyEvent).count()
+    publisher.publish_forward_physical_refresh_current(
+        db_session, target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        delta_manifest={"rows": (sle,), "supersessions": ()},
+        odata_client=None, source_revision=int(target.physical_import_batch_id),
+        planning_pool_by_warehouse={"SHOP": "main"},
+    )
+    row = db_session.query(models.ProductionMaterialCustodyProjection).filter_by(
+        product_id=int(product.product_id), component_item_id=int(item.item_id),
+        location_kind="workshop", warehouse_ref1c="SHOP", is_current=True,
+    ).one()
+    assert float(row.reserved_qty) == 2.0
+    assert int(row.ledger_generation_id) == int(target.id)
+    assert db_session.query(models.ProductionMaterialCustodyEvent).count() == before_count
 
 
 def test_forward_publish_is_atomic_and_pointer_is_last(db_session, monkeypatch):
@@ -348,16 +455,9 @@ def test_in_window_supersession_keeps_full_stock_manifest_but_one_business_fact(
     def stock(*args, **kwargs):
         observed["stock"] = kwargs["delta_manifest"]
         return SimpleNamespace(changed_keys=1)
-    def custody(*args, **kwargs):
-        observed["custody"] = kwargs["source_sle_ids"]
-        return 0
     monkeypatch.setattr(
         publisher, "apply_bounded_current_stock_bins",
         stock,
-    )
-    monkeypatch.setattr(
-        publisher, "apply_bounded_current_material_custody_events",
-        custody,
     )
     monkeypatch.setattr(
         publisher, "require_facts_not_over_allocated",
@@ -372,7 +472,6 @@ def test_in_window_supersession_keeps_full_stock_manifest_but_one_business_fact(
     assert result.input_delta_rows == 2
     assert set(observed["stock"].new_sle_ids) == {a.id, b.id}
     assert observed["stock"].supersession_edge_ids == (edge.id,)
-    assert observed["custody"] == (b.id,)
     assert observed["allocation"] == {b.id}
     db_session.rollback()
     result = publisher.publish_forward_physical_refresh_current(
@@ -383,7 +482,6 @@ def test_in_window_supersession_keeps_full_stock_manifest_but_one_business_fact(
         custody_source_sle_ids=(a.id, b.id),
     )
     assert result.input_delta_rows == 2
-    assert set(observed["custody"]) == {a.id, b.id}
     assert observed["allocation"] == {b.id}
     db_session.rollback()
     # Persisted edges alone do not authorize a retired custody source.
@@ -769,8 +867,8 @@ def test_supplier_receipt_scope_comes_from_the_canonical_pool_key(db_session, mo
         or publisher.BoundedBuyReceiptDeltaManifest(new_sle_ids=(row.id,)),
     )
     monkeypatch.setattr(
-        publisher, "apply_current_replenishment_for_bounded_buy_scopes",
-        lambda *a, **kw: SimpleNamespace(replayed_rows=1),
+        publisher, "prepare_current_replenishment_for_bounded_buy_scopes",
+        lambda *a, **kw: SimpleNamespace(scope_replay_rows=1, changes=()),
     )
     db_session.add(models.StockLedgerSupplierReceiptProvenance(
         ledger_generation_id=target.id, stock_ledger_entry_id=row.id,
@@ -851,9 +949,9 @@ def test_mapped_supplier_receipt_uses_exact_current_buy_owner(db_session, monkey
         or publisher.BoundedBuyReceiptDeltaManifest(new_sle_ids=(row.id,)),
     )
     monkeypatch.setattr(
-        publisher, "apply_current_replenishment_for_bounded_buy_scopes",
+        publisher, "prepare_current_replenishment_for_bounded_buy_scopes",
         lambda *a, **kw: buy_scope_calls.append(("apply", tuple(kw["affected_scopes"])))
-        or SimpleNamespace(replayed_rows=1),
+        or SimpleNamespace(scope_replay_rows=1, changes=()),
     )
     result = publisher.publish_forward_physical_refresh_current(
         db_session, target_generation_id=target.id, parent_generation_id=parent.id,
@@ -980,9 +1078,9 @@ def test_assembly_uses_current_owner_pool_when_warehouse_is_unmapped(db_session,
     _patch_safe_pipeline(monkeypatch, phases)
     make_scopes = []
     monkeypatch.setattr(
-        publisher, "apply_current_replenishment_for_bounded_make_scopes",
+        publisher, "prepare_current_replenishment_for_bounded_make_scopes",
         lambda *a, **kw: make_scopes.append(tuple(kw["affected_scopes"]))
-        or SimpleNamespace(fact_rows=1),
+        or SimpleNamespace(scope_history_rows=1, changes=()),
     )
     result = publisher.publish_forward_physical_refresh_current(
         db_session, target_generation_id=target.id, parent_generation_id=parent.id,
@@ -1387,15 +1485,13 @@ def _stale_pointer_world(db_session, *, days=5):
     )
     target_batch.cutoff = target_cutoff
     target_batch.completed_at = target_cutoff
-    db_session.add(models.ProductionMaterialCustodyProjectionManifest(
-        ledger_generation_id=parent.id,
-        cutoff=parent_cutoff,
-        status="complete",
-        is_baseline=True,
-        source_event_high_watermark_id=0,
-        observed_at=parent_cutoff,
-        built_at=parent_cutoff,
-    ))
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
+    )
+    manifest.cutoff = parent_cutoff
+    manifest.is_baseline = True
+    manifest.observed_at = parent_cutoff
+    manifest.built_at = parent_cutoff
     db_session.flush()
     return parent, target
 
@@ -1444,7 +1540,7 @@ def test_bounded_publish_succeeds_with_the_real_builders_on_a_five_day_old_point
         },
     )
     monkeypatch.setattr(
-        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+        publisher, "install_verified_material_custody_handoff", lambda *a, **kw: None,
     )
     # The two journal payloads need a live fixed run to describe, which this
     # physical fixture has none of; they are not on the path to the gate.
@@ -1634,7 +1730,7 @@ def test_a_supplier_only_tick_publishes_with_the_real_builders(db_session, monke
         },
     )
     monkeypatch.setattr(
-        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+        publisher, "install_verified_material_custody_handoff", lambda *a, **kw: None,
     )
     monkeypatch.setattr(
         publisher, "build_compact_current_production_control_payload",

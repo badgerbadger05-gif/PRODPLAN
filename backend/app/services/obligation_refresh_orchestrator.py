@@ -38,8 +38,9 @@ from app.services.item_ledger.supplier_receipt_allocation import (
     rebuild_supplier_receipt_coverage_from_persisted_provenance,
 )
 from app.services.item_ledger.current_replenishment import (
-    apply_current_replenishment_for_accepted_generation,
+    prepare_current_replenishment_for_accepted_generation,
 )
+from app.services.item_ledger.reservation_current import prepare_current_reservations
 from app.services.purchase_control_projection import build_candidate_payload as build_purchase_journal_payload
 from app.services.production_control_journal_projection import (
     build_candidate_payload as build_production_journal_payload,
@@ -682,17 +683,21 @@ def run_obligation_refresh(
     # The scope's live owners after this publication are the staged ones and
     # the retained runs' current owners; both are handed in, so a fact held by
     # a retained owner is not handed to a successor a second time.
-    current_replenishment = apply_current_replenishment_for_accepted_generation(
+    prepared_current_reservations = prepare_current_reservations(
+        db, generation_id=target_id, retire_run_ids=retire_run_ids,
+    )
+    prepared_current_replenishment = prepare_current_replenishment_for_accepted_generation(
         db, generation_id=target_id, allow_building=True,
         retained_run_ids=retained_run_ids,
+        target_reservation_rows=prepared_current_reservations.target_reservations,
     )
     supplier_summary = {
         "provenance_count": supplier.provenance_count,
         "exact_fact_count": supplier.exact_fact_count,
         "allocation_count": supplier.allocation_count,
         "surplus_qty": supplier.surplus_qty,
-        "current_replenishment_changed_pairs": sum(
-            int(result.changed_pairs) for result in current_replenishment
+        "current_replenishment_prepared_scopes": len(
+            prepared_current_replenishment.changes
         ),
     }
     # Work items are a persisted projection of the reservation fold.  Both
@@ -735,9 +740,6 @@ def run_obligation_refresh(
     # dropped (canon R11).  Doing it before the payload builders is what makes
     # the journals below reference owners that still exist after acceptance;
     # the caller-owned transaction keeps it atomic with the pointer switch.
-    reservation_current_publish = publish_current_reservations(
-        db, generation_id=target_id, retire_run_ids=retire_run_ids
-    )
     mrp_payloads = {
         str(run_id): build_mrp_result_current_payload(db, int(run_id))
         for run_id in sorted({int(value) for value in (*candidate_ids, *retained_run_ids)})
@@ -817,7 +819,10 @@ def run_obligation_refresh(
         "freeze_summary": _json_value(freeze),
         "replay_summary": _json_value(replay),
         "reservation_consumption_summary": _json_value(reservation_consumption),
-        "reservation_current_publish": _json_value(reservation_current_publish),
+        "reservation_current_publish": {
+            "prepared": True,
+            "target_rows": len(prepared_current_reservations.target_reservations),
+        },
         "assembly_output_summary": _json_value(assembly_outputs),
         "drum_schedule_summary": _json_value(drum_schedule),
         "shelf_projection_summary": _json_value(shelf_projection),
@@ -841,7 +846,10 @@ def run_obligation_refresh(
     # StockBin fold, a reservation cache that disagrees with its own events, or
     # an event belonging to a foreign generation.
     try:
-        validate_obligation_refresh_build(db, target_id)
+        validate_obligation_refresh_build(
+            db, target_id,
+            prepared_current_reservations=prepared_current_reservations,
+        )
     except GenerationValidationError as exc:
         raise ObligationRefreshOrchestratorError(
             f"obligation refresh candidate is structurally invalid: {exc}"
@@ -853,6 +861,8 @@ def run_obligation_refresh(
         production_payload=production_journal_payload,
         mrp_payloads=mrp_payloads,
         period_payloads=period_payloads,
+        prepared_current_reservations=prepared_current_reservations,
+        prepared_current_replenishment=prepared_current_replenishment,
     )
     if published.published:
         compact_metrics = dict(snapshot_batch.metrics or {})

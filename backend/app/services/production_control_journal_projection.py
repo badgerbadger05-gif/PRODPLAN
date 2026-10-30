@@ -120,8 +120,13 @@ def _public_journal_row(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _current_executor_payloads(db, truth, product_ids, run_ids, roots_by_product, *, material_snapshots=None):
     from .production_control_material_availability import preview_materials_bulk
     ids = sorted(set(map(int, product_ids)))
-    materials = (material_snapshots if material_snapshots is not None else
-                 preview_materials_bulk(db, ids, ledger_generation_id=truth.generation_id, _current_only=True))
+    materials = dict(material_snapshots or {})
+    missing_material_ids = [product_id for product_id in ids if product_id not in materials]
+    if missing_material_ids:
+        materials.update(preview_materials_bulk(
+            db, missing_material_ids,
+            ledger_generation_id=truth.generation_id, _current_only=True,
+        ))
     routes = build_route_sheet_snapshot_payloads(db, product_ids=ids, ledger_generation_id=truth.generation_id)
     result = {}
     for product_id in ids:
@@ -140,19 +145,184 @@ def _current_executor_payloads(db, truth, product_ids, run_ids, roots_by_product
     return result
 
 
-def _publish_local_payloads(db, truth, manifest, payloads):
+def _publish_local_payloads(
+    db, truth, manifest, payloads, *,
+    affected_product_ids: Sequence[int] = (),
+    affected_identities: Sequence[str] = (),
+):
     from .item_ledger.current_execution import publish_current_production_control_from_payload
+    from .accepted_command_mutation import (
+        lock_accepted_mutation_state,
+        record_locked_accepted_production_mutation,
+    )
+    expected_manifest = (
+        int(manifest.source_generation_id or 0),
+        str(manifest.source_revision or ""),
+        str(manifest.content_hash or ""),
+        bool(manifest.result_ready),
+    )
+    pointer, mutation_state = lock_accepted_mutation_state(db)
+    if int(pointer.current_generation_id or 0) != int(truth.generation_id):
+        raise RuntimeError("accepted pointer moved before local payload publication")
+    manifest = (
+        db.query(models.CurrentExecutionScope)
+        .filter_by(
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        .populate_existing()
+        .with_for_update()
+        .one()
+    )
+    actual_manifest = (
+        int(manifest.source_generation_id or 0),
+        str(manifest.source_revision or ""),
+        str(manifest.content_hash or ""),
+        bool(manifest.result_ready),
+    )
+    if actual_manifest != expected_manifest:
+        raise RuntimeError("production manifest changed before local payload publication")
     rows = [payloads[key] for key in sorted(payloads)]
     prefix = f"accepted:g{truth.generation_id}:production_control_journal:local"
     meta = dict(manifest.summary or {})
     meta.pop("row_count", None)
-    publish_current_production_control_from_payload(db, int(truth.generation_id),
+    published = publish_current_production_control_from_payload(db, int(truth.generation_id),
         {"meta": meta, "rows": rows, "summary": {"total_rows": len(rows)}}, source_revision=prefix)
     db.flush()
     revision = f"{prefix}:{manifest.content_hash[:20]}"
     manifest.source_revision = revision
     db.flush()
+    if not published.idempotent:
+        record_locked_accepted_production_mutation(
+            db,
+            pointer=pointer,
+            state=mutation_state,
+            mutation_kind="production_payload",
+            product_ids=affected_product_ids,
+            business_identities=affected_identities,
+        )
     return revision
+
+
+def rebase_production_payload_for_accepted_mutations(
+    db: Session,
+    payload: Mapping[str, Any],
+    *,
+    parent_generation_id: int,
+    product_ids: Sequence[int],
+    business_identities: Sequence[str] = (),
+    target_payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Overlay accepted command metadata on canonical TARGET journal rows.
+
+    The caller must rebuild ``target_payload`` with the target generation's
+    physical/custody context after the command.  Target rows own every factual
+    quantity, coverage and residual proposal; current accepted rows contribute
+    only operational metadata and compatible quantity-preview caches.
+    """
+    from .planning_truth import require_accepted_truth
+    from .item_ledger.current_execution import load_current_execution_rows
+
+    ids = sorted({int(value) for value in product_ids})
+    identities = sorted({str(value) for value in business_identities if str(value)})
+    if not ids and not identities:
+        return dict(target_payload or payload)
+    truth = require_accepted_truth(db, "production.publisher_rebase")
+    if int(truth.generation_id or 0) != int(parent_generation_id):
+        raise RuntimeError("accepted pointer moved before production payload rebase")
+    if target_payload is None:
+        raise RuntimeError("accepted mutation rebase requires canonical target payload")
+
+    result = deepcopy(dict(target_payload))
+    rows = [deepcopy(dict(row)) for row in target_payload.get("rows") or ()]
+    target_by_identity = {
+        str(row.get("current_identity") or ""): row
+        for row in rows if str(row.get("current_identity") or "")
+    }
+    target_by_product = {
+        int(row["product_id"]): row
+        for row in rows if row.get("product_id") is not None
+    }
+    current_rows_by_id: dict[int, Any] = {}
+    if identities:
+        for current in load_current_execution_rows(
+            db, entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+            business_identities=identities,
+        ):
+            current_rows_by_id[int(current.id)] = current
+    if ids:
+        for current in load_current_execution_rows(
+            db, entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+            product_ids=ids,
+        ):
+            current_rows_by_id[int(current.id)] = current
+    current_by_identity = {
+        str(row.business_identity): deepcopy(dict(row.payload or {}))
+        for row in current_rows_by_id.values()
+    }
+
+    metadata_keys = (
+        "order_ref1c", "order_one_c_number", "status", "issue_status",
+        "issue_count", "route_sheet_printed_at", "comment",
+        "available_actions", "selection_disabled_reason", "opened_at",
+    )
+    product_basis_keys = (
+        "product_id", "order_id", "item_id", "quantity", "spec_id",
+        "spec_revision_hash",
+    )
+    proposal_basis_keys = (
+        "item_id", "source_mrp_requirement_id", "source_run_id",
+        "reservation_id", "quantity", "launchable_qty",
+        "materialized_order_qty", "spec_id", "spec_revision_hash",
+    )
+
+    for product_id in ids:
+        target = target_by_product.get(product_id)
+        if target is None:
+            raise RuntimeError("canonical target payload lacks accepted executor")
+        identity = str(target.get("current_identity") or "")
+        current = current_by_identity.get(identity)
+        if current is None:
+            raise RuntimeError("accepted executor metadata is unavailable")
+        if not all(target.get(key) == current.get(key) for key in product_basis_keys):
+            raise RuntimeError("production business basis changed during metadata reconciliation")
+        for key in metadata_keys:
+            if key in current:
+                target[key] = deepcopy(current[key])
+
+    for identity in identities:
+        current = current_by_identity.get(identity)
+        target = target_by_identity.get(identity)
+        if current is None or target is None:
+            # Insert/delete/residual transitions are already represented by the
+            # canonical target builder. Never resurrect a parent-current row.
+            continue
+        basis_keys = (
+            product_basis_keys
+            if target.get("product_id") is not None
+            else proposal_basis_keys
+        )
+        cache_basis_compatible = (
+            all(target.get(key) == current.get(key) for key in basis_keys)
+            and target.get("material_coverage_snapshot")
+            == current.get("material_coverage_snapshot")
+        )
+        if cache_basis_compatible:
+            if "_material_quantity_snapshots" in current:
+                target["_material_quantity_snapshots"] = deepcopy(
+                    current["_material_quantity_snapshots"]
+                )
+        else:
+            target.pop("_material_quantity_snapshots", None)
+
+    result["rows"] = rows
+    if isinstance(result.get("meta"), Mapping):
+        result["meta"] = {**dict(result["meta"]), "row_count": len(rows)}
+    if isinstance(result.get("summary"), Mapping):
+        result["summary"] = {**dict(result["summary"]), "total_rows": len(rows)}
+    return result
 
 
 def publish_current_executor_changes(db: Session, product_ids: Sequence[int], *,
@@ -209,7 +379,11 @@ def publish_current_executor_changes(db: Session, product_ids: Sequence[int], *,
     for pid in ids:
         payloads.pop(str(by_product[pid].business_identity), None)
     payloads.update(updated)
-    revision = _publish_local_payloads(db, truth, manifest, payloads)
+    revision = _publish_local_payloads(
+        db, truth, manifest, payloads,
+        affected_product_ids=ids,
+        affected_identities=tuple(sorted(updated)),
+    )
     return {"status": "refreshed", "product_ids": ids,
             "current_identities": sorted(updated), "source_revision": revision}
 
@@ -233,6 +407,8 @@ def publish_local_make_changes(db: Session, work_item_ids: Sequence[int]) -> str
     manifest = require_current_execution_scope(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
     records = load_current_execution_rows(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
     payloads = {str(row.business_identity): deepcopy(dict(row.payload)) for row in records}
+    affected_identity_set: set[str] = set()
+    affected_product_set: set[int] = set()
     for work_id in sorted(set(map(int, work_item_ids))):
         work = db.get(models.ReplenishmentWorkItem, work_id)
         if work is None:
@@ -240,14 +416,18 @@ def publish_local_make_changes(db: Session, work_item_ids: Sequence[int]) -> str
         run, generation_id = require_current_run(db, work.run_id, consumer="production.local_make_publish")
         owner = require_selected_make_work_items(db, [work], run=run, generation_id=generation_id)[work.id]
         identity = f"mrp-reservation:{owner.current_identity}"
+        affected_identity_set.add(identity)
         previous = payloads.get(identity)
         if previous is None:
             raise ValueError("Текущая строка MRP недоступна")
         requirement = db.get(models.MrpRequirement, work.requirement_id)
         products = [product for product, _ in _active_mrp_products_for_requirement(db, requirement)]
         ids = [int(product.product_id) for product in products]
-        payloads.update(_current_executor_payloads(db, truth, ids, [run.run_id],
-                         {pid: previous.get("root_item_ids") for pid in ids}))
+        executors = _current_executor_payloads(db, truth, ids, [run.run_id],
+                         {pid: previous.get("root_item_ids") for pid in ids})
+        payloads.update(executors)
+        affected_identity_set.update(executors)
+        affected_product_set.update(ids)
         remaining = replenishment_remaining(owner.replenishment_required_qty, owner.replenishment_received_qty)
         source = SimpleNamespace(id=work.id, reservation_id=owner.id, item_id=work.item_id,
                                  requirement_id=work.requirement_id, run_id=run.run_id,
@@ -288,7 +468,13 @@ def publish_local_make_changes(db: Session, work_item_ids: Sequence[int]) -> str
             payloads[identity] = _compact_business_payload(row)
         else:
             payloads.pop(identity, None)
-    return _publish_local_payloads(db, truth, manifest, payloads)
+    affected_identities = tuple(sorted(affected_identity_set))
+    affected_product_ids = tuple(sorted(affected_product_set))
+    return _publish_local_payloads(
+        db, truth, manifest, payloads,
+        affected_product_ids=affected_product_ids,
+        affected_identities=affected_identities,
+    )
 
 
 def prepare_current_work_materials(db: Session, *, work_item_id: int, qty: float,
@@ -299,7 +485,12 @@ def prepare_current_work_materials(db: Session, *, work_item_id: int, qty: float
     from .mrp_mutation_guard import require_current_run, require_selected_make_work_items
     from .production_control_material_availability import preview_make_work_item_materials, public_materials_payload
     from .item_ledger.current_execution import require_current_execution_scope
+    from .accepted_command_mutation import (
+        lock_accepted_mutation_state,
+        record_locked_accepted_production_mutation,
+    )
 
+    mutation_boundary = lock_accepted_mutation_state(db)
     manifest = require_current_execution_scope(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
     if str(manifest.source_revision) != expected_source_revision:
         raise HTTPException(409, detail={"code": "production_current_revision_stale", "expected_source_revision": manifest.source_revision})
@@ -325,6 +516,7 @@ def prepare_current_work_materials(db: Session, *, work_item_id: int, qty: float
     from .production_control_material_availability import material_supported_snapshot_is_consistent
     if saved and saved.get("source_revision") == expected_source_revision and material_supported_snapshot_is_consistent(saved['payload']):
         snapshot = saved["payload"]
+        wrote_preview = False
     else:
         snapshot = preview_make_work_item_materials(db, work_item_id=work.id, item_id=work.item_id,
                    quantity=float(quantity), spec_id=row.get("spec_id"), ledger_generation_id=generation_id,
@@ -337,6 +529,16 @@ def prepare_current_work_materials(db: Session, *, work_item_id: int, qty: float
         row["_material_quantity_snapshots"] = variants
         record.payload = jsonable_encoder(row)
         db.flush()
+        wrote_preview = True
+    if wrote_preview:
+        record_locked_accepted_production_mutation(
+            db,
+            pointer=mutation_boundary[0],
+            state=mutation_boundary[1],
+            mutation_kind="material_preview",
+            item_ids=(int(work.item_id),),
+            business_identities=(str(current_identity),),
+        )
     public = public_materials_payload(dict(snapshot))
     generation = db.get(models.LedgerGeneration, generation_id)
     public.update(work_item_id=work_item_id, ledger_generation_id=generation_id,
@@ -1263,20 +1465,25 @@ def build_compact_current_production_control_payload(
     shelf_payload: Mapping[str, Any] | Any,
     accepted_run_ids: Sequence[int],
     affected_item_ids: Sequence[int] | None = None,
+    custody_override: Any | None = None,
+    use_target_material_context: bool = False,
+    reservation_views_override: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Build the production-control current DTO without generation staging.
 
     Ordinary 1C production orders still come from ``list_journal``.  MAKE
     proposal rows are derived from stable current reservations and the compact
     drum/shelf DTOs; no ``ReplenishmentWorkItem`` or target queue/readiness/drum
-    row is read or created.  Material coverage is intentionally evaluated at
-    the accepted parent boundary, whose StockBin/custody/future-supply owners
-    are the only compact current inputs available before target publication.
+    row is read or created. Material coverage uses the accepted parent by
+    default. Publisher catch-up explicitly opts into the BUILDING target's
+    sealed physical/future basis and supplies its simulated custody owner;
+    public accepted readers never use that private mode.
     """
 
     target = db.get(models.LedgerGeneration, int(target_generation_id))
     parent = db.get(models.LedgerGeneration, int(parent_generation_id))
-    if target is None or str(target.status or "") != "building":
+    target_status = str(target.status or "") if target is not None else ""
+    if target is None or target_status not in {"building", "accepted"}:
         raise ProductionControlJournalPromotionError(
             "compact production payload requires a BUILDING target"
         )
@@ -1292,6 +1499,10 @@ def build_compact_current_production_control_payload(
     if pointer is None or int(pointer.current_generation_id or -1) != int(parent.id):
         raise ProductionControlJournalPromotionError(
             "compact production payload parent is not current truth"
+        )
+    if target_status == "accepted" and int(pointer.current_generation_id or -1) == int(target.id):
+        raise ProductionControlJournalPromotionError(
+            "compact production payload cannot rebuild the published pointer"
         )
     run_ids = tuple(sorted({int(value) for value in accepted_run_ids}))
     if not run_ids:
@@ -1344,11 +1555,14 @@ def build_compact_current_production_control_payload(
             preview_materials_bulk(
                 db,
                 coverage_product_ids,
-                ledger_generation_id=int(parent.id),
-                _current_only=True,
+                ledger_generation_id=int(
+                    target.id if use_target_material_context else parent.id
+                ),
+                _current_only=not use_target_material_context,
+                _custody_override=custody_override,
             )
         )
-    truth = _candidate_truth(parent)
+    truth = _candidate_truth(target if use_target_material_context else parent)
     rows: list[dict[str, Any]] = []
     offset = 0
     latest_run_id: int | None = None
@@ -1385,7 +1599,10 @@ def build_compact_current_production_control_payload(
     )
     product_ids = [int(row["product_id"]) for row in rows if row.get("product_id") is not None]
     route_snapshots = build_route_sheet_snapshot_payloads(
-        db, product_ids=product_ids, ledger_generation_id=int(parent.id)
+        db, product_ids=product_ids,
+        ledger_generation_id=int(
+            target.id if use_target_material_context else parent.id
+        ),
     )
     direct_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -1506,19 +1723,50 @@ def build_compact_current_production_control_payload(
                 "readiness_phase": payload.get("readiness_phase"),
             })
 
-    reservations = (
-        db.query(models.ReservationEntry)
-        .filter(
-            models.ReservationEntry.is_current.is_(True),
-            models.ReservationEntry.owner_kind == "current",
-            models.ReservationEntry.lifecycle_status == "active",
-            models.ReservationEntry.realization_mode == "make",
-            models.ReservationEntry.current_identity != "",
-            models.ReservationEntry.run_id.in_(run_ids),
+    if reservation_views_override is None:
+        reservations = (
+            db.query(models.ReservationEntry)
+            .filter(
+                models.ReservationEntry.is_current.is_(True),
+                models.ReservationEntry.owner_kind == "current",
+                models.ReservationEntry.lifecycle_status == "active",
+                models.ReservationEntry.realization_mode == "make",
+                models.ReservationEntry.current_identity != "",
+                models.ReservationEntry.run_id.in_(run_ids),
+            )
+            .order_by(models.ReservationEntry.priority_period_from, models.ReservationEntry.id)
+            .all()
         )
-        .order_by(models.ReservationEntry.priority_period_from, models.ReservationEntry.id)
-        .all()
-    )
+    else:
+        reservations = sorted(
+            (
+                SimpleNamespace(
+                    id=int(row.stage_reservation_id),
+                    current_identity=str(row.current_identity),
+                    item_id=int(row.item_id),
+                    characteristic_ref=str(row.characteristic_ref or ""),
+                    organization_ref=str(row.organization_ref or ""),
+                    planning_stock_pool=str(row.planning_stock_pool or ""),
+                    run_id=int(row.run_id) if row.run_id is not None else None,
+                    freeze_version=int(row.freeze_version),
+                    requirement_id=int(row.requirement_id),
+                    realization_mode=str(row.realization_mode or ""),
+                    reserved_qty=row.reserved_qty,
+                    covered_from_stock_at_freeze_qty=row.covered_from_stock_at_freeze_qty,
+                    replenishment_required_qty=row.replenishment_required_qty,
+                    replenishment_received_qty=row.replenishment_received_qty,
+                    realized_qty=row.realized_qty,
+                    lifecycle_status=str(row.lifecycle_status or ""),
+                    priority_period_from=row.priority_period_from,
+                    priority_period_to=row.priority_period_to,
+                )
+                for row in reservation_views_override
+                if str(row.lifecycle_status or "") == "active"
+                and str(row.realization_mode or "") == "make"
+                and row.run_id is not None and int(row.run_id) in run_ids
+            ),
+            key=lambda row: (row.priority_period_from, row.id),
+        )
     seen_current_identities: set[str] = set()
     for reservation in reservations:
         identity = str(reservation.current_identity or "").strip()
@@ -1599,10 +1847,13 @@ def build_compact_current_production_control_payload(
             raise ProductionControlJournalPromotionError(
                 "compact MAKE proposal lacks stable current reservation identity"
             )
-        synthetic_id = -int(reservation.id)
+        reservation_id = int(
+            getattr(reservation, "id", None) or reservation.reservation_id
+        )
+        synthetic_id = -reservation_id
         compact_work_items.append(SimpleNamespace(
             id=synthetic_id,
-            reservation_id=int(reservation.id),
+            reservation_id=reservation_id,
             item_id=int(item.item_id),
             requirement_id=int(requirement.id),
             run_id=int(run.run_id),
@@ -1629,8 +1880,11 @@ def build_compact_current_production_control_payload(
     proposal_coverage = preview_make_work_items_coverage(
         db,
         canonical_proposals,
-        ledger_generation_id=int(parent.id),
-        _current_only=True,
+        ledger_generation_id=int(
+            target.id if use_target_material_context else parent.id
+        ),
+        _current_only=not use_target_material_context,
+        _custody_override=custody_override,
     )
     # Preserve the same row-level BOM membership used by ordinary production
     # lines.  A run may have multiple roots; assigning the complete run root
@@ -1657,10 +1911,14 @@ def build_compact_current_production_control_payload(
         preview_make_work_items_materials_bulk,
     )
 
-    reusable_proposal_snapshots = _parent_current_proposal_snapshots(
-        db,
-        parent_generation_id=int(parent.id),
-        affected_item_ids=affected_item_ids,
+    reusable_proposal_snapshots = (
+        {}
+        if use_target_material_context
+        else _parent_current_proposal_snapshots(
+            db,
+            parent_generation_id=int(parent.id),
+            affected_item_ids=affected_item_ids,
+        )
     )
     proposal_material_snapshots: dict[str, dict[str, Any]] = {}
     preview_inputs: list[dict[str, Any]] = []
@@ -1702,12 +1960,19 @@ def build_compact_current_production_control_payload(
             ),
         })
     if preview_inputs:
+        preview_kwargs = {
+            "ledger_generation_id": int(
+                target.id if use_target_material_context else parent.id
+            ),
+            "_current_only": not use_target_material_context,
+            "_allow_synthetic_ids": True,
+        }
+        if custody_override is not None:
+            preview_kwargs["_custody_override"] = custody_override
         previewed = preview_make_work_items_materials_bulk(
             db,
             preview_inputs,
-            ledger_generation_id=int(parent.id),
-            _current_only=True,
-            _allow_synthetic_ids=True,
+            **preview_kwargs,
         )
         if set(previewed) != set(preview_identity_by_work_item):
             raise ProductionControlJournalPromotionError(
@@ -1744,7 +2009,9 @@ def build_compact_current_production_control_payload(
                     "compact MAKE proposal material preview is missing"
                 )
             proposal["material_coverage_snapshot"] = snapshot
-        proposal["reservation_id"] = int(reservation.id)
+        proposal["reservation_id"] = int(
+            getattr(reservation, "id", None) or reservation.reservation_id
+        )
         proposal["root_item_ids"] = sorted(
             roots_by_proposal.get(proposal_root_keys[synthetic_id], set())
         )

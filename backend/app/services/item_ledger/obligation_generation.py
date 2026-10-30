@@ -29,6 +29,7 @@ from .reservation import (
 ALGORITHM_VERSION = "ledger-obligation-generation/1"
 REPLAY_VERSION = "ledger-obligation-replay/1"
 GENERATION_KIND = "obligation_refresh"
+ACCEPTED_MUTATION_EPOCH_KEY = "accepted_production_mutation_epoch"
 
 
 class ObligationGenerationError(RuntimeError):
@@ -55,11 +56,13 @@ def _utc(value: datetime | None, field: str) -> datetime:
 def _expected_watermarks_with_replay_from(
     parent_id: int,
     replay_from: datetime,
+    accepted_mutation_epoch: int,
 ) -> dict[str, Any]:
     return {
         "parent_generation_id": int(parent_id),
         "generation_kind": GENERATION_KIND,
         "replay_from": _utc(replay_from, "replay_from").isoformat(),
+        ACCEPTED_MUTATION_EPOCH_KEY: int(accepted_mutation_epoch),
     }
 
 
@@ -275,7 +278,10 @@ def _exact_existing(
         or _utc(existing.cutoff, "existing cutoff") != _utc(parent.cutoff, "parent cutoff")
         or not _watermarks_are_own_progress(
             dict(existing.source_watermarks or {}),
-            _expected_watermarks_with_replay_from(parent.id, replay_from),
+            _expected_watermarks_with_replay_from(
+                parent.id, replay_from,
+                int((existing.source_watermarks or {}).get(ACCEPTED_MUTATION_EPOCH_KEY, -1)),
+            ),
         )
         # ``capabilities`` are deliberately NOT compared: the fork creates them
         # empty, but the later build steps of this very generation declare the
@@ -353,12 +359,13 @@ def fork_obligation_generation(
             created=False,
         )
 
+    from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
     candidate = models.LedgerGeneration(
         generation_key=key,
         status="building",
         cutoff=parent.cutoff,
         source_watermarks=_expected_watermarks_with_replay_from(
-            parent.id, replay_from,
+            parent.id, replay_from, capture_accepted_mutation_epoch(db),
         ),
         capabilities={},
         physical_import_batch_id=int(physical.id),

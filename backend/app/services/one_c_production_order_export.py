@@ -73,6 +73,7 @@ from .production_control_common import DONE_STATE_KEY
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .bom_specification_resolver import BomSpecificationResolver
+from .accepted_command_mutation import stamp_external_production_metadata
 
 
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
@@ -158,6 +159,10 @@ def reduce_existing_production_quantity_to_1c(
     if dry_run:
         return {"status": "preview", **summary}
     _upsert_sync_link(db, SyncLink, source_doctype="production_order_quantity_amendment", source_id=int(product_id), target_entity=PRODUCTION_ORDER_ENTITY, target_number=document["Number"], payload_hash=request_hash, target_ref_key=ref, status="pending", last_error=None)
+    stamp_external_production_metadata(
+        db, mutation_kind="production_quantity_amendment_pending",
+        product_ids=(int(product_id),),
+    )
     db.commit()
     needs_patch = any(document.get(key) != value for key, value in payload.items())
     if needs_patch:
@@ -183,6 +188,10 @@ def reduce_existing_production_quantity_to_1c(
     product.quantity = float(quantity)
     update_accepted_product_output_cache(product, produced_qty=output.produced_qty)
     _upsert_sync_link(db, SyncLink, source_doctype="production_order_quantity_amendment", source_id=int(product_id), target_entity=PRODUCTION_ORDER_ENTITY, target_number=document["Number"], payload_hash=request_hash, target_ref_key=ref, status="success", last_error=None)
+    stamp_external_production_metadata(
+        db, mutation_kind="production_quantity_amendment_success",
+        product_ids=(int(product_id),),
+    )
     db.commit()
     return {"status": "ok", **summary, "requires_materials_refresh": True}
 
@@ -770,7 +779,7 @@ def _collect_close_entries(
 
 def _persist_line_destinations(
     db: Session, entry: "ProductionOrderExportEntry"
-) -> None:
+) -> bool:
     """Record on the order line where 1C was told the output will land.
 
     The Ledger counts an open production order as future supply only with an
@@ -1095,6 +1104,13 @@ def close_production_orders_to_1c(
             order = db.get(ProductionOrder, int(entry.order_id))
             order.order_state_key = observed["СостояниеЗаказа_Key"]
             order.order_state_name = "Завершён"
+            stamp_external_production_metadata(
+                db, mutation_kind="production_order_closed",
+                product_ids=tuple(
+                    int(row[0]) for row in db.query(ProductionProduct.product_id)
+                    .filter(ProductionProduct.order_id == int(entry.order_id)).all()
+                ),
+            )
             db.commit()
             closed += 1
         except Exception as exc:
@@ -1211,7 +1227,7 @@ def _upsert_link(
         )
         if not verified_reuse:
             raise RuntimeError("production SyncLink belongs to another Ledger generation")
-    _upsert_sync_link(
+    changed = _upsert_sync_link(
         db,
         SyncLink,
         source_doctype="production_order",
@@ -1229,7 +1245,9 @@ def _upsert_link(
         raise RuntimeError("production SyncLink upsert was not persisted")
     if entry.ledger_generation_id is None:
         raise MrpMutationLineageError("production SyncLink has no accepted Ledger generation")
+    generation_changed = int(link.ledger_generation_id or 0) != int(entry.ledger_generation_id)
     link.ledger_generation_id = int(entry.ledger_generation_id)
+    return bool(changed or generation_changed)
 
 
 def _validate_existing_retry_link(
@@ -1464,6 +1482,14 @@ def export_production_orders_to_1c(
         _persist_line_destinations(db, entry)
         recovered.append(entry)
     if recovered:
+        recovered_order_ids = {int(entry.order_id) for entry in recovered}
+        stamp_external_production_metadata(
+            db, mutation_kind="production_order_export_recovered",
+            product_ids=tuple(
+                int(row[0]) for row in db.query(ProductionProduct.product_id)
+                .filter(ProductionProduct.order_id.in_(recovered_order_ids)).all()
+            ),
+        )
         db.commit()
 
     def _mark_success(entry: ProductionOrderExportEntry, ref_key: str) -> None:
@@ -1488,6 +1514,22 @@ def export_production_orders_to_1c(
         missing_ref_error=f"1C did not return Ref_Key for the new {PRODUCTION_ORDER_ENTITY}",
         upsert_link=lambda **kwargs: _upsert_link(db, **kwargs),
         on_success=_mark_success,
+        before_commit=lambda entry, status: stamp_external_production_metadata(
+            db,
+            mutation_kind=f"production_order_export_{status}",
+            product_ids=tuple(
+                int(row[0])
+                for row in db.query(ProductionProduct.product_id)
+                .filter(ProductionProduct.order_id == int(entry.order_id)).all()
+            ),
+        ),
+        read_link_semantic=lambda entry: (
+            (lambda link: None if link is None else (
+                str(link.target_number or ""), str(link.payload_hash or ""),
+                str(link.target_ref_key or ""), str(link.status or ""),
+                str(link.last_error or ""), int(link.ledger_generation_id or 0),
+            ))(_existing_link(db, int(entry.order_id)))
+        ),
         log_error=lambda entry: f"[1C production export] order_id={entry.order_id} failed: {entry.error}",
     )
 

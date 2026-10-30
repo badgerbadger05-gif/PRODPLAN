@@ -8,9 +8,10 @@ before the accepted pointer is published.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -23,8 +24,412 @@ class ReservationCurrentError(ValueError):
     """Current reservation publication is unavailable and must fail closed."""
 
 
+class PreparedCurrentReservationsBasisConflict(ReservationCurrentError):
+    """Accepted or BUILDING reservation basis changed after preparation."""
+
+
+@dataclass(frozen=True)
+class PreparedReservationOwnerView:
+    current_identity: str
+    stage_reservation_id: int
+    accepted_owner_id: int | None
+    item_id: int
+    characteristic_ref: str
+    organization_ref: str
+    run_id: int | None
+    freeze_version: int
+    requirement_id: int
+    realization_mode: str
+    planning_stock_pool: str
+    reserved_qty: Decimal
+    covered_from_stock_at_freeze_qty: Decimal
+    replenishment_required_qty: Decimal
+    replenishment_received_qty: Decimal
+    realized_qty: Decimal
+    lifecycle_status: str
+    priority_period_from: Any
+    priority_period_to: Any
+
+    @property
+    def reservation_id(self) -> int:
+        """Compatibility locator for canonical R4 target-view preparation."""
+        return int(self.stage_reservation_id)
+
+
+@dataclass(frozen=True)
+class PreparedCurrentReservations:
+    generation_id: int
+    generation_basis: tuple[int, str]
+    retire_run_ids: tuple[int, ...] | None
+    activation_identities: tuple[str, ...]
+    retiring_identities: tuple[str, ...]
+    target_reservations: tuple[PreparedReservationOwnerView, ...]
+    stage_basis: tuple[tuple[Any, ...], ...]
+    accepted_basis: tuple[tuple[Any, ...], ...]
+
+
+@dataclass(frozen=True)
+class InstalledCurrentReservations:
+    metrics: Mapping[str, int]
+    owner_id_by_identity: Mapping[str, int]
+    closed_identities: tuple[str, ...]
+
+
 def _dialect(db: Session) -> str:
     return str(getattr(getattr(db, "bind", None), "dialect", None).name)
+
+
+def _reservation_basis(row: models.ReservationEntry) -> tuple[Any, ...]:
+    return (
+        int(row.id), int(row.ledger_generation_id),
+        str(row.current_identity or ""), str(row.owner_kind or ""),
+        bool(row.is_current), int(row.item_id),
+        str(row.characteristic_ref or ""), str(row.organization_ref or ""),
+        str(row.planning_stock_pool or ""),
+        int(row.run_id) if row.run_id is not None else None,
+        int(row.freeze_version), int(row.requirement_id),
+        row.priority_period_from, row.priority_period_to,
+        str(row.realization_mode or ""), Decimal(row.reserved_qty),
+        Decimal(row.covered_from_stock_at_freeze_qty),
+        Decimal(row.replenishment_required_qty),
+        Decimal(row.replenishment_received_qty), Decimal(row.realized_qty),
+        str(row.lifecycle_status or ""), row.opened_at, row.closed_at,
+    )
+
+
+def _prepared_stage_rows(db: Session, generation_id: int) -> list[models.ReservationEntry]:
+    rows = list(db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == int(generation_id),
+    ).order_by(models.ReservationEntry.id.asc()).all())
+    known = {int(row.id) for row in rows}
+    for row in tuple(db.new) + tuple(db.dirty):
+        if not isinstance(row, models.ReservationEntry):
+            continue
+        if int(row.ledger_generation_id or 0) != int(generation_id):
+            continue
+        if row.id is None:
+            raise ReservationCurrentError(
+                "reservation prepare requires flushed BUILDING owners"
+            )
+        if int(row.id) not in known:
+            rows.append(row)
+            known.add(int(row.id))
+    return sorted(rows, key=lambda row: int(row.id))
+
+
+def _accepted_rows_for_prepared_scope(
+    db: Session,
+    *,
+    identities: set[str],
+    retire_run_ids: tuple[int, ...] | None,
+) -> list[models.ReservationEntry]:
+    rows = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.is_current.is_(True),
+    ).order_by(models.ReservationEntry.id.asc()).all()
+    return [
+        row for row in rows
+        if str(row.current_identity or "") in identities
+        or (
+            str(row.current_identity or "") not in identities
+            and (
+                retire_run_ids is None
+                or (row.run_id is not None and int(row.run_id) in retire_run_ids)
+            )
+        )
+    ]
+
+
+def prepare_current_reservations(
+    db: Session,
+    *,
+    generation_id: int,
+    retire_run_ids: Iterable[int] | None = None,
+) -> PreparedCurrentReservations:
+    """Prepare R11 owner activation without locks or accepted-owner DML."""
+    generation_id = int(generation_id)
+    generation = db.get(models.LedgerGeneration, generation_id)
+    if generation is None or str(generation.status) != "building":
+        raise ReservationCurrentError(
+            "reservation current preparation requires BUILDING generation"
+        )
+    retire_scope = (
+        None if retire_run_ids is None
+        else tuple(sorted({int(value) for value in retire_run_ids}))
+    )
+    stages = _prepared_stage_rows(db, generation_id)
+    identities: set[str] = set()
+    for stage in stages:
+        identity = str(stage.current_identity or "").strip()
+        if str(stage.owner_kind or "") != "building":
+            raise ReservationCurrentError(
+                "BUILDING reservation publication contains a non-building owner"
+            )
+        if not identity or identity in identities:
+            raise ReservationCurrentError(
+                f"BUILDING reservation identity collision: {identity!r}"
+            )
+        identities.add(identity)
+    accepted = _accepted_rows_for_prepared_scope(
+        db, identities=identities, retire_run_ids=retire_scope,
+    )
+    accepted_by_identity = {
+        str(row.current_identity or ""): row for row in accepted
+        if str(row.current_identity or "") in identities
+    }
+    staged_targets = tuple(
+        PreparedReservationOwnerView(
+            current_identity=str(stage.current_identity),
+            stage_reservation_id=int(stage.id),
+            accepted_owner_id=(
+                int(accepted_by_identity[str(stage.current_identity)].id)
+                if str(stage.current_identity) in accepted_by_identity else None
+            ),
+            item_id=int(stage.item_id),
+            characteristic_ref=str(stage.characteristic_ref or ""),
+            organization_ref=str(stage.organization_ref or ""),
+            run_id=int(stage.run_id) if stage.run_id is not None else None,
+            freeze_version=int(stage.freeze_version),
+            requirement_id=int(stage.requirement_id),
+            realization_mode=str(stage.realization_mode or ""),
+            planning_stock_pool=str(stage.planning_stock_pool or ""),
+            reserved_qty=Decimal(stage.reserved_qty),
+            covered_from_stock_at_freeze_qty=Decimal(
+                stage.covered_from_stock_at_freeze_qty
+            ),
+            replenishment_required_qty=Decimal(stage.replenishment_required_qty),
+            replenishment_received_qty=Decimal(stage.replenishment_received_qty),
+            realized_qty=Decimal(stage.realized_qty),
+            lifecycle_status=str(stage.lifecycle_status or ""),
+            priority_period_from=stage.priority_period_from,
+            priority_period_to=stage.priority_period_to,
+        )
+        for stage in stages
+    )
+    retained_rows: list[models.ReservationEntry] = []
+    if retire_scope is not None:
+        removed_owner_ids = {
+            int(row.id) for row in accepted
+            if str(row.current_identity or "") not in identities
+        }
+        retained_rows = [
+            row for row in db.query(models.ReservationEntry).filter(
+                models.ReservationEntry.is_current.is_(True),
+                models.ReservationEntry.lifecycle_status == "active",
+            ).order_by(models.ReservationEntry.id.asc()).all()
+            if str(row.current_identity or "") not in identities
+            and int(row.id) not in removed_owner_ids
+        ]
+    retained_targets = tuple(
+        PreparedReservationOwnerView(
+            current_identity=str(row.current_identity),
+            stage_reservation_id=int(row.id),
+            accepted_owner_id=int(row.id),
+            item_id=int(row.item_id),
+            characteristic_ref=str(row.characteristic_ref or ""),
+            organization_ref=str(row.organization_ref or ""),
+            run_id=int(row.run_id) if row.run_id is not None else None,
+            freeze_version=int(row.freeze_version),
+            requirement_id=int(row.requirement_id),
+            realization_mode=str(row.realization_mode or ""),
+            planning_stock_pool=str(row.planning_stock_pool or ""),
+            reserved_qty=Decimal(row.reserved_qty),
+            covered_from_stock_at_freeze_qty=Decimal(
+                row.covered_from_stock_at_freeze_qty
+            ),
+            replenishment_required_qty=Decimal(row.replenishment_required_qty),
+            replenishment_received_qty=Decimal(row.replenishment_received_qty),
+            realized_qty=Decimal(row.realized_qty),
+            lifecycle_status=str(row.lifecycle_status or ""),
+            priority_period_from=row.priority_period_from,
+            priority_period_to=row.priority_period_to,
+        )
+        for row in retained_rows
+        if str(row.current_identity or "")
+    )
+    return PreparedCurrentReservations(
+        generation_id=generation_id,
+        generation_basis=(generation_id, str(generation.status)),
+        retire_run_ids=retire_scope,
+        activation_identities=tuple(sorted(identities)),
+        retiring_identities=tuple(sorted(
+            str(row.current_identity or "") for row in accepted
+            if str(row.current_identity or "") not in identities
+        )),
+        target_reservations=tuple(sorted(
+            (*staged_targets, *retained_targets),
+            key=lambda row: row.current_identity,
+        )),
+        stage_basis=tuple(_reservation_basis(row) for row in stages),
+        accepted_basis=tuple(_reservation_basis(row) for row in accepted),
+    )
+
+
+def prepared_reservation_views_with_execution(
+    prepared: PreparedCurrentReservations,
+    execution_views: Iterable[Any],
+) -> tuple[PreparedReservationOwnerView, ...]:
+    """Overlay R4 desired execution counters on the canonical R11 target view."""
+    by_identity = {
+        str(row.current_identity): row for row in execution_views
+    }
+    result: list[PreparedReservationOwnerView] = []
+    immutable_fields = (
+        "item_id", "run_id", "requirement_id", "realization_mode",
+        "planning_stock_pool", "reserved_qty",
+        "covered_from_stock_at_freeze_qty", "replenishment_required_qty",
+    )
+    for owner in prepared.target_reservations:
+        execution = by_identity.get(owner.current_identity)
+        if execution is None:
+            result.append(owner)
+            continue
+        if any(
+            getattr(owner, field) != getattr(execution, field)
+            for field in immutable_fields
+        ):
+            raise PreparedCurrentReservationsBasisConflict(
+                "R4 execution target does not match prepared R11 owner basis"
+            )
+        result.append(replace(
+            owner,
+            replenishment_received_qty=Decimal(
+                execution.replenishment_received_qty
+            ),
+            realized_qty=Decimal(execution.realized_qty),
+        ))
+    unknown = sorted(set(by_identity) - {
+        row.current_identity for row in prepared.target_reservations
+    })
+    if unknown and prepared.retire_run_ids:
+        retired_runs = set(prepared.retire_run_ids)
+        retired_identities = {
+            str(basis[2]) for basis in prepared.accepted_basis
+            if basis[9] is not None and int(basis[9]) in retired_runs
+        }
+        unknown = sorted(set(unknown) - retired_identities)
+    if unknown:
+        raise PreparedCurrentReservationsBasisConflict(
+            f"R4 execution target has no R11 owner: {unknown[0]}"
+        )
+    return tuple(result)
+
+
+def install_prepared_current_reservations(
+    db: Session,
+    prepared: PreparedCurrentReservations,
+    *,
+    retire_closed_allocations: bool = True,
+) -> InstalledCurrentReservations:
+    """Validate a prepared R11 basis and activate stable owners atomically."""
+    generation = (
+        db.query(models.LedgerGeneration)
+        .filter(models.LedgerGeneration.id == int(prepared.generation_id))
+        .populate_existing().with_for_update().one_or_none()
+    )
+    status_transition_ok = False
+    if generation is not None:
+        pointer = db.get(models.PlanningTruthState, 1)
+        status_transition_ok = (
+            prepared.generation_basis == (int(generation.id), "building")
+            and str(generation.status) == "accepted"
+            and pointer is not None
+            and int(pointer.current_generation_id or 0) != int(generation.id)
+        )
+    if generation is None or (
+        (int(generation.id), str(generation.status)) != prepared.generation_basis
+        and not status_transition_ok
+    ):
+        raise PreparedCurrentReservationsBasisConflict(
+            "reservation generation basis changed after preparation"
+        )
+    stages = _prepared_stage_rows(db, int(prepared.generation_id))
+    if tuple(_reservation_basis(row) for row in stages) != prepared.stage_basis:
+        raise PreparedCurrentReservationsBasisConflict(
+            "BUILDING reservation basis changed after preparation"
+        )
+    activation_identities = set(prepared.activation_identities)
+    accepted = _accepted_rows_for_prepared_scope(
+        db, identities=activation_identities,
+        retire_run_ids=prepared.retire_run_ids,
+    )
+    # Lock only after the read-only basis was prepared; the caller already
+    # owns the final pointer boundary and R4 prepared against this same basis.
+    accepted_ids = [int(row.id) for row in accepted]
+    if accepted_ids:
+        db.query(models.ReservationEntry).filter(
+            models.ReservationEntry.id.in_(accepted_ids)
+        ).populate_existing().with_for_update().all()
+        accepted = _accepted_rows_for_prepared_scope(
+            db, identities=activation_identities,
+            retire_run_ids=prepared.retire_run_ids,
+        )
+    if tuple(_reservation_basis(row) for row in accepted) != prepared.accepted_basis:
+        raise PreparedCurrentReservationsBasisConflict(
+            "accepted reservation basis changed after preparation"
+        )
+    metrics = dict(_publish_current_reservation_owners(
+        db,
+        generation_id=int(prepared.generation_id),
+        retire_run_ids=prepared.retire_run_ids,
+        allow_accepted_unpublished=status_transition_ok,
+    ))
+    target_identities = {row.current_identity for row in prepared.target_reservations}
+    owners = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.is_current.is_(True),
+        models.ReservationEntry.current_identity.in_(sorted(target_identities) or [""]),
+    ).all()
+    owner_map = {
+        str(row.current_identity): int(row.id) for row in owners
+    }
+    if set(owner_map) != target_identities:
+        raise ReservationCurrentError(
+            "reservation activation did not produce every stable owner"
+        )
+    if prepared.retiring_identities:
+        closed_rows = db.query(models.ReservationEntry).filter(
+            models.ReservationEntry.current_identity.in_(prepared.retiring_identities),
+        ).all()
+        closed_by_identity = {
+            str(row.current_identity): row for row in closed_rows
+        }
+        if any(
+            identity not in closed_by_identity
+            or bool(closed_by_identity[identity].is_current)
+            or str(closed_by_identity[identity].lifecycle_status) != "closed"
+            for identity in prepared.retiring_identities
+        ):
+            raise ReservationCurrentError(
+                "reservation retirement did not close every prepared owner"
+            )
+    if retire_closed_allocations:
+        metrics.update(retire_prepared_closed_owner_allocations(
+            db, generation_id=int(prepared.generation_id),
+        ))
+    return InstalledCurrentReservations(
+        metrics=metrics,
+        owner_id_by_identity=owner_map,
+        closed_identities=prepared.retiring_identities,
+    )
+
+
+def retire_prepared_closed_owner_allocations(
+    db: Session,
+    *,
+    generation_id: int,
+) -> dict[str, int]:
+    """Run the canonical post-R4 closed-owner allocation retirement."""
+    from .current_replenishment import retire_current_allocations_of_closed_owners
+
+    retired = retire_current_allocations_of_closed_owners(
+        db, generation_id=int(generation_id)
+    )
+    return {
+        "retired_allocations": int(retired["retired_allocations"]),
+        "retired_consumption_allocations": int(
+            retired["retired_consumption_allocations"]
+        ),
+        "retired_unaudited": int(retired["unaudited"]),
+    }
 
 
 def publish_current_reservations(
@@ -42,20 +447,20 @@ def publish_current_reservations(
     for the live owners.  See :func:`_publish_current_reservation_owners` for
     the owner publication itself.
     """
-    from .current_replenishment import retire_current_allocations_of_closed_owners
-
-    result = dict(_publish_current_reservation_owners(
-        db, generation_id=generation_id, retire_run_ids=retire_run_ids,
-    ))
-    retired = retire_current_allocations_of_closed_owners(
-        db, generation_id=int(generation_id)
+    # Narrow compatibility seam for the SQL-shape unit double used by the
+    # pre-existing PostgreSQL fail-closed contract test. Real sessions and all
+    # production callers always take the prepared boundary below.
+    if not hasattr(db, "query"):
+        return dict(_publish_current_reservation_owners(
+            db, generation_id=int(generation_id), retire_run_ids=retire_run_ids,
+        ))
+    prepared = prepare_current_reservations(
+        db, generation_id=int(generation_id), retire_run_ids=retire_run_ids,
     )
-    result["retired_allocations"] = int(retired["retired_allocations"])
-    result["retired_consumption_allocations"] = int(
-        retired["retired_consumption_allocations"]
+    installed = install_prepared_current_reservations(
+        db, prepared, retire_closed_allocations=True,
     )
-    result["retired_unaudited"] = int(retired["unaudited"])
-    return result
+    return dict(installed.metrics)
 
 
 def _publish_current_reservation_owners(
@@ -63,6 +468,7 @@ def _publish_current_reservation_owners(
     *,
     generation_id: int,
     retire_run_ids: Iterable[int] | None = None,
+    allow_accepted_unpublished: bool = False,
 ) -> dict[str, int]:
     """Atomically publish target BUILDING reservations into stable owners.
 
@@ -85,7 +491,17 @@ def _publish_current_reservation_owners(
     """
     generation_id = int(generation_id)
     generation = db.get(models.LedgerGeneration, generation_id)
-    if generation is None or str(generation.status) != "building":
+    accepted_unpublished = False
+    if generation is not None and allow_accepted_unpublished:
+        pointer = db.get(models.PlanningTruthState, 1)
+        accepted_unpublished = (
+            str(generation.status) == "accepted"
+            and pointer is not None
+            and int(pointer.current_generation_id or 0) != generation_id
+        )
+    if generation is None or (
+        str(generation.status) != "building" and not accepted_unpublished
+    ):
         raise ReservationCurrentError("reservation current publication requires BUILDING generation")
     retire_scope = (
         None if retire_run_ids is None

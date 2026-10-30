@@ -374,7 +374,10 @@ def create_obligation_refresh_manifest(
         return existing
 
     watermarks = dict(target.source_watermarks or {})
-    allowed = {"generation_kind", "parent_generation_id", "replay_from"}
+    allowed = {
+        "generation_kind", "parent_generation_id", "replay_from",
+        "accepted_production_mutation_epoch",
+    }
     if set(watermarks) - allowed:
         raise ObligationRefreshManifestError("target source_watermarks are already sealed")
 

@@ -179,10 +179,10 @@ def test_deferred_accepted_alias_waits_behind_prior_staging_suffix(
     projected = []
     monkeypatch.setattr(
         custody_events,
-        "project_transfer_custody_events_for_recorder",
+        "build_transfer_custody_event_specs_for_recorder",
         lambda _db, **kwargs: projected.append(
             (kwargs["recorder_type"], kwargs["recorder_ref"])
-        ) or 0,
+        ) or (),
     )
     assert project_deferred_custody_for_target(
         db_session, target,
@@ -299,8 +299,8 @@ def test_candidate_custody_waits_across_windows_without_fencing_current(
     projected = []
     monkeypatch.setattr(
         custody_events,
-        "project_transfer_custody_events_for_recorder",
-        lambda _db, **kwargs: projected.append(kwargs["recorder_ref"]) or 0,
+        "build_transfer_custody_event_specs_for_recorder",
+        lambda _db, **kwargs: projected.append(kwargs["recorder_ref"]) or (),
     )
     project_deferred_custody_for_target(db_session, second_target)
     assert projected == ["candidate-window-1", "candidate-window-2"]

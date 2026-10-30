@@ -22,11 +22,16 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.purchase_control_projection import validate_purchase_control_journal_row
 from app.services.production_control_journal_projection import (
+    rebase_production_payload_for_accepted_mutations,
     validate_candidate_payload as validate_production_journal_payload,
 )
+from app.services.accepted_command_mutation import accepted_mutation_tail
 from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
-    publish_current_material_custody,
+    PreparedCurrentMaterialCustodyBasisConflict,
+    install_prepared_current_material_custody,
+    material_custody_state_from_values,
+    prepare_current_material_custody,
     require_published_current_material_custody,
     validate_material_custody_projection,
 )
@@ -47,6 +52,20 @@ from app.services.item_ledger.r3_contract import (
     record_successor,
     retire_live_pointer,
     set_live_pointer,
+)
+from app.services.item_ledger.reservation_current import (
+    PreparedCurrentReservations,
+    PreparedCurrentReservationsBasisConflict,
+    install_prepared_current_reservations,
+    prepare_current_reservations,
+    prepared_reservation_views_with_execution,
+    retire_prepared_closed_owner_allocations,
+)
+from app.services.item_ledger.current_replenishment import (
+    PreparedAcceptedGenerationReplenishment,
+    PreparedCurrentReplenishmentBasisConflict,
+    install_prepared_accepted_generation_replenishment,
+    prepare_current_replenishment_for_accepted_generation,
 )
 
 
@@ -454,9 +473,17 @@ def _source_export_links_exist(db: Session, candidate_ids: list[int]) -> bool:
 def _require_refresh_lineage(
     db: Session, parent_generation_id: int, target_generation_id: int
 ) -> tuple[models.PlanningTruthState, models.LedgerGeneration, models.LedgerGeneration]:
-    pointer = _lock(db.query(models.PlanningTruthState)).filter_by(id=1).one_or_none()
-    parent = _lock(db.query(models.LedgerGeneration)).filter_by(id=int(parent_generation_id)).one_or_none()
-    target = _lock(db.query(models.LedgerGeneration)).filter_by(id=int(target_generation_id)).one_or_none()
+    # Do not hold the accepted pointer through the heavy publication build.
+    # Commands keep mutating the old committed owner; the final shared
+    # publish_generation CAS locks and rejects an epoch that was not rebased.
+    pointer = (
+        db.query(models.PlanningTruthState)
+        .filter_by(id=1)
+        .populate_existing()
+        .one_or_none()
+    )
+    parent = db.query(models.LedgerGeneration).filter_by(id=int(parent_generation_id)).populate_existing().one_or_none()
+    target = db.query(models.LedgerGeneration).filter_by(id=int(target_generation_id)).populate_existing().one_or_none()
     if pointer is None or parent is None or target is None:
         raise ObligationRefreshPublishError("planning truth pointer or generation is missing")
     if str(parent.status) != "accepted":
@@ -891,6 +918,8 @@ def publish_obligation_refresh_batch(
     production_payload: Mapping[str, Any] | None = None,
     mrp_payloads: Mapping[str, Any] | None = None,
     period_payloads: Mapping[str, Any] | None = None,
+    prepared_current_reservations: PreparedCurrentReservations | None = None,
+    prepared_current_replenishment: PreparedAcceptedGenerationReplenishment | None = None,
 ) -> ObligationRefreshPublishResult:
     """Publish every active source plan together, using only ``flush``.
 
@@ -923,9 +952,14 @@ def publish_obligation_refresh_batch(
 
     # Read the locked terminal state first: _require_refresh_lineage intentionally
     # admits BUILDING only, while an exact completed retry is a no-op.
-    retry_pointer = _lock(db.query(models.PlanningTruthState)).filter_by(id=1).one_or_none()
-    retry_parent = _lock(db.query(models.LedgerGeneration)).filter_by(id=int(parent_generation_id)).one_or_none()
-    retry_target = _lock(db.query(models.LedgerGeneration)).filter_by(id=int(target_generation_id)).one_or_none()
+    retry_pointer = (
+        db.query(models.PlanningTruthState)
+        .filter_by(id=1)
+        .populate_existing()
+        .one_or_none()
+    )
+    retry_parent = db.query(models.LedgerGeneration).filter_by(id=int(parent_generation_id)).populate_existing().one_or_none()
+    retry_target = db.query(models.LedgerGeneration).filter_by(id=int(target_generation_id)).populate_existing().one_or_none()
     if retry_pointer is None or retry_parent is None or retry_target is None:
         raise ObligationRefreshPublishError("planning truth pointer or generation is missing")
     if str(retry_target.status) == "accepted" or int(retry_pointer.current_generation_id or -1) == int(retry_target.id):
@@ -945,16 +979,16 @@ def publish_obligation_refresh_batch(
     except ObligationRefreshManifestError as exc:
         raise ObligationRefreshPublishError(str(exc)) from exc
     parents = [
-        _lock(db.query(models.PlanningRun)).filter_by(run_id=int(row.run_id)).one()
+        db.query(models.PlanningRun).filter_by(run_id=int(row.run_id)).populate_existing().one()
         for row in current_parents
     ]
     if any(row.source_plan_id is None for row in parents):
         raise ObligationRefreshPublishError("active parent snapshot lacks source plan lineage")
 
-    candidates = _lock(db.query(models.PlanningRun)).filter(
+    candidates = db.query(models.PlanningRun).filter(
         models.PlanningRun.ledger_generation_id == int(target.id),
         models.PlanningRun.status == "BUILDING_SNAPSHOT",
-    ).all()
+    ).populate_existing().all()
     additions, replacements, retained, retired = _require_manifest(
         db, target=target, parents=parents, candidates=candidates,
         candidate_status="BUILDING_SNAPSHOT",
@@ -971,6 +1005,59 @@ def publish_obligation_refresh_batch(
         ],
         capabilities=capability_snapshot,
     )
+    if prepared_current_reservations is None:
+        prepared_current_reservations = prepare_current_reservations(
+            db,
+            generation_id=int(target.id),
+            retire_run_ids=tuple(int(row.run_id) for row in retired),
+        )
+    if prepared_current_replenishment is None:
+        from app.services.item_ledger.current_replenishment import (
+            prepare_current_replenishment_for_accepted_generation,
+        )
+        prepared_current_replenishment = prepare_current_replenishment_for_accepted_generation(
+            db, generation_id=int(target.id), allow_building=True,
+            target_reservation_rows=prepared_current_reservations.target_reservations,
+        )
+    merged_reservation_views = prepared_reservation_views_with_execution(
+        prepared_current_reservations,
+        prepared_current_replenishment.target_reservations,
+    )
+
+    def refresh_prepared_reservation_views() -> None:
+        """Rebase R11/R4 from the latest accepted command state, without DML."""
+        nonlocal prepared_current_reservations
+        nonlocal prepared_current_replenishment
+        nonlocal merged_reservation_views
+        retire_run_ids = prepared_current_reservations.retire_run_ids
+        restore_status = str(target.status)
+        if restore_status == "accepted":
+            target.status = "building"
+            db.flush()
+        try:
+            prepared_current_reservations = prepare_current_reservations(
+                db,
+                generation_id=int(target.id),
+                retire_run_ids=retire_run_ids,
+            )
+            prepared_current_replenishment = (
+                prepare_current_replenishment_for_accepted_generation(
+                    db,
+                    generation_id=int(target.id),
+                    allow_building=True,
+                    target_reservation_rows=(
+                        prepared_current_reservations.target_reservations
+                    ),
+                )
+            )
+        finally:
+            if restore_status == "accepted":
+                target.status = "accepted"
+                db.flush()
+        merged_reservation_views = prepared_reservation_views_with_execution(
+            prepared_current_reservations,
+            prepared_current_replenishment.target_reservations,
+        )
     from .item_ledger.current_execution import _require_period_current_payloads
     direct_period_payloads = _require_period_current_payloads(
         period_payloads,
@@ -1010,6 +1097,93 @@ def publish_obligation_refresh_batch(
             raise ObligationRefreshPublishError("purchase control journal row violates Ledger fact contract")
         seen_supply_rows.add(key)
     direct_production_payload = production_payload
+    def rebuild_target_production_payload(
+        affected_item_ids: Iterable[int],
+    ) -> Mapping[str, Any]:
+        from .item_ledger.current_execution import (
+            build_compact_current_assembly_payload,
+        )
+        from .item_ledger.drum_schedule_persistence import (
+            build_compact_current_drum_payload,
+        )
+        from .item_ledger.shelf_projection_persistence import (
+            build_compact_current_shelf_payload,
+        )
+        from .production_control_journal_projection import (
+            build_compact_current_production_control_payload,
+        )
+        custody_change = prepare_current_material_custody(
+            db, ledger_generation_id=int(target.id),
+        )
+        custody_state = material_custody_state_from_values({
+            key: float(qty) for key, qty in custody_change.desired_rows
+        })
+        restore_status = str(target.status or "")
+        if restore_status == "accepted":
+            target.status = "building"
+            db.flush()
+        assembly = build_compact_current_assembly_payload(
+            db, target_generation_id=int(target.id),
+            parent_generation_id=int(parent.id), affected_physical_keys=(),
+        )
+        drum = build_compact_current_drum_payload(
+            db, target_generation_id=int(target.id),
+            parent_generation_id=int(parent.id), assembly_payload=assembly,
+        )
+        shelf = build_compact_current_shelf_payload(
+            db, target_generation_id=int(target.id),
+            parent_generation_id=int(parent.id), drum_payload=drum,
+        )
+        live_run_ids = tuple(sorted({
+            int(row.run_id) for row in [
+                *additions, *replacements, *retained,
+            ]
+        }))
+        result = build_compact_current_production_control_payload(
+            db, target_generation_id=int(target.id),
+            parent_generation_id=int(parent.id), assembly_payload=assembly,
+            drum_payload=drum, shelf_payload=shelf,
+            accepted_run_ids=live_run_ids,
+            affected_item_ids=tuple(sorted({int(value) for value in affected_item_ids})),
+            use_target_material_context=True,
+            custody_override=custody_state,
+            reservation_views_override=merged_reservation_views,
+        )
+        if restore_status == "accepted":
+            target.status = "accepted"
+            db.flush()
+        return result
+    marks = dict(target.source_watermarks or {})
+    captured_epoch = int(marks.get("accepted_production_mutation_epoch", -1))
+    if captured_epoch < 0:
+        raise ObligationRefreshPublishError(
+            "obligation refresh lacks accepted mutation basis"
+        )
+    mutation_tail = accepted_mutation_tail(db, after_epoch=captured_epoch)
+    if mutation_tail.through_epoch != captured_epoch:
+        if mutation_tail.full_scope:
+            raise ObligationRefreshPublishError(
+                "full production dependency changed during obligation build"
+            )
+        try:
+            refresh_prepared_reservation_views()
+            target_rebase_payload = rebuild_target_production_payload(
+                mutation_tail.item_ids,
+            )
+            direct_production_payload = rebase_production_payload_for_accepted_mutations(
+                db,
+                direct_production_payload,
+                parent_generation_id=int(parent.id),
+                product_ids=mutation_tail.product_ids,
+                business_identities=mutation_tail.business_identities,
+                target_payload=target_rebase_payload,
+            )
+        except RuntimeError as exc:
+            raise ObligationRefreshPublishError(str(exc)) from exc
+        marks["accepted_production_mutation_epoch"] = int(
+            mutation_tail.through_epoch
+        )
+        target.source_watermarks = marks
     try:
         validate_material_custody_projection(
             db, ledger_generation_id=int(target.id)
@@ -1119,34 +1293,17 @@ def publish_obligation_refresh_batch(
     publish_current_execution_from_generation(
         db, generation_id=int(target.id)
     )
-    # One current custody owner, promoted by every publication that moves the
-    # pointer - the same function and the same place relative to the current
-    # execution scopes as ``accept_generation_build``.  Without it the target
-    # built its custody rows and left them non-current, so the compact owner
-    # stayed at the physical generation that last promoted it and the next
-    # bounded physical refresh was refused ("compact current custody
-    # provenance is stale or ambiguous").
-    try:
-        publish_current_material_custody(
-            db, ledger_generation_id=int(target.id)
-        )
-        require_published_current_material_custody(
-            db, ledger_generation_id=int(target.id)
-        )
-    except MaterialCustodySnapshotUnavailable as exc:
-        raise ObligationRefreshPublishError(
-            f"custody current publication failed: {exc}"
-        ) from exc
     # Custody publication must still see the previous accepted owner: its
     # post-cutoff local holds are carried into the successor's compact cells.
     # Moving the pointer first makes that owner look like the target itself
     # and silently drops the live tail. All contours switch in this transaction.
-    move_pointer_to_generation(db, pointer, target)
     # Future supply is captured as immutable generation evidence but exposed
     # through one compact current projection, alongside the truth-pointer
     # switch.  No reader should select a historical generation copy.
     try:
-        publish_current_future_supply(db, int(target.id))
+        publish_current_future_supply(
+            db, int(target.id), expected_parent_id=int(parent.id),
+        )
     except FutureSupplyCaptureError as exc:
         raise ObligationRefreshPublishError(
             f"future supply current publication failed: {exc}"
@@ -1170,14 +1327,18 @@ def publish_obligation_refresh_batch(
     )
     # Current user-facing obligation/result views are promoted from the
     # validated direct payloads; no historical read-model rows cross publication.
-    from .item_ledger.current_execution import publish_current_obligation_views_from_generation
-    publish_current_obligation_views_from_generation(
+    from .item_ledger.current_execution import (
+        prepare_current_obligation_views_from_generation,
+        install_prepared_current_obligation_views,
+    )
+    prepared_obligation_views = prepare_current_obligation_views_from_generation(
         db,
         int(target.id),
         purchase_payload=journal_payload,
         production_payload=direct_production_payload,
         mrp_payloads=direct_mrp_payloads,
         period_payloads=direct_period_payloads,
+        publish_production=False,
     )
     # The accepted current owner is fully published before retired projection
     # copies are removed.  Cleanup is in this same transaction and therefore
@@ -1185,7 +1346,175 @@ def publish_obligation_refresh_batch(
     from .item_ledger.execution_projection_retention import (
         prune_retired_execution_projections,
     )
-    prune_retired_execution_projections(db, int(target.id))
+    prune_retired_execution_projections(
+        db, int(target.id), expected_parent_id=int(parent.id),
+    )
+    # Commands may commit while the prebuilt owners above are installed. Catch
+    # their compact tail outside the final pointer lock; bounded retries avoid
+    # starving publication under ordinary operator traffic.
+    for _catchup in range(3):
+        caught_epoch = int(
+            (target.source_watermarks or {}).get(
+                "accepted_production_mutation_epoch", -1,
+            )
+        )
+        late_tail = accepted_mutation_tail(db, after_epoch=caught_epoch)
+        if late_tail.through_epoch == caught_epoch:
+            break
+        if late_tail.full_scope:
+            raise ObligationRefreshPublishError(
+                "full production dependency changed during final catch-up"
+            )
+        refresh_prepared_reservation_views()
+        target_rebase_payload = rebuild_target_production_payload(
+            late_tail.item_ids,
+        )
+        direct_production_payload = rebase_production_payload_for_accepted_mutations(
+            db, direct_production_payload,
+            parent_generation_id=int(parent.id),
+            product_ids=late_tail.product_ids,
+            business_identities=late_tail.business_identities,
+            target_payload=target_rebase_payload,
+        )
+        target.source_watermarks = {
+            **dict(target.source_watermarks or {}),
+            "accepted_production_mutation_epoch": int(late_tail.through_epoch),
+        }
+        prepared_obligation_views = prepare_current_obligation_views_from_generation(
+            db,
+            int(target.id),
+            purchase_payload=journal_payload,
+            production_payload=direct_production_payload,
+            mrp_payloads=direct_mrp_payloads,
+            period_payloads=direct_period_payloads,
+            publish_production=False,
+        )
+    else:
+        raise ObligationRefreshPublishError(
+            "accepted commands outran bounded final catch-up"
+        )
+    # Every heavy builder/current-owner write is complete.  Hold the accepted
+    # pointer only for the final CAS and pointer-last handoff.
+    from .accepted_command_mutation import (
+        consume_locked_publication_epoch,
+        lock_publication_epoch,
+    )
+    from .item_ledger.current_execution import (
+        CurrentExecutionPreparedBasisConflict,
+        install_prepared_current_execution_scope,
+        prepare_current_production_control_from_payload,
+    )
+    prepared_production = prepare_current_production_control_from_payload(
+        db, int(target.id), direct_production_payload,
+    )
+    prepared_custody = prepare_current_material_custody(
+        db, ledger_generation_id=int(target.id),
+    )
+    pointer = None
+    for _final_attempt in range(3):
+        savepoint = db.begin_nested()
+        try:
+            pointer, mutation_state, publication_epoch = lock_publication_epoch(
+                db, generation=target, expected_parent_id=int(parent.id),
+            )
+        except RuntimeError as exc:
+            savepoint.rollback()
+            db.expire_all()
+            pointer_now = db.get(models.PlanningTruthState, 1)
+            if int(pointer_now.current_generation_id or 0) != int(parent.id):
+                raise ObligationRefreshPublishError(
+                    "obligation refresh parent is no longer current"
+                ) from exc
+            target = db.get(models.LedgerGeneration, int(target_generation_id))
+            caught_epoch = int(
+                (target.source_watermarks or {}).get(
+                    "accepted_production_mutation_epoch", -1,
+                )
+            )
+            late_tail = accepted_mutation_tail(db, after_epoch=caught_epoch)
+            if late_tail.full_scope:
+                raise ObligationRefreshPublishError(
+                    "full production dependency changed during final retry"
+                ) from exc
+            if late_tail.through_epoch == caught_epoch:
+                raise ObligationRefreshPublishError(str(exc)) from exc
+            refresh_prepared_reservation_views()
+            target_rebase_payload = rebuild_target_production_payload(
+                late_tail.item_ids,
+            )
+            direct_production_payload = rebase_production_payload_for_accepted_mutations(
+                db, direct_production_payload,
+                parent_generation_id=int(parent.id),
+                product_ids=late_tail.product_ids,
+                business_identities=late_tail.business_identities,
+                target_payload=target_rebase_payload,
+            )
+            target.source_watermarks = {
+                **dict(target.source_watermarks or {}),
+                "accepted_production_mutation_epoch": int(late_tail.through_epoch),
+            }
+            prepared_obligation_views = prepare_current_obligation_views_from_generation(
+                db, int(target.id), purchase_payload=journal_payload,
+                production_payload=direct_production_payload,
+                mrp_payloads=direct_mrp_payloads,
+                period_payloads=direct_period_payloads,
+                publish_production=False,
+            )
+            prepared_production = prepare_current_production_control_from_payload(
+                db, int(target.id), direct_production_payload,
+            )
+            prepared_custody = prepare_current_material_custody(
+                db, ledger_generation_id=int(target.id),
+            )
+            continue
+        try:
+            target.status = "building"
+            db.flush()
+            installed_reservations = install_prepared_current_reservations(
+                db, prepared_current_reservations,
+                retire_closed_allocations=False,
+            )
+            install_prepared_accepted_generation_replenishment(
+                db, prepared_current_replenishment,
+                reservation_owner_ids=installed_reservations.owner_id_by_identity,
+                closed_reservation_identities=installed_reservations.closed_identities,
+            )
+            retire_prepared_closed_owner_allocations(
+                db, generation_id=int(target.id),
+            )
+            target.status = "accepted"
+            db.flush()
+            install_prepared_current_material_custody(db, prepared_custody)
+            require_published_current_material_custody(
+                db, ledger_generation_id=int(target.id)
+            )
+            install_prepared_current_execution_scope(db, prepared_production)
+            install_prepared_current_obligation_views(
+                db, prepared_obligation_views,
+            )
+        except (
+            CurrentExecutionPreparedBasisConflict,
+            PreparedCurrentMaterialCustodyBasisConflict,
+            PreparedCurrentReservationsBasisConflict,
+            PreparedCurrentReplenishmentBasisConflict,
+        ) as exc:
+            savepoint.rollback()
+            db.expire_all()
+            continue
+        except MaterialCustodySnapshotUnavailable as exc:
+            raise ObligationRefreshPublishError(
+                f"custody current publication failed: {exc}"
+            ) from exc
+        move_pointer_to_generation(db, pointer, target)
+        consume_locked_publication_epoch(
+            db, state=mutation_state, through_epoch=publication_epoch,
+        )
+        savepoint.commit()
+        break
+    else:
+        raise ObligationRefreshPublishError(
+            "accepted commands outran final publication retries"
+        )
     try:
         db.flush()
     except IntegrityError as exc:

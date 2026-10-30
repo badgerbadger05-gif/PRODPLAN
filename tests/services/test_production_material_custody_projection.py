@@ -40,6 +40,7 @@ from app.services.production_material_custody_projection import (
     require_published_current_material_custody,
 )
 from app.services.planning_truth import publish_generation
+from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
 from app.services.production_material_custody_events import append_material_issue_custody_event
 from app.services.item_ledger.current_execution import (
     get_current_execution_scope,
@@ -174,14 +175,20 @@ def _generation(db, *, key: str, cutoff: datetime) -> LedgerGeneration:
         status="completed",
         cutoff=cutoff,
         completed_at=cutoff,
-        source_watermarks={"explicit_empty_prefix": True},
+        source_watermarks={
+            "explicit_empty_prefix": True,
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+        },
     )
     generation = LedgerGeneration(
         generation_key=key,
         status="accepted",
         cutoff=cutoff,
         accepted_at=cutoff,
-        source_watermarks={"explicit_empty_prefix": True},
+        source_watermarks={
+            "explicit_empty_prefix": True,
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+        },
         capabilities={
             "physical_ledger": True,
             "reservation_replay": True,
@@ -216,7 +223,10 @@ def _building_generation(
         generation_key=key,
         status="building",
         cutoff=cutoff,
-        source_watermarks={"parent_generation_id": int(parent.id)},
+        source_watermarks={
+            "parent_generation_id": int(parent.id),
+            "accepted_production_mutation_epoch": capture_accepted_mutation_epoch(db),
+        },
         capabilities=dict(parent.capabilities or {}),
         physical_import_batch=batch,
         algorithm_version="test",

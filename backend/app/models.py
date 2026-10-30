@@ -2967,6 +2967,37 @@ class CurrentExecutionScope(Base):
     source_generation = relationship("LedgerGeneration")
 
 
+class AcceptedProductionMutationState(Base):
+    """Compact monotonic coordination watermark for accepted commands."""
+
+    __tablename__ = "accepted_production_mutation_state"
+
+    id = Column(Integer, primary_key=True)
+    last_issued_epoch = Column(BigInteger, nullable=False, default=0, server_default="0")
+    last_consumed_epoch = Column(BigInteger, nullable=False, default=0, server_default="0")
+    updated_at = Column(TIMESTAMP, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class AcceptedProductionMutation(Base):
+    """Compactable affected-scope metadata; never a quantity owner."""
+
+    __tablename__ = "accepted_production_mutation"
+    __table_args__ = (
+        Index("ix_accepted_production_mutation_generation_epoch", "accepted_generation_id", "epoch"),
+    )
+
+    epoch = Column(BigInteger, primary_key=True)
+    accepted_generation_id = Column(
+        BigInteger, ForeignKey("ledger_generation.id", ondelete="RESTRICT"), nullable=False,
+    )
+    mutation_kind = Column(String(64), nullable=False)
+    product_ids = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    item_ids = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    business_identities = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    full_scope = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+
+
 class CurrentExecutionChange(Base):
     """Bounded append-only audit of real current execution changes only."""
 

@@ -30,13 +30,30 @@ from app.services.item_ledger.current_execution import (
     get_current_execution_scope,
     publish_current_execution_scope,
     publish_current_obligation_views_from_generation,
+    prepare_current_obligation_views_from_generation,
+    install_prepared_current_obligation_views,
+    prepare_compact_current_execution_views,
+    install_prepared_compact_current_execution_views,
+    prepare_current_production_control_from_payload,
+    install_prepared_current_execution_scope,
+    CurrentExecutionPreparedBasisConflict,
     resolve_compact_queue_owner_ids,
 )
 from app.services.item_ledger.current_replenishment import (
     BoundedBuyReceiptDeltaManifest,
-    apply_current_replenishment_for_bounded_buy_scopes,
-    apply_current_replenishment_for_bounded_make_scopes,
+    PreparedCurrentReplenishmentBasisConflict,
+    prepare_current_replenishment_for_bounded_buy_scopes,
+    install_prepared_bounded_buy_replenishment,
+    prepare_current_replenishment_for_bounded_make_scopes,
+    install_prepared_bounded_make_replenishment,
     require_facts_not_over_allocated,
+)
+from app.services.item_ledger.reservation_current import (
+    PreparedCurrentReservationsBasisConflict,
+    install_prepared_current_reservations,
+    prepare_current_reservations,
+    prepared_reservation_views_with_execution,
+    retire_prepared_closed_owner_allocations,
 )
 from app.services.item_ledger.document_net_output import NETTED_MOVEMENT_KINDS
 from app.services.item_ledger.drum_schedule_persistence import (
@@ -52,7 +69,7 @@ from app.services.item_ledger.future_supply_capture import (
 from app.services.item_ledger.live_plan_scope import sealed_lineage_read_batch
 from app.services.item_ledger.physical_refresh_provenance import (
     apply_bounded_current_material_custody_events,
-    handoff_current_physical_refresh_provenance,
+    install_verified_material_custody_handoff,
 )
 from app.services.item_ledger.supplier_future_supply import (
     SupplierFutureSupplyDelta,
@@ -82,19 +99,38 @@ from app.services.item_ledger.physical_refresh_supplier_evidence import (
     qualify_standalone_supplier_repair_rows,
 )
 from app.services.mrp_result_projection import build_mrp_result_current_payload
-from app.services.planning_truth import publication_context, publish_generation
+from app.services.planning_truth import (
+    _serialize_publication,
+    publication_context,
+    publish_generation,
+)
 from app.services.item_ledger.shelf_projection_persistence import (
     build_compact_current_shelf_payload,
 )
 from app.services.production_control_journal_projection import (
     build_compact_current_production_control_payload,
+    rebase_production_payload_for_accepted_mutations,
+)
+from app.services.accepted_command_mutation import (
+    accepted_mutation_tail,
+    lock_publication_epoch,
 )
 from app.services.purchase_control_projection import (
     build_compact_current_purchase_control_payload,
 )
 from app.services.production_material_custody_projection import (
-    lock_current_custody_marker,
+    build_terminal_custody_event_specs,
+    fold_candidate_custody_event_specs,
+    install_precomputed_current_material_custody,
+    material_custody_state_from_values,
 )
+from app.services.production_material_custody_events import (
+    build_transfer_custody_event_specs_for_recorder,
+    candidate_custody_spec_from_payload,
+    materialize_candidate_custody_event_specs,
+)
+from app.services.item_ledger.ingest import DEFERRED_CUSTODY_SPECS_KEY
+from app.services.item_ledger.physical_visibility import visible_sle_query
 
 
 class ForwardPhysicalRefreshUnavailable(RuntimeError):
@@ -1602,10 +1638,6 @@ def _publish_forward_physical_refresh_current(
     a late payload or pointer validation failure, is left to the caller's
     rollback boundary and therefore restores every current owner it touched.
     """
-    # Custody writers allocate append-only event ids under this marker. Hold
-    # it for the caller-owned publication transaction so a concurrent local
-    # event cannot appear between the bounded fold and compact payload reads.
-    lock_current_custody_marker(db)
     target = db.get(models.LedgerGeneration, int(target_generation_id))
     parent = db.get(models.LedgerGeneration, int(parent_generation_id))
     pointer = db.get(models.PlanningTruthState, 1)
@@ -1621,6 +1653,20 @@ def _publish_forward_physical_refresh_current(
         or _comparable(target.cutoff) < _comparable(parent.cutoff)
     ):
         raise ForwardPhysicalRefreshUnavailable("physical refresh generation boundary is invalid")
+    raw_candidate_specs = list(
+        (target.source_watermarks or {}).get(DEFERRED_CUSTODY_SPECS_KEY) or ()
+    )
+    try:
+        candidate_custody_specs = tuple(
+            candidate_custody_spec_from_payload(value)
+            for value in raw_candidate_specs
+        )
+    except ValueError as exc:
+        raise ForwardPhysicalRefreshUnavailable(str(exc)) from exc
+    candidate_spec_sle_ids = tuple(
+        int(spec.source_sle_id)
+        for spec in candidate_custody_specs if spec.source_sle_id is not None
+    )
 
     def start_phase(name: str) -> None:
         if _phase_tracker is not None:
@@ -1733,29 +1779,114 @@ def _publish_forward_physical_refresh_current(
     if _phase_tracker is not None:
         _phase_tracker.complete("validation")
         _phase_tracker.begin("custody")
-    # Transfer custody events can be discovered while ingesting an exact
-    # recorder re-pull. Fold the proven tail and canonical terminal releases
-    # before any compact payload reader runs; foreign tails remain fail-closed.
+    parent_custody_manifest = db.get(
+        models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
+    )
+    if parent_custody_manifest is None or str(parent_custody_manifest.status) != "complete":
+        raise ForwardPhysicalRefreshUnavailable("accepted custody manifest is unavailable")
     custody_watermark_before = int(
-        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0))
-        .scalar()
-        or 0
+        parent_custody_manifest.source_event_high_watermark_id or 0
     )
-    custody_event_rows = apply_bounded_current_material_custody_events(
+    physical_custody_ids = tuple(dict.fromkeys(
+        tuple(int(row.id) for row in rows)
+        + tuple(int(row.id) for row in basis_rows)
+        + custody_source_ids
+        + candidate_spec_sle_ids
+    ))
+    persisted_candidate_events = (
+        db.query(models.ProductionMaterialCustodyEvent)
+        .filter(models.ProductionMaterialCustodyEvent.id > custody_watermark_before)
+        .filter(models.ProductionMaterialCustodyEvent.source_sle_id.in_(physical_custody_ids))
+        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
+        .all()
+        if physical_custody_ids else []
+    )
+    prefix_physical_events = (
+        db.query(models.ProductionMaterialCustodyEvent)
+        .filter(models.ProductionMaterialCustodyEvent.id <= custody_watermark_before)
+        .filter(models.ProductionMaterialCustodyEvent.source_sle_id.in_(physical_custody_ids))
+        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
+        .all()
+        if physical_custody_ids else []
+    )
+    prefix_source_ids = {
+        int(event.source_sle_id) for event in prefix_physical_events
+        if event.source_sle_id is not None
+    }
+    target_visible_prefix_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=int(target.physical_import_batch_id),
+            cutoff=target.cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(prefix_source_ids)).all()
+    } if prefix_source_ids else set()
+    parent_visible_prefix_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=int(parent.physical_import_batch_id),
+            cutoff=parent.cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(prefix_source_ids)).all()
+    } if prefix_source_ids else set()
+    newly_visible_prefix_ids = target_visible_prefix_ids - parent_visible_prefix_ids
+    newly_visible_persisted_event_ids = {
+        int(event.id) for event in prefix_physical_events
+        if int(event.source_sle_id or 0) in newly_visible_prefix_ids
+    }
+    persisted_candidate_events.extend(
+        event for event in prefix_physical_events
+        if int(event.id) in newly_visible_persisted_event_ids
+    )
+    baseline_custody_rows = {
+        (
+            int(row.product_id), int(row.component_item_id),
+            str(row.location_kind), str(row.warehouse_ref1c or ""),
+        ): float(row.reserved_qty)
+        for row in db.query(models.ProductionMaterialCustodyProjection).filter(
+            models.ProductionMaterialCustodyProjection.is_current.is_(True)
+        ).all()
+    }
+    candidate_custody_rows = fold_candidate_custody_event_specs(
         db,
-        parent_generation_id=int(parent.id),
-        target_generation_id=int(target.id),
-        source_sle_ids=tuple(dict.fromkeys(
-            tuple(int(row.id) for row in rows)
-            + tuple(int(row.id) for row in basis_rows)
-            + custody_source_ids
-        )),
+        generation=target,
+        baseline_generation_id=int(parent.id),
+        baseline_high_watermark_id=custody_watermark_before,
+        baseline_cutoff=parent.cutoff,
+        baseline_rows=baseline_custody_rows,
+        candidate_events=tuple(persisted_candidate_events) + candidate_custody_specs,
     )
-    custody_watermark_after = int(
-        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0))
-        .scalar()
-        or 0
+    terminal_specs = tuple(
+        replace(
+            spec,
+            virtual_ordinal=len(candidate_custody_specs) + ordinal,
+        )
+        for ordinal, spec in enumerate(
+            build_terminal_custody_event_specs(
+                db, generation=target, cells=candidate_custody_rows,
+            ),
+            start=1,
+        )
     )
+    if terminal_specs:
+        candidate_custody_rows = fold_candidate_custody_event_specs(
+            db,
+            generation=target,
+            baseline_generation_id=int(parent.id),
+            baseline_high_watermark_id=custody_watermark_before,
+            baseline_cutoff=parent.cutoff,
+            baseline_rows=baseline_custody_rows,
+            candidate_events=(
+                tuple(persisted_candidate_events)
+                + candidate_custody_specs
+                + terminal_specs
+            ),
+        )
+    candidate_custody_state = material_custody_state_from_values(
+        candidate_custody_rows
+    )
+    custody_event_rows = (
+        len(persisted_candidate_events)
+        + len(candidate_custody_specs)
+        + len(terminal_specs)
+    )
+    custody_watermark_after = custody_watermark_before
     if _phase_tracker is not None:
         _phase_tracker.complete("custody")
         _phase_tracker.begin("scope")
@@ -1794,10 +1925,13 @@ def _publish_forward_physical_refresh_current(
 
     make_scopes = tuple(scope for scope in scopes if scope[4] == "make")
     buy_scopes = tuple(scope for scope in scopes if scope[4] == "buy")
-    make_result = None
+    prepared_current_reservations = prepare_current_reservations(
+        db, generation_id=int(target.id), retire_run_ids=(),
+    )
+    prepared_make = None
     start_phase("make")
     if make_scopes:
-        make_result = apply_current_replenishment_for_bounded_make_scopes(
+        prepared_make = prepare_current_replenishment_for_bounded_make_scopes(
             db,
             target_generation_id=int(target.id),
             parent_generation_id=int(parent.id),
@@ -1829,7 +1963,7 @@ def _publish_forward_physical_refresh_current(
         current_owners=current_owners,
     )
     buy_manifest = BoundedBuyReceiptDeltaManifest()
-    buy_result = None
+    prepared_buy = None
     if buy_scopes and (supplier_ids or superseded_supplier_ids or buy_edge_ids):
         start_phase("supplier_manifest")
         if phase_hook is not None:
@@ -1855,7 +1989,7 @@ def _publish_forward_physical_refresh_current(
                 ignored_stock_ledger_entries=buy_manifest.excluded_supplier_entries,
             )
         start_phase("buy")
-        buy_result = apply_current_replenishment_for_bounded_buy_scopes(
+        prepared_buy = prepare_current_replenishment_for_bounded_buy_scopes(
             db,
             target_generation_id=int(target.id),
             parent_generation_id=int(parent.id),
@@ -1867,6 +2001,71 @@ def _publish_forward_physical_refresh_current(
     else:
         start_phase("buy")
     phase("buy")
+    prepared_execution_views = tuple(
+        view
+        for prepared in (prepared_make, prepared_buy)
+        if prepared is not None
+        for change in prepared.changes
+        for view in change.target_reservations
+    )
+    target_reservation_views = prepared_reservation_views_with_execution(
+        prepared_current_reservations,
+        prepared_execution_views,
+    )
+    merged_reservation_views = target_reservation_views
+
+    def refresh_prepared_reservation_views() -> None:
+        """Rebase canonical R11/R4 plans after an accepted command tail."""
+        nonlocal prepared_current_reservations
+        nonlocal prepared_make
+        nonlocal prepared_buy
+        nonlocal merged_reservation_views
+        restore_status = str(target.status)
+        if restore_status == "accepted":
+            target.status = "building"
+            db.flush()
+        try:
+            prepared_current_reservations = prepare_current_reservations(
+                db, generation_id=int(target.id), retire_run_ids=(),
+            )
+            prepared_make = (
+                prepare_current_replenishment_for_bounded_make_scopes(
+                    db,
+                    target_generation_id=int(target.id),
+                    parent_generation_id=int(parent.id),
+                    target_cutoff=target.cutoff,
+                    affected_scopes=make_scopes,
+                )
+                if make_scopes else None
+            )
+            prepared_buy = (
+                prepare_current_replenishment_for_bounded_buy_scopes(
+                    db,
+                    target_generation_id=int(target.id),
+                    parent_generation_id=int(parent.id),
+                    target_cutoff=target.cutoff,
+                    affected_scopes=buy_scopes,
+                    delta_manifest=buy_manifest,
+                    planning_pool_by_warehouse=planning_pool_by_warehouse,
+                )
+                if buy_scopes and (
+                    supplier_ids or superseded_supplier_ids or buy_edge_ids
+                ) else None
+            )
+        finally:
+            if restore_status == "accepted":
+                target.status = "accepted"
+                db.flush()
+        execution_views = tuple(
+            view
+            for prepared in (prepared_make, prepared_buy)
+            if prepared is not None
+            for change in prepared.changes
+            for view in change.target_reservations
+        )
+        merged_reservation_views = prepared_reservation_views_with_execution(
+            prepared_current_reservations, execution_views,
+        )
     standalone_supplier_rows = _standalone_supplier_rows(
         rows,
         planning_pool_by_warehouse=planning_pool_by_warehouse,
@@ -1983,6 +2182,17 @@ def _publish_forward_physical_refresh_current(
         _phase_tracker.complete("shelf_payload")
     run_ids = _fixed_run_ids(db)
     start_phase("production_payload")
+    base_production_affected_item_ids = set(production_affected_item_ids(
+        db,
+        rows=scoped_rows,
+        stock_result=stock_result,
+        custody_source_sle_ids=tuple(dict.fromkeys(
+            tuple(int(row.id) for row in rows) + custody_source_ids
+        )),
+        custody_event_id_range=(
+            custody_watermark_before, custody_watermark_after,
+        ),
+    ))
     production_payload = build_compact_current_production_control_payload(
         db,
         target_generation_id=int(target.id),
@@ -1991,18 +2201,163 @@ def _publish_forward_physical_refresh_current(
         drum_payload=drum_payload,
         shelf_payload=shelf_payload,
         accepted_run_ids=run_ids,
-        affected_item_ids=production_affected_item_ids(
-            db,
-            rows=scoped_rows,
-            stock_result=stock_result,
-            custody_source_sle_ids=tuple(dict.fromkeys(
-                tuple(int(row.id) for row in rows) + custody_source_ids
-            )),
-            custody_event_id_range=(
-                custody_watermark_before, custody_watermark_after,
-            ),
-        ),
+        custody_override=candidate_custody_state,
+        use_target_material_context=True,
+        reservation_views_override=merged_reservation_views,
+        affected_item_ids=tuple(sorted(
+            base_production_affected_item_ids
+            | {int(spec.component_item_id) for spec in terminal_specs}
+        )),
     )
+    marks = dict(target.source_watermarks or {})
+    captured_epoch = int(marks.get("accepted_production_mutation_epoch", -1))
+    if captured_epoch < 0:
+        raise ForwardPhysicalRefreshUnavailable(
+            "physical refresh lacks accepted mutation basis"
+        )
+    mutation_tail = accepted_mutation_tail(db, after_epoch=captured_epoch)
+    if mutation_tail.through_epoch != captured_epoch:
+        if mutation_tail.full_scope:
+            raise ForwardPhysicalRefreshUnavailable(
+                "full production dependency changed during physical build"
+            )
+        if mutation_tail.product_ids or mutation_tail.item_ids:
+            recorder_refs = sorted({
+                str(spec.source_ref2c)
+                for spec in candidate_custody_specs
+                if spec.source_ref2c
+            })
+            regenerated_specs = []
+            for recorder_ref in recorder_refs:
+                recorder_rows = visible_sle_query(
+                    db,
+                    physical_import_batch_id=int(target.physical_import_batch_id),
+                    cutoff=target.cutoff,
+                ).filter(
+                    models.StockLedgerEntry.recorder_type
+                    == "Document_ПеремещениеЗапасов",
+                    models.StockLedgerEntry.recorder_ref == recorder_ref,
+                ).all()
+                regenerated_specs.extend(
+                    build_transfer_custody_event_specs_for_recorder(
+                        db,
+                        recorder_type="Document_ПеремещениеЗапасов",
+                        recorder_ref=recorder_ref,
+                        stock_ledger_entries=recorder_rows,
+                    )
+                )
+            candidate_custody_specs = tuple(
+                replace(spec, virtual_ordinal=ordinal)
+                for ordinal, spec in enumerate(sorted(
+                    regenerated_specs,
+                    key=lambda spec: (
+                        spec.effective_at,
+                        0 if spec.source_kind == "issue_created" else 1,
+                        str(spec.source_ref2c or ""),
+                        str(spec.physical_line_no or ""),
+                        spec.idempotency_key,
+                    ),
+                ), start=1)
+            )
+            latest_manifest = db.get(
+                models.ProductionMaterialCustodyProjectionManifest,
+                int(parent.id),
+            )
+            latest_hwm = int(latest_manifest.source_event_high_watermark_id or 0)
+            latest_rows = {
+                (
+                    int(row.product_id), int(row.component_item_id),
+                    str(row.location_kind), str(row.warehouse_ref1c or ""),
+                ): float(row.reserved_qty)
+                for row in db.query(models.ProductionMaterialCustodyProjection).filter(
+                    models.ProductionMaterialCustodyProjection.is_current.is_(True)
+                ).all()
+            }
+            candidate_custody_rows = fold_candidate_custody_event_specs(
+                db,
+                generation=target,
+                baseline_generation_id=int(parent.id),
+                baseline_high_watermark_id=latest_hwm,
+                baseline_cutoff=target.cutoff,
+                baseline_rows=latest_rows,
+                candidate_events=(
+                    tuple(event for event in persisted_candidate_events if int(event.id) > latest_hwm or int(event.id) in newly_visible_persisted_event_ids)
+                    + candidate_custody_specs
+                ),
+            )
+            terminal_specs = tuple(
+                replace(
+                    spec,
+                    virtual_ordinal=len(candidate_custody_specs) + ordinal,
+                )
+                for ordinal, spec in enumerate(
+                    build_terminal_custody_event_specs(
+                        db, generation=target, cells=candidate_custody_rows,
+                    ), start=1,
+                )
+            )
+            if terminal_specs:
+                candidate_custody_rows = fold_candidate_custody_event_specs(
+                    db,
+                    generation=target,
+                    baseline_generation_id=int(parent.id),
+                    baseline_high_watermark_id=latest_hwm,
+                    baseline_cutoff=target.cutoff,
+                    baseline_rows=latest_rows,
+                    candidate_events=(
+                        tuple(event for event in persisted_candidate_events if int(event.id) > latest_hwm or int(event.id) in newly_visible_persisted_event_ids)
+                        + candidate_custody_specs + terminal_specs
+                    ),
+                )
+            candidate_custody_state = material_custody_state_from_values(
+                candidate_custody_rows
+            )
+            production_payload = build_compact_current_production_control_payload(
+                db,
+                target_generation_id=int(target.id),
+                parent_generation_id=int(parent.id),
+                assembly_payload=assembly_payload,
+                drum_payload=drum_payload,
+                shelf_payload=shelf_payload,
+                accepted_run_ids=run_ids,
+                custody_override=candidate_custody_state,
+                use_target_material_context=True,
+                reservation_views_override=merged_reservation_views,
+                affected_item_ids=tuple(sorted(
+                    base_production_affected_item_ids
+                    | set(mutation_tail.item_ids)
+                    | {int(spec.component_item_id) for spec in terminal_specs}
+                )),
+            )
+        try:
+            target_rebase_payload = build_compact_current_production_control_payload(
+                db, target_generation_id=int(target.id),
+                parent_generation_id=int(parent.id),
+                assembly_payload=assembly_payload, drum_payload=drum_payload,
+                shelf_payload=shelf_payload, accepted_run_ids=run_ids,
+                custody_override=candidate_custody_state,
+                use_target_material_context=True,
+                reservation_views_override=merged_reservation_views,
+                affected_item_ids=tuple(sorted(
+                    base_production_affected_item_ids
+                    | set(mutation_tail.item_ids)
+                    | {int(spec.component_item_id) for spec in terminal_specs}
+                )),
+            )
+            production_payload = rebase_production_payload_for_accepted_mutations(
+                db,
+                production_payload,
+                parent_generation_id=int(parent.id),
+                product_ids=mutation_tail.product_ids,
+                business_identities=mutation_tail.business_identities,
+                target_payload=target_rebase_payload,
+            )
+        except RuntimeError as exc:
+            raise ForwardPhysicalRefreshUnavailable(str(exc)) from exc
+        marks["accepted_production_mutation_epoch"] = int(
+            mutation_tail.through_epoch
+        )
+        target.source_watermarks = marks
     if _phase_tracker is not None:
         _phase_tracker.complete("production_payload")
     start_phase("purchase_payload")
@@ -2041,9 +2396,23 @@ def _publish_forward_physical_refresh_current(
     replayed_rows = (
         len(scoped_rows)
         + int(custody_event_rows)
-        + int(getattr(make_result, "fact_rows", 0) or 0)
-        + int(getattr(buy_result, "replayed_rows", 0) or 0)
+        + int(getattr(prepared_make, "scope_history_rows", 0) or 0)
+        + int(getattr(prepared_buy, "scope_replay_rows", 0) or 0)
         + int(getattr(output, "metrics", {}).get("replayed_fact_rows", 0) or 0)
+    )
+    # Acceptance status is unpublished staging until the pointer-last CAS.
+    # Mark it now so canonical current-scope preparation can validate source
+    # provenance outside the final pointer lock.
+    target.status = "accepted"
+    target.accepted_at = target.accepted_at or datetime.now(timezone.utc)
+    target.capabilities = {
+        **dict(parent.capabilities or {}),
+        **dict(target.capabilities or {}),
+        "physical_ledger": True,
+    }
+    db.flush()
+    prepared_production_scope = prepare_current_production_control_from_payload(
+        db, int(target.id), production_payload,
     )
 
     start_phase("provenance")
@@ -2051,11 +2420,269 @@ def _publish_forward_physical_refresh_current(
     # generation captured its own supplier contour above and publishes it as
     # the current owner after the pointer switch.  Custody keeps the bounded
     # provenance handoff.
-    handoff_current_physical_refresh_provenance(
+    # Global publisher lock order is MRP advisory -> pointer -> epoch.
+    _serialize_publication(db)
+    # Install non-command-overlapping current owners before the pointer lock.
+    # Their payloads are fully prebuilt; production/custody remain final-CAS
+    # owners because accepted commands mutate those exact rows.
+    prepared_compact_views = prepare_compact_current_execution_views(
+        db, generation_id=int(target.id),
+        source_revision=f"physical:g{target.id}:{revision}",
+        assembly_payload=assembly_payload, drum_payload=drum_payload,
+        shelf_payload=shelf_payload,
+    )
+    prepared_obligation_views = prepare_current_obligation_views_from_generation(
+        db, int(target.id), purchase_payload=purchase_payload,
+        production_payload=production_payload, mrp_payloads=mrp_payloads,
+        period_payloads=period_payloads, period_run_ids=run_ids,
+        publish_production=False,
+    )
+    uncovered = lost_supplier_receipt_provenance_sle_ids(
+        db, ledger_generation_id=int(target.id), rows=rows,
+        contour=planning_pool_by_warehouse, limit=9,
+    )
+    if uncovered:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"generation {int(target.id)} does not own supplier receipt provenance; "
+            f"first uncovered sle_ids={list(uncovered[:8])}"
+        )
+    unallocatable = _untyped_buy_owned_receipt_ids(
+        rows, current_owners=current_owners,
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
+        typed_sle_ids=_typed_supplier_sle_ids(db, int(target.id), rows),
+    )
+    if unallocatable:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"generation {int(target.id)} leaves supplier receipts untyped; "
+            f"first sle_ids={list(unallocatable[:8])}"
+        )
+    published_make_scopes = set(make_scopes)
+    unscoped = tuple(
+        int(row.id) for row in rows
+        if _text(row.movement_kind) == "assembly_in"
+        and _text(row.warehouse_ref1c)
+        and _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
+        and _make_scopes_for_assembly_row(row, current_owners)
+        and not (
+            set(_make_scopes_for_assembly_row(row, current_owners))
+            & published_make_scopes
+        )
+    )
+    if unscoped:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"generation {int(target.id)} leaves assembly outputs outside MAKE scope; "
+            f"first sle_ids={list(unscoped[:8])}"
+        )
+    publish_current_future_supply(
+        db, int(target.id), expected_parent_id=int(parent.id),
+    )
+    final_savepoint = None
+    for _final_attempt in range(3):
+        final_savepoint = db.begin_nested()
+        try:
+            _locked_pointer, _mutation_state, _publication_epoch = lock_publication_epoch(
+                db, generation=target, expected_parent_id=int(parent.id),
+            )
+        except RuntimeError as exc:
+            final_savepoint.rollback()
+            db.expire_all()
+            pointer_now = db.get(models.PlanningTruthState, 1)
+            if int(pointer_now.current_generation_id or 0) != int(parent.id):
+                raise ForwardPhysicalRefreshUnavailable(
+                    "physical refresh parent is no longer current"
+                ) from exc
+            target = db.get(models.LedgerGeneration, int(target_generation_id))
+            caught_epoch = int(
+                (target.source_watermarks or {}).get(
+                    "accepted_production_mutation_epoch", -1,
+                )
+            )
+            late_tail = accepted_mutation_tail(db, after_epoch=caught_epoch)
+            if late_tail.full_scope:
+                raise ForwardPhysicalRefreshUnavailable(
+                    "full dependency changed during final retry"
+                ) from exc
+            if late_tail.through_epoch == caught_epoch:
+                raise ForwardPhysicalRefreshUnavailable(str(exc)) from exc
+            refresh_prepared_reservation_views()
+            if late_tail.item_ids:
+                recorder_refs = sorted({
+                    str(spec.source_ref2c) for spec in candidate_custody_specs
+                    if spec.source_ref2c
+                })
+                regenerated = []
+                for recorder_ref in recorder_refs:
+                    recorder_rows = visible_sle_query(
+                        db,
+                        physical_import_batch_id=int(target.physical_import_batch_id),
+                        cutoff=target.cutoff,
+                    ).filter(
+                        models.StockLedgerEntry.recorder_type
+                        == "Document_ПеремещениеЗапасов",
+                        models.StockLedgerEntry.recorder_ref == recorder_ref,
+                    ).populate_existing().all()
+                    regenerated.extend(build_transfer_custody_event_specs_for_recorder(
+                        db, recorder_type="Document_ПеремещениеЗапасов",
+                        recorder_ref=recorder_ref,
+                        stock_ledger_entries=recorder_rows,
+                    ))
+                candidate_custody_specs = tuple(
+                    replace(spec, virtual_ordinal=ordinal)
+                    for ordinal, spec in enumerate(regenerated, start=1)
+                )
+                latest_manifest = (
+                    db.query(models.ProductionMaterialCustodyProjectionManifest)
+                    .filter_by(ledger_generation_id=int(parent.id))
+                    .populate_existing().one()
+                )
+                latest_rows = {
+                    (
+                        int(row.product_id), int(row.component_item_id),
+                        str(row.location_kind), str(row.warehouse_ref1c or ""),
+                    ): float(row.reserved_qty)
+                    for row in db.query(models.ProductionMaterialCustodyProjection)
+                    .filter_by(is_current=True).populate_existing().all()
+                }
+                latest_hwm = int(latest_manifest.source_event_high_watermark_id or 0)
+                candidate_custody_rows = fold_candidate_custody_event_specs(
+                    db, generation=target,
+                    baseline_generation_id=int(parent.id),
+                    baseline_high_watermark_id=latest_hwm,
+                    baseline_cutoff=target.cutoff,
+                    baseline_rows=latest_rows,
+                    candidate_events=(
+                        tuple(event for event in persisted_candidate_events if int(event.id) > latest_hwm or int(event.id) in newly_visible_persisted_event_ids)
+                        + candidate_custody_specs
+                    ),
+                )
+                terminal_specs = tuple(
+                    replace(spec, virtual_ordinal=len(candidate_custody_specs) + ordinal)
+                    for ordinal, spec in enumerate(
+                        build_terminal_custody_event_specs(
+                            db, generation=target, cells=candidate_custody_rows,
+                        ), start=1,
+                    )
+                )
+                if terminal_specs:
+                    candidate_custody_rows = fold_candidate_custody_event_specs(
+                        db, generation=target,
+                        baseline_generation_id=int(parent.id),
+                        baseline_high_watermark_id=latest_hwm,
+                        baseline_cutoff=target.cutoff,
+                        baseline_rows=latest_rows,
+                        candidate_events=(
+                            tuple(event for event in persisted_candidate_events if int(event.id) > latest_hwm or int(event.id) in newly_visible_persisted_event_ids)
+                            + candidate_custody_specs + terminal_specs
+                        ),
+                    )
+                candidate_custody_state = material_custody_state_from_values(
+                    candidate_custody_rows
+                )
+                production_payload = build_compact_current_production_control_payload(
+                    db, target_generation_id=int(target.id),
+                    parent_generation_id=int(parent.id),
+                    assembly_payload=assembly_payload, drum_payload=drum_payload,
+                    shelf_payload=shelf_payload, accepted_run_ids=run_ids,
+                    custody_override=candidate_custody_state,
+                    use_target_material_context=True,
+                    reservation_views_override=merged_reservation_views,
+                    affected_item_ids=tuple(sorted(
+                        base_production_affected_item_ids
+                        | set(late_tail.item_ids)
+                        | {int(spec.component_item_id) for spec in terminal_specs}
+                    )),
+                )
+            target_rebase_payload = build_compact_current_production_control_payload(
+                db, target_generation_id=int(target.id),
+                parent_generation_id=int(parent.id),
+                assembly_payload=assembly_payload, drum_payload=drum_payload,
+                shelf_payload=shelf_payload, accepted_run_ids=run_ids,
+                custody_override=candidate_custody_state,
+                use_target_material_context=True,
+                reservation_views_override=merged_reservation_views,
+                affected_item_ids=tuple(sorted(
+                    base_production_affected_item_ids
+                    | set(late_tail.item_ids)
+                    | {int(spec.component_item_id) for spec in terminal_specs}
+                )),
+            )
+            production_payload = rebase_production_payload_for_accepted_mutations(
+                db, production_payload,
+                parent_generation_id=int(parent.id),
+                product_ids=late_tail.product_ids,
+                business_identities=late_tail.business_identities,
+                target_payload=target_rebase_payload,
+            )
+            target.source_watermarks = {
+                **dict(target.source_watermarks or {}),
+                "accepted_production_mutation_epoch": int(late_tail.through_epoch),
+            }
+            prepared_production_scope = prepare_current_production_control_from_payload(
+                db, int(target.id), production_payload,
+            )
+            continue
+        break
+    else:
+        raise ForwardPhysicalRefreshUnavailable(
+            "accepted commands outran physical final retries"
+        )
+    all_materialized_specs = candidate_custody_specs + terminal_specs
+    final_custody_source_ids = tuple(dict.fromkeys(
+        physical_custody_ids
+        + tuple(
+            int(spec.source_sle_id)
+            for spec in candidate_custody_specs
+            if spec.source_sle_id is not None
+        )
+    ))
+    if all_materialized_specs:
+        materialize_candidate_custody_event_specs(
+            db,
+            specs=all_materialized_specs,
+            invalidate_current=False,
+            visibility_generation_id=int(target.id),
+        )
+    affected_custody_keys = {
+        (
+            int(event.product_id), int(event.component_item_id),
+            str(event.location_kind), str(event.warehouse_ref1c or ""),
+        )
+        for event in (
+            tuple(persisted_candidate_events) + all_materialized_specs
+        )
+    }
+    actual_custody_hwm = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0))
+        .scalar() or 0
+    )
+    install_precomputed_current_material_custody(
         db,
         parent_generation_id=int(parent.id),
+        rows=candidate_custody_rows,
+        affected_keys=affected_custody_keys,
+        source_event_high_watermark_id=actual_custody_hwm,
+    )
+    actual_custody_rows = {
+        (
+            int(row.product_id), int(row.component_item_id),
+            str(row.location_kind), str(row.warehouse_ref1c or ""),
+        ): float(row.reserved_qty)
+        for row in db.query(models.ProductionMaterialCustodyProjection).filter(
+            models.ProductionMaterialCustodyProjection.is_current.is_(True)
+        ).all()
+    }
+    for key in affected_custody_keys:
+        if abs(actual_custody_rows.get(key, 0.0) - candidate_custody_rows.get(key, 0.0)) > 1e-9:
+            raise ForwardPhysicalRefreshUnavailable(
+                "materialized custody differs from simulated candidate"
+            )
+    marks = dict(target.source_watermarks or {})
+    marks.pop(DEFERRED_CUSTODY_SPECS_KEY, None)
+    target.source_watermarks = marks
+    install_verified_material_custody_handoff(
+        db, parent_generation_id=int(parent.id),
         target_generation_id=int(target.id),
-        include_future_supply=False,
+        expected_watermark=actual_custody_hwm,
     )
     phase("provenance")
 
@@ -2085,125 +2712,68 @@ def _publish_forward_physical_refresh_current(
     db.flush()
     phase("accepted")
 
-    start_phase("queue")
-    queue_changed, readiness_changed = _publish_assembly_current(
-        db, target_id=int(target.id), assembly_payload=assembly_payload, revision=f"physical:g{target.id}:{revision}"
-    )
-    phase("queue")
-    # Resolve compact dependent queue ids only after queue publication.
-    start_phase("dependents")
-    drum_rows = resolve_compact_queue_owner_ids(db, tuple(_member(drum_payload, "rows") or ()))
-    publish_current_execution_scope(
-        db,
-        source_revision=f"physical:g{target.id}:{revision}",
-        source_generation_id=int(target.id),
-        scope_key="drum:all-live-plans",
-        rows=drum_rows,
-        entity_kinds=("drum_schedule", "drum_slot", "drum_gap", "drum_excluded"),
-        summary=dict(_member(drum_payload, "metrics", {}) or {}),
-    )
-    publish_current_execution_scope(
-        db,
-        source_revision=f"physical:g{target.id}:{revision}",
-        source_generation_id=int(target.id),
-        scope_key="shelf:all-live-mrps",
-        rows=tuple(_member(shelf_payload, "rows") or ()),
-        entity_kinds=("shelf_projection",),
-        summary=dict(_member(shelf_payload, "metrics", {}) or {}),
-    )
-    phase("dependents")
-    start_phase("obligations")
-    # One canonical obligation-view publisher owns all four manifests.  A
-    # bounded refresh that advanced only production/purchase left mrp_result
-    # and period_plan_execution pinned to the previous generation, and every
-    # reader of those two scopes fails closed against the advanced pointer.
-    obligation_results = publish_current_obligation_views_from_generation(
-        db,
-        int(target.id),
-        purchase_payload=purchase_payload,
-        production_payload=production_payload,
-        mrp_payloads=mrp_payloads,
-        period_payloads=period_payloads,
-        period_run_ids=run_ids,
-    )
-    production_result = obligation_results["production_control_journal"]
-    purchase_result = obligation_results["purchase_control_journal"]
-    phase("obligations")
-
-    # The generation about to become the pointer must own the complete typed
-    # evidence of its own visible prefix.  The current replenishment reader
-    # looks only at the pointer, so an uncovered supplier fact is an accepted
-    # physical quantity nobody can count - fail closed here rather than
-    # publish coverage that silently drops to zero.
-    uncovered = lost_supplier_receipt_provenance_sle_ids(
-        db,
-        ledger_generation_id=int(target.id),
-        rows=rows,
-        contour=planning_pool_by_warehouse,
-        limit=9,
-    )
-    if uncovered:
+    try:
+        # Reservation owners are prepared against the unpublished BUILDING
+        # generation. Current-execution payloads were prepared while the same
+        # target was temporarily marked accepted for strict source validation;
+        # install R11/R4 first under their exact BUILDING basis, then restore
+        # accepted status before installing accepted current scopes.
+        target.status = "building"
+        db.flush()
+        installed_reservations = install_prepared_current_reservations(
+            db,
+            prepared_current_reservations,
+            retire_closed_allocations=False,
+        )
+        make_result = (
+            install_prepared_bounded_make_replenishment(
+                db,
+                prepared_make,
+                reservation_owner_ids=installed_reservations.owner_id_by_identity,
+                closed_reservation_identities=installed_reservations.closed_identities,
+            )
+            if prepared_make is not None else None
+        )
+        buy_result = (
+            install_prepared_bounded_buy_replenishment(
+                db,
+                prepared_buy,
+                reservation_owner_ids=installed_reservations.owner_id_by_identity,
+                closed_reservation_identities=installed_reservations.closed_identities,
+            )
+            if prepared_buy is not None else None
+        )
+        retire_prepared_closed_owner_allocations(
+            db, generation_id=int(target.id),
+        )
+        target.status = "accepted"
+        db.flush()
+        production_result = install_prepared_current_execution_scope(
+            db, prepared_production_scope,
+        )
+        obligation_results = install_prepared_current_obligation_views(
+            db, prepared_obligation_views,
+        )
+        compact_results = install_prepared_compact_current_execution_views(
+            db, prepared_compact_views,
+        )
+        queue_changed = int(compact_results["assembly_queue"].changed_rows)
+        readiness_changed = int(compact_results["assembly_readiness"].changed_rows)
+        purchase_result = obligation_results["purchase_control_journal"]
+    except (
+        CurrentExecutionPreparedBasisConflict,
+        PreparedCurrentReservationsBasisConflict,
+        PreparedCurrentReplenishmentBasisConflict,
+    ) as exc:
         raise ForwardPhysicalRefreshUnavailable(
-            f"generation {int(target.id)} does not own supplier receipt "
-            f"provenance for its visible supplier facts; first uncovered "
-            f"sle_ids={list(uncovered[:8])}"
-        )
-    # A supplier receipt inside the planning contour for an item that has an
-    # active current BUY owner is a receipt against that order.  Untyped, it
-    # is counted by nobody: the purchase journal never sees it arrive.  This
-    # is the second half of the same gate - the first half catches evidence
-    # the system lost, this one catches evidence it never wrote.
-    unallocatable = _untyped_buy_owned_receipt_ids(
-        rows,
-        current_owners=current_owners,
-        planning_pool_by_warehouse=planning_pool_by_warehouse,
-        typed_sle_ids=_typed_supplier_sle_ids(db, int(target.id), rows),
-    )
-    if unallocatable:
-        raise ForwardPhysicalRefreshUnavailable(
-            f"generation {int(target.id)} leaves {len(unallocatable)} supplier "
-            "receipts untyped although their items have an active current BUY "
-            f"owner; first sle_ids={list(unallocatable[:8])}"
-        )
-    # The MAKE mirror.  An accepted assembly output is a receipt into stock and
-    # it extinguishes demand; a delta output whose item has a live MAKE owner
-    # but which this refresh never placed in a MAKE scope was never offered to
-    # the writer at all, so its demand silently stays open.  Scoped to the
-    # delta because that is what this refresh is responsible for, and because
-    # "produced no allocation" is not by itself a defect - a surplus output
-    # beyond the open requirement legitimately allocates nothing.
-    # With both sides keyed through the canonical collapse, a fact whose item
-    # has a live MAKE owner always resolves to a scope - so this can only
-    # fire when the publisher and the writer disagree, i.e. when the scope
-    # plumbing between them drops a fact.  That is what it guards now, and it
-    # is the regression that produced 492 unrealized outputs on the stand.
-    published_make_scopes = set(make_scopes)
-    unscoped = tuple(
-        int(row.id) for row in rows
-        if _text(row.movement_kind) == "assembly_in"
-        and _text(row.warehouse_ref1c)
-        and _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
-        and _make_scopes_for_assembly_row(row, current_owners)
-        and not (
-            set(_make_scopes_for_assembly_row(row, current_owners))
-            & published_make_scopes
-        )
-    )
-    if unscoped:
-        raise ForwardPhysicalRefreshUnavailable(
-            f"generation {int(target.id)} leaves {len(unscoped)} assembly "
-            "outputs outside every MAKE scope although their items have an "
-            f"active current MAKE owner; first sle_ids={list(unscoped[:8])}"
-        )
+            "production current basis changed inside final publication: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
     # CAS pointer switch is deliberately the last business mutation.
     start_phase("pointer")
     publish_generation(db, target, expected_parent_id=int(parent.id))
-    # The compact current owner can only be promoted once the pointer names
-    # this generation.  It replaces the staging captured above in the same
-    # transaction, so a rollback restores both the previous current owner and
-    # the retryable staging.
-    publish_current_future_supply(db, int(target.id))
+    final_savepoint.commit()
     phase("pointer")
     return PhysicalRefreshCurrentPublishResult(
         target_generation_id=int(target.id),

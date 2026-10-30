@@ -6,8 +6,10 @@ from datetime import datetime
 
 import pytest
 
+from app import models
 from app.models import (
     Item,
+    LedgerGeneration,
     PhysicalImportBatch,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
@@ -23,7 +25,12 @@ from app.services import one_c_posted_transfer_sync as posted_sync
 from app.services.one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 from app.services.production_material_custody_events import (
     append_material_issue_custody_event,
+    build_transfer_custody_event_specs_for_recorder,
+    materialize_candidate_custody_event_specs,
     project_transfer_custody_events_for_recorder,
+)
+from app.services.production_material_custody_projection import (
+    fold_candidate_custody_event_specs,
 )
 
 
@@ -129,6 +136,12 @@ def _mk_transfer_batch(db, *, batch_key: str) -> PhysicalImportBatch:
     )
     db.add(batch)
     db.flush()
+    db.add(LedgerGeneration(
+        generation_key=f"visibility-{batch_key}", status="building",
+        cutoff=datetime(2099, 1, 1), source_watermarks={}, capabilities={},
+        physical_import_batch_id=int(batch.id), algorithm_version="test",
+    ))
+    db.flush()
     return batch
 
 
@@ -159,6 +172,124 @@ def _add_transfer_sle(
     db.add(row)
     db.flush()
     return row
+
+
+def test_transfer_candidate_specs_are_pure_deterministic_and_id_free(db_session):
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        target_ref_key="candidate-spec-transfer",
+        source_warehouse_ref1c="source-warehouse",
+        warehouse_ref1c="workshop-warehouse",
+    )
+    line = db.query(ProductionMaterialIssueLine).filter_by(
+        issue_id=int(issue.issue_id)
+    ).one()
+    batch = _mk_transfer_batch(db, batch_key="candidate-spec-batch")
+    posting_at = datetime(2026, 5, 20, 12, 0)
+    outbound = _add_transfer_sle(
+        db, batch=batch, transfer_ref="candidate-spec-transfer",
+        item_id=int(line.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="source-warehouse", qty=-3,
+        posting_at=posting_at, line_no=1,
+    )
+    inbound = _add_transfer_sle(
+        db, batch=batch, transfer_ref="candidate-spec-transfer",
+        item_id=int(line.component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="workshop-warehouse", qty=3,
+        posting_at=posting_at, line_no=2,
+    )
+    before_revision = int(line.custody_event_revision or 0)
+
+    first = build_transfer_custody_event_specs_for_recorder(
+        db, recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="candidate-spec-transfer",
+        stock_ledger_entries=[inbound, outbound],
+    )
+    second = build_transfer_custody_event_specs_for_recorder(
+        db, recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="candidate-spec-transfer",
+        stock_ledger_entries=[outbound, inbound],
+    )
+
+    assert first == second
+    assert (first[0].source_kind, first[0].location_kind, first[0].delta_qty) == (
+        "issue_created", "transit", 3.0,
+    )
+    assert sorted(
+        (spec.source_kind, spec.location_kind, spec.delta_qty) for spec in first[1:]
+    ) == [
+        ("transfer_posted", "transit", -3.0),
+        ("transfer_posted", "workshop", 3.0),
+    ]
+    assert all(not hasattr(spec, "id") for spec in first)
+    assert [spec.virtual_ordinal for spec in first] == [1, 2, 3]
+    assert db.query(ProductionMaterialCustodyEvent).count() == 0
+    assert int(line.custody_event_revision or 0) == before_revision
+
+    generation = LedgerGeneration(
+        generation_key="candidate-spec-fold", status="building",
+        cutoff=datetime(2026, 5, 20, 12, 1), source_watermarks={},
+        capabilities={}, physical_import_batch_id=int(batch.id),
+        algorithm_version="test",
+    )
+    db.add(generation)
+    db.flush()
+    folded = fold_candidate_custody_event_specs(
+        db, generation=generation, baseline_generation_id=int(generation.id),
+        baseline_high_watermark_id=0,
+        baseline_cutoff=datetime(2026, 5, 20, 11, 59), baseline_rows={},
+        candidate_events=first,
+    )
+    assert folded == {
+        (int(issue.product_id), int(line.component_item_id),
+         "workshop", "workshop-warehouse"): 3.0,
+    }
+    assert db.query(ProductionMaterialCustodyEvent).count() == 0
+
+    corrected_batch = _mk_transfer_batch(db, batch_key="candidate-spec-correction")
+    corrected_outbound = _add_transfer_sle(
+        db, batch=corrected_batch, transfer_ref="candidate-spec-transfer",
+        item_id=int(line.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="source-warehouse", qty=-4,
+        posting_at=posting_at, line_no=1,
+    )
+    corrected_outbound.source_content_hash = "b" * 64
+    db.add(models.StockLedgerFactSupersession(
+        old_sle_id=int(outbound.id), new_sle_id=int(corrected_outbound.id),
+        import_batch_id=int(corrected_batch.id),
+    ))
+    db.flush()
+    corrected_generation = db.query(LedgerGeneration).filter_by(
+        physical_import_batch_id=int(corrected_batch.id)
+    ).one()
+    with pytest.raises(RuntimeError, match="outside exact generation visibility"):
+        materialize_candidate_custody_event_specs(
+            db, specs=first, invalidate_current=False,
+            visibility_generation_id=int(corrected_generation.id),
+        )
+    assert db.query(ProductionMaterialCustodyEvent).count() == 0
+
+    # The later correction must not rewrite what the earlier sealed prefix saw.
+    assert materialize_candidate_custody_event_specs(
+        db, specs=first, invalidate_current=False,
+        visibility_generation_id=int(generation.id),
+    ) == 3
+    db.flush()
+    actual_high = max(
+        event.id for event in db.query(ProductionMaterialCustodyEvent).all()
+    )
+    actual = fold_candidate_custody_event_specs(
+        db, generation=generation, baseline_generation_id=int(generation.id),
+        baseline_high_watermark_id=0,
+        baseline_cutoff=datetime(2026, 5, 20, 11, 59), baseline_rows={},
+        candidate_events=(), target_high_watermark_id=actual_high,
+    )
+    assert actual == folded
+    assert materialize_candidate_custody_event_specs(
+        db, specs=first, invalidate_current=False,
+        visibility_generation_id=int(generation.id),
+    ) == 0
 
 
 def test_manual_posted_transfer_uses_exact_order_basis_for_custody(db_session):

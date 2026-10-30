@@ -24,6 +24,7 @@ from .generation_lifecycle import materialize_generation_stock_bins
 ALGORITHM_VERSION = "ledger-physical-refresh-generation/1"
 REPLAY_VERSION = "ledger-physical-refresh-replay/1"
 GENERATION_KIND = "physical_refresh"
+ACCEPTED_MUTATION_EPOCH_KEY = "accepted_production_mutation_epoch"
 
 
 class PhysicalRefreshGenerationError(RuntimeError):
@@ -327,16 +328,19 @@ def fork_physical_refresh_generation(
             created=False,
         )
 
+    marks = _expected_watermarks(
+        parent_id=int(parent.id),
+        parent_physical_import_batch_id=int(parent.physical_import_batch_id),
+        from_cutoff=replay_from,
+        replay_from=inherited_replay_from,
+    )
+    from app.services.accepted_command_mutation import capture_accepted_mutation_epoch
+    marks[ACCEPTED_MUTATION_EPOCH_KEY] = capture_accepted_mutation_epoch(db)
     candidate = models.LedgerGeneration(
         generation_key=key,
         status="building",
         cutoff=target,
-        source_watermarks=_expected_watermarks(
-            parent_id=int(parent.id),
-            parent_physical_import_batch_id=int(parent.physical_import_batch_id),
-            from_cutoff=replay_from,
-            replay_from=inherited_replay_from,
-        ),
+        source_watermarks=marks,
         capabilities={},
         physical_import_batch_id=int(physical.id),
         algorithm_version=ALGORITHM_VERSION,
