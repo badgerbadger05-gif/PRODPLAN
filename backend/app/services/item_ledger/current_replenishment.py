@@ -2036,7 +2036,14 @@ def install_prepared_current_replenishment(
     entry_by_physical_id = {int(row.id): row for row in entries}
     owner_ids = dict(prepared.entry_id_by_identity)
     if reservation_owner_ids is not None:
-        owner_ids.update({str(key): int(value) for key, value in reservation_owner_ids.items()})
+        # R11 returns the owners for the entire publication. This R4 change
+        # owns only its prepared scope: importing the global map here locks
+        # every enterprise reservation once per affected item (N x scopes).
+        # Rebind and validate only identities proved by this preparation.
+        owner_ids = {
+            identity: int(reservation_owner_ids.get(identity, row_id))
+            for identity, row_id in owner_ids.items()
+        }
     entry_by_identity: dict[str, models.ReservationEntry] = {}
     for identity, row_id in owner_ids.items():
         entry = entry_by_physical_id.get(int(row_id))

@@ -79,6 +79,52 @@ def test_install_rejects_reservation_basis_change_before_dml(db_session):
     assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
 
 
+@pytest.mark.parametrize("unrelated_owner_count", [0, 500])
+def test_install_keeps_global_owner_rebind_bounded_to_prepared_scope(
+    db_session, unrelated_owner_count,
+):
+    world = _world(db_session)
+    for row in world[2]:
+        row.current_identity = reservation_business_identity(
+            int(row.requirement_id), str(row.realization_mode),
+        )
+    db_session.flush()
+    prepared, reservations = _prepare(db_session, world)
+    owners = dict(prepared.entry_id_by_identity)
+    owners.update({f"unrelated:{i}": 1000000 + i for i in range(unrelated_owner_count)})
+    statements = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT") and "FROM reservation_entry" in statement:
+            statements.append(statement)
+
+    event.listen(db_session.bind, "before_cursor_execute", capture)
+    try:
+        result = install_prepared_current_replenishment(
+            db_session, prepared, reservation_owner_ids=owners,
+        )
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", capture)
+
+    assert result.changed_pairs == len(prepared.plan.insertions)
+    assert len(statements) <= 1
+    target = {row.reservation_id: row for row in prepared.target_reservations}
+    for row in reservations:
+        assert row.replenishment_received_qty == target[int(row.id)].replenishment_received_qty
+
+
+def test_install_still_rejects_wrong_owner_inside_prepared_scope(db_session):
+    prepared, _reservations = _prepare(db_session)
+    owners = dict(prepared.entry_id_by_identity)
+    identity = next(iter(owners))
+    owners[identity] = 1000000
+
+    with pytest.raises(PreparedCurrentReplenishmentBasisConflict, match="owner rebind changed"):
+        install_prepared_current_replenishment(
+            db_session, prepared, reservation_owner_ids=owners,
+        )
+
+
 def test_accepted_generation_adapter_prepares_every_scope_without_dml(db_session):
     generation_id, _item_id, _reservations, _facts = _supplier_typed_world(
         db_session, prefix="accepted-prepare"
