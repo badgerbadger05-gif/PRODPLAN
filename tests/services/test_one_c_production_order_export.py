@@ -440,7 +440,9 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     assert prod_row["СтруктурнаяЕдиница_Key"] == "production-warehouse-ref"
     assert prod_row["Спецификация_Key"] == "spec-ref"
     assert isinstance(prod_row["КлючСвязи"], int)
-    assert 0 < prod_row["КлючСвязи"] < 2**63
+    # UNF stores only five digits even though OData advertises Int64.
+    # Oversized keys silently became 99999 for every row in production.
+    assert 0 < prod_row["КлючСвязи"] <= 99999
     [stock_row] = payload["Запасы"]
     assert stock_row["Номенклатура_Key"] == component.item_ref1c
     assert stock_row["Количество"] == 6.0
@@ -455,6 +457,26 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     assert operation_row["СтруктурнаяЕдиница_Key"] == "production-warehouse-ref"
     assert operation_row["КлючСвязиПродукция"] == prod_row["КлючСвязи"]
     assert payload["ЗапланированыОперации"] is True
+
+
+def test_export_line_keys_survive_native_five_digit_precision():
+    from types import SimpleNamespace
+
+    entry = SimpleNamespace(
+        order_id=19314, ledger_generation_id=3282,
+        source_run_id=748, freeze_version=1,
+    )
+    tokens = [
+        exporter._export_line_token(entry, "operation", {"operation": i})
+        for i in range(20)
+    ]
+    native_readback = [min(value, 99999) for value in tokens]
+    assert native_readback == tokens
+    assert len(set(native_readback)) == len(tokens)
+    assert tokens == [
+        exporter._export_line_token(entry, "operation", {"operation": i})
+        for i in range(20)
+    ]
 
 
 def test_welded_chain_order_delivers_output_to_painted_workshop(

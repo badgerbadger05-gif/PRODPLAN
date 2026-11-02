@@ -816,7 +816,13 @@ def _persist_line_destinations(
 
 
 def _export_line_token(entry: ProductionOrderExportEntry, kind: str, axes: Dict[str, Any]) -> int:
-    """Versioned deterministic positive Int64 for 1C ``КлючСвязи``."""
+    """Deterministic key within the native UNF five-digit field precision.
+
+    OData advertises Int64, but UNF clips larger numeric values to 99999.
+    Keep the existing per-table collision validation fail-closed; never let
+    distinct material or operation rows become identical on native read-back.
+    Already exported documents retain their SyncLink and are not rewritten.
+    """
     if (
         entry.ledger_generation_id is None or entry.source_run_id is None
         or entry.freeze_version is None
@@ -835,13 +841,13 @@ def _export_line_token(entry: ProductionOrderExportEntry, kind: str, axes: Dict[
             return [norm(v) for v in value]
         return value
     payload = {
-        "v": 1, "kind": kind, "order": entry.order_id,
+        "v": 2, "kind": kind, "order": entry.order_id,
         "generation": entry.ledger_generation_id, "run": entry.source_run_id,
         "freeze": entry.freeze_version, "axes": axes,
     }
     canonical = json.dumps(norm(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     value = int.from_bytes(hashlib.sha256(canonical.encode("utf-8")).digest()[:8], "big") & ((1 << 63) - 1)
-    return value or 1
+    return value % 99999 + 1
 
 
 def _build_header_payload(
