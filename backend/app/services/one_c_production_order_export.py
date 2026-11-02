@@ -19,7 +19,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime
 from decimal import Decimal
-import hashlib
 import json
 import copy
 import math
@@ -816,38 +815,22 @@ def _persist_line_destinations(
 
 
 def _export_line_token(entry: ProductionOrderExportEntry, kind: str, axes: Dict[str, Any]) -> int:
-    """Deterministic key within the native UNF five-digit field precision.
+    """Native row identity is document + table + frozen row ordinal.
 
-    OData advertises Int64, but UNF clips larger numeric values to 99999.
-    Keep the existing per-table collision validation fail-closed; never let
-    distinct material or operation rows become identical on native read-back.
-    Already exported documents retain their SyncLink and are not rewritten.
+    UNF clips numeric values above five digits despite advertising Int64.
+    Identical operations may legitimately occur twice in a route, so a hash
+    of operation fields is not a row identity. Stable table order makes retry
+    payloads deterministic and preserves both operations and their labour.
     """
     if (
         entry.ledger_generation_id is None or entry.source_run_id is None
         or entry.freeze_version is None
     ):
         raise MrpMutationLineageError("production export has no accepted generation/run/freeze")
-    def norm(value: Any) -> Any:
-        if isinstance(value, Decimal):
-            return format(value.normalize(), "f") if value else "0"
-        if isinstance(value, (date, datetime)):
-            return value.isoformat()
-        if isinstance(value, float):
-            return format(Decimal(str(value)).normalize(), "f") if value else "0"
-        if isinstance(value, dict):
-            return {str(k): norm(v) for k, v in sorted(value.items())}
-        if isinstance(value, (list, tuple)):
-            return [norm(v) for v in value]
-        return value
-    payload = {
-        "v": 2, "kind": kind, "order": entry.order_id,
-        "generation": entry.ledger_generation_id, "run": entry.source_run_id,
-        "freeze": entry.freeze_version, "axes": axes,
-    }
-    canonical = json.dumps(norm(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    value = int.from_bytes(hashlib.sha256(canonical.encode("utf-8")).digest()[:8], "big") & ((1 << 63) - 1)
-    return value % 99999 + 1
+    ordinal = axes.get("line_number")
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or not 0 < ordinal <= 99999:
+        raise MrpMutationLineageError(f"invalid native row ordinal in {kind}")
+    return ordinal
 
 
 def _build_header_payload(
@@ -862,9 +845,7 @@ def _build_header_payload(
     products = []
     for ln in entry.lines:
         product_link_key = _export_line_token(entry, "product", {
-            "item": ln.item_ref1c, "characteristic": ln.characteristic_ref1c or EMPTY_REF1C,
-            "unit": ln.unit_ref1c or "", "qty": ln.qty, "spec": ln.spec_ref1c or "",
-            "structural_unit": ln.structural_unit_ref1c or "",
+            "line_number": int(ln.line_number or len(products) + 1),
         })
         row: Dict[str, Any] = {
             "LineNumber": int(ln.line_number or len(products) + 1),
@@ -898,32 +879,21 @@ def _build_header_payload(
             row["Спецификация_Key"] = ln.spec_ref1c
         if ln.reserve_structural_unit_ref1c:
             row["СтруктурнаяЕдиница_Key"] = ln.reserve_structural_unit_ref1c
-        row["КлючСвязи"] = _export_line_token(entry, "material", {
-            "item": ln.item_ref1c, "unit": ln.unit_ref1c or "", "qty": ln.qty,
-            "spec": ln.spec_ref1c or "", "reserve": ln.reserve_structural_unit_ref1c or "",
-        })
+        row["КлючСвязи"] = _export_line_token(entry, "material", {"line_number": idx})
         stock_lines.append(row)
     operation_lines = []
     for idx, op in enumerate(entry.operations, start=1):
-        product_token = _export_line_token(entry, "product", {
-            "item": next((p.item_ref1c for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), ""),
-            "characteristic": next((p.characteristic_ref1c or EMPTY_REF1C for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), EMPTY_REF1C),
-            "unit": next((p.unit_ref1c or "" for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), ""),
-            "qty": next((p.qty for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), 0),
-            "spec": next((p.spec_ref1c or "" for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), ""),
-            "structural_unit": next((p.structural_unit_ref1c or "" for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), ""),
-        })
+        product_token = (
+            _export_line_token(entry, "product", {"line_number": int(op.product_link_key)})
+            if op.product_link_key else 0
+        )
         row: Dict[str, Any] = {
             "LineNumber": idx,
             "Операция_Key": op.operation_ref1c,
             "КоличествоПлан": float(op.qty),
             "НормаВремени": float(op.time_norm),
             "Нормочасы": float(op.norm_hours),
-            "КлючСвязи": _export_line_token(entry, "operation", {
-                "operation": op.operation_ref1c, "unit": op.unit_ref1c or "", "qty": op.qty,
-                "time_norm": op.time_norm, "norm_hours": op.norm_hours,
-                "structural_unit": op.structural_unit_ref1c or "", "product": product_token,
-            }),
+            "КлючСвязи": _export_line_token(entry, "operation", {"line_number": idx}),
         }
         if op.product_link_key:
             row["КлючСвязиПродукция"] = product_token
@@ -978,7 +948,7 @@ def _build_header_payload(
         payload["Комментарий"] = _add_origin_marker(payload["Комментарий"], entry.origin_token)
     for table_name in ("Продукция", "Запасы", "Операции"):
         tokens = [row.get("КлючСвязи") for row in payload.get(table_name, [])]
-        if any(not isinstance(token, int) or token <= 0 or token >= 2**63 for token in tokens):
+        if any(not isinstance(token, int) or not 0 < token <= 99999 for token in tokens):
             raise MrpMutationLineageError(f"invalid 1C КлючСвязи in {table_name}")
         if len(tokens) != len(set(tokens)):
             raise MrpMutationLineageError(f"1C КлючСвязи collision in {table_name}")

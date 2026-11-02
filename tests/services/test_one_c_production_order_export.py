@@ -463,18 +463,18 @@ def test_export_line_keys_survive_native_five_digit_precision():
     from types import SimpleNamespace
 
     entry = SimpleNamespace(
-        order_id=19314, ledger_generation_id=3282,
-        source_run_id=748, freeze_version=1,
+        order_id=1001, ledger_generation_id=77,
+        source_run_id=55, freeze_version=1,
     )
     tokens = [
-        exporter._export_line_token(entry, "operation", {"operation": i})
+        exporter._export_line_token(entry, "operation", {"line_number": i + 1})
         for i in range(20)
     ]
     native_readback = [min(value, 99999) for value in tokens]
     assert native_readback == tokens
     assert len(set(native_readback)) == len(tokens)
     assert tokens == [
-        exporter._export_line_token(entry, "operation", {"operation": i})
+        exporter._export_line_token(entry, "operation", {"line_number": i + 1})
         for i in range(20)
     ]
 
@@ -1419,3 +1419,30 @@ def test_other_document_callers_keep_strict_operational_posting():
     with pytest.raises(RuntimeError, match='Дата документа'):
         post_document_operational(fake, entity='Document_СборкаЗапасов', ref_key='81818181-8181-8181-8181-818181818181')
     assert len(fake.operations) == 1 and fake.operations[0].endswith('PostingModeOperational=true')
+
+
+def test_native_row_ordinals_preserve_repeated_operations_and_materials():
+    from dataclasses import replace
+
+    entry = exporter.ProductionOrderExportEntry(
+        order_id=1002, number="PDO-REPEATED-ROUTE", source_run_id=55,
+        ledger_generation_id=77, freeze_version=1,
+        document_date=_dt.datetime(2026, 11, 2, 10, 0),
+        lines=[exporter.ProductionOrderExportLine(
+            1, 918, "output-ref", "Вал", "SHAFT", None, 50,
+        )],
+    )
+    operation = exporter.ProductionOrderExportOperation(
+        1, "same-operation", None, 50, 0.05, 2.5, product_link_key=1,
+    )
+    material = exporter.ProductionOrderExportMaterial(1, 917, "raw-ref", None, 50)
+    entry.operations = [operation, replace(operation, line_number=2)]
+    entry.materials = [material, replace(material, line_number=2)]
+    payload = exporter._build_header_payload(entry)
+    assert payload == exporter._build_header_payload(entry)
+    assert [r["КлючСвязи"] for r in payload["Операции"]] == [1, 2]
+    assert [r["КлючСвязи"] for r in payload["Запасы"]] == [1, 2]
+    assert [r["КлючСвязиПродукция"] for r in payload["Операции"]] == [1, 1]
+    assert [r["КоличествоПлан"] for r in payload["Операции"]] == [50, 50]
+    assert sum(r["Нормочасы"] for r in payload["Операции"]) == 5
+    assert sum(r["Количество"] for r in payload["Запасы"]) == 100
