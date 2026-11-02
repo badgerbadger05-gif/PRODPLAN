@@ -45,6 +45,72 @@ PG_URL = os.getenv("PRODPLAN_BARRIER_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not PG_URL, reason="isolated PostgreSQL URL required")
 
 
+def test_output_baseline_does_not_lock_order_foreign_key_run(monkeypatch):
+    """The real joined baseline lock must permit an accepted order insert."""
+    from datetime import date
+    from types import SimpleNamespace
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    from app.services.item_ledger import assembly_output_persistence as output
+
+    engine = create_engine(PG_URL, pool_size=4, max_overflow=0)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    try:
+        with Session() as seed:
+            item = models.Item(item_code="PG-OUTPUT-LOCK", item_name="Root")
+            plan = models.ProductionPlanHeader(
+                name="Output lock", status="fixed",
+                period_from=date(2026, 11, 1), period_to=date(2026, 11, 30),
+            )
+            seed.add_all((item, plan))
+            seed.flush()
+            run = models.PlanningRun(
+                source_plan_id=plan.id, status="FIXED_SNAPSHOT",
+                period_from=plan.period_from, period_to=plan.period_to,
+                active_freeze_version=1, config_snapshot={},
+            )
+            line = models.ProductionPlanLine(
+                plan_id=plan.id, item_id=item.item_id,
+                bucket_date=plan.period_from, qty=1,
+                accepted_output_qty=0, remaining_output_qty=1,
+            )
+            seed.add_all((run, line, models.PlanningTruthState(id=1)))
+            seed.commit()
+            run_id, line_id = int(run.run_id), int(line.id)
+        monkeypatch.setattr(output, "live_plan_run_ids", lambda *_args: [run_id])
+        with Session() as publisher:
+            output._ensure_plan_execution_baseline(publisher, SimpleNamespace(id=1))
+            # The actual mutable plan line must still be locked.
+            with Session() as contender:
+                with pytest.raises(OperationalError):
+                    contender.query(models.ProductionPlanLine).filter_by(
+                        id=line_id,
+                    ).with_for_update(nowait=True).one()
+                contender.rollback()
+            # An order references the joined MRP run, not the output row.
+            # Previously its FK check waited while holding this pointer,
+            # completing the pointer/run deadlock with the publisher.
+            with Session() as command:
+                command.execute(text("SET LOCAL lock_timeout='1s'"))
+                command.query(models.PlanningTruthState).filter_by(
+                    id=1,
+                ).with_for_update().one()
+                command.add(models.ProductionOrder(
+                    order_number="PG-OUTPUT-ORDER", source="mrp",
+                    source_run_id=run_id,
+                ))
+                command.commit()
+            publisher.query(models.PlanningTruthState).filter_by(
+                id=1,
+            ).with_for_update(nowait=True).one()
+            publisher.rollback()
+    finally:
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
 def test_command_commits_during_build_and_final_pointer_cas_consumes_epoch():
     engine = create_engine(PG_URL, pool_size=4, max_overflow=0)
     Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)

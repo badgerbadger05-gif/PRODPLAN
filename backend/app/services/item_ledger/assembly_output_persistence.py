@@ -133,7 +133,10 @@ def _ensure_plan_execution_baseline(
             if item_ids is not None
             else True,
         )
-        .with_for_update()
+        # Only the saved output belongs to this writer. Locking the joined
+        # PlanningRun also blocks the FK check of a concurrent order insert;
+        # that command holds the truth pointer the publisher later needs.
+        .with_for_update(of=models.ProductionPlanLine)
         .all()
     )
     for line in lines:
