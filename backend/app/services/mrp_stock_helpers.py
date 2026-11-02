@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, true
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -206,7 +206,10 @@ def current_stock_bin_query(db: Session, ledger_generation_id: int, *entities: A
     _require_current_stock_bin_provenance(
         db, int(ledger_generation_id), require_pointer=not building,
     )
-    return db.query(*entities).filter(StockBin.is_current.is_(True))
+    # Match ux_stock_bin_current_physical_key's predicate exactly. PostgreSQL
+    # does not prove `IS TRUE` implies that index's `= true` predicate; bulk
+    # material reads otherwise scan historical bins instead of compact owners.
+    return db.query(*entities).filter(StockBin.is_current == true())
 
 
 def _require_current_stock_bin_provenance(
@@ -235,7 +238,7 @@ def _require_current_stock_bin_provenance(
         provenance_ids = {
             int(generation_id)
             for (generation_id,) in db.query(StockBin.ledger_generation_id)
-            .filter(StockBin.is_current.is_(True))
+            .filter(StockBin.is_current == true())
             .distinct()
             .all()
         }
