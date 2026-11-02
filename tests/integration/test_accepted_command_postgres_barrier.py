@@ -99,7 +99,7 @@ def test_output_baseline_does_not_lock_order_foreign_key_run(monkeypatch):
                 ).with_for_update().one()
                 command.add(models.ProductionOrder(
                     order_number="PG-OUTPUT-ORDER", source="mrp",
-                    source_run_id=run_id,
+                    source_run_id=run_id, order_date=datetime(2026, 11, 2, tzinfo=timezone.utc),
                 ))
                 command.commit()
             publisher.query(models.PlanningTruthState).filter_by(
