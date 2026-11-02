@@ -150,7 +150,10 @@ def record_specification_revisions(
     if changed_refs:
         # A new revision of a spec a parked run's remainder needs may be the
         # fix for that run's failing rebase: give it a fresh counter.
-        from .specification_rebase_worker import reset_rebase_run_failures
+        from .specification_rebase_worker import (
+            reset_rebase_run_failures,
+            specification_changes_affect_remaining_roots,
+        )
 
         reset_rebase_run_failures(
             db, spec_refs=changed_refs, reason="specification_revision",
@@ -168,12 +171,16 @@ def record_specification_revisions(
         specification_revision_marker = (
             f"specification:{len(changed_refs)}:sha256:{changed_digest}"
         )
+        # The same remaining-root graph owns both rebase and invalidation.
+        # Otherwise a revision used only by completed roots takes every live
+        # queue offline until the next physical refresh, despite no rebase.
+        affected = specification_changes_affect_remaining_roots(db, changed_refs)
         for entity_kind, scope_key in (
             ("assembly_queue", "assembly:all-live-plans"),
             ("assembly_readiness", "assembly:all-live-plans"),
             ("drum_schedule", "drum:all-live-plans"),
             ("shelf_projection", "shelf:all-live-mrps"),
-        ):
+        ) if affected else ():
             invalidate_current_execution_scope(
                 db,
                 entity_kind=entity_kind,

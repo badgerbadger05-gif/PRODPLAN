@@ -527,6 +527,54 @@ def test_a_change_only_an_accepted_root_uses_does_not_rebase_the_run(db_session,
     assert queued.result == {"status": worker.DRIFT_OUTSIDE_REMAINING_ROOTS}
 
 
+@pytest.mark.parametrize("used_by,ready_before,ready_after", [
+    ("done", True, True),
+    ("done", False, False),
+    ("open", True, False),
+])
+def test_specification_import_invalidates_only_remaining_root_execution(
+    db_session, used_by, ready_before, ready_after,
+):
+    _rebase_scope_world(db_session, changed_spec_used_by=used_by)
+    spec = db_session.query(models.Specification).filter_by(
+        spec_ref1c="spec-changed",
+    ).one()
+    scopes = [
+        models.CurrentExecutionScope(
+            entity_kind=kind, scope_key=scope, source_revision="before",
+            result_ready=ready_before, content_hash="a" * 64, summary={},
+        )
+        for kind, scope in (
+            ("assembly_queue", "assembly:all-live-plans"),
+            ("assembly_readiness", "assembly:all-live-plans"),
+            ("drum_schedule", "drum:all-live-plans"),
+            ("shelf_projection", "shelf:all-live-mrps"),
+        )
+    ]
+    db_session.add_all(scopes)
+    db_session.flush()
+
+    result = record_specification_revisions(
+        db_session, [int(spec.spec_id)],
+        previous_hash_by_id={int(spec.spec_id): "new-hash"},
+    )
+
+    assert result["changed_spec_refs"] == ["spec-changed"]
+    assert all(scope.result_ready is ready_after for scope in scopes)
+    if used_by == "done":
+        assert all(scope.source_revision == "before" for scope in scopes)
+
+
+def test_unrelated_import_does_not_invalidate_for_another_pending_rebase(db_session):
+    from app.services.specification_rebase_worker import (
+        specification_changes_affect_remaining_roots,
+    )
+
+    _rebase_scope_world(db_session, changed_spec_used_by="open")
+    assert specification_changes_affect_remaining_roots(db_session, ["spec-changed"])
+    assert not specification_changes_affect_remaining_roots(db_session, ["unrelated"])
+
+
 def test_a_change_a_remaining_root_uses_rebases_the_run(db_session, monkeypatch):
     from app.services import specification_rebase_worker as worker
 

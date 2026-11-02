@@ -317,6 +317,24 @@ def _any_frozen_drift(db: Session) -> bool:
     )
 
 
+def specification_changes_affect_remaining_roots(
+    db: Session, spec_refs: Iterable[str],
+) -> bool:
+    """Use the rebase scope to decide whether current execution is affected.
+
+    A changed historical/unused specification must not invalidate the queue.
+    Keep this decision on the same remaining-root graph as the rebase worker,
+    including removed nodes and unresolved expansions.
+    """
+    changed = {str(ref).strip() for ref in spec_refs if str(ref or "").strip()}
+    if not changed:
+        return False
+    return any(
+        changed.intersection(refs)
+        for _run, refs in _affected(db, BomSpecificationResolver(db))
+    )
+
+
 def _request_ref(db: Session, request: models.SpecificationRebaseQueue) -> str:
     spec = db.get(models.Specification, int(request.spec_id))
     return str(spec.spec_ref1c or "").strip() if spec is not None else ""

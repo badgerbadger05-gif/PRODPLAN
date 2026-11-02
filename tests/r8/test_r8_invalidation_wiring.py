@@ -71,7 +71,13 @@ def test_r8_calendar_hook_invalidates_only_calendar_dependents(db_session):
     ).result_ready is False
 
 
-def test_r8_specification_revision_invalidates_only_on_semantic_change(db_session):
+def test_r8_specification_revision_invalidates_only_on_semantic_change(db_session, monkeypatch):
+    from app.services import specification_rebase_worker
+
+    monkeypatch.setattr(
+        specification_rebase_worker, "specification_changes_affect_remaining_roots",
+        lambda *_args: True,
+    )
     item = models.Item(item_code="R8-SPEC-ITEM", item_name="R8 spec item")
     spec = models.Specification(spec_ref1c="r8-spec", spec_code="R8", spec_name="R8")
     db_session.add_all([item, spec])

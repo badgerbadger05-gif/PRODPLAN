@@ -270,8 +270,14 @@ def test_legacy_generation_publisher_refuses_to_close_a_live_scope(db_session):
     db_session.rollback()
 
 
-def _invalidate_via_specification_import(db_session):
+def _invalidate_via_specification_import(db_session, monkeypatch):
     """Run the canonical specification-import hook, not a hand-made update."""
+    from app.services import specification_rebase_worker
+
+    monkeypatch.setattr(
+        specification_rebase_worker, "specification_changes_affect_remaining_roots",
+        lambda *_args: True,
+    )
     spec = models.Specification(
         spec_code="SPEC-REPAIR", spec_name="Repair spec",
         spec_ref1c="spec-ref-repair", content_hash="stale-hash",
@@ -320,7 +326,7 @@ def test_noop_refresh_republishes_invalidated_scopes_without_row_or_audit_churn(
     ))
     db_session.flush()
 
-    _invalidate_via_specification_import(db_session)
+    _invalidate_via_specification_import(db_session, monkeypatch)
     db_session.commit()
     invalidated = {
         key for key, (_generation, ready) in _manifests(db_session).items() if not ready
