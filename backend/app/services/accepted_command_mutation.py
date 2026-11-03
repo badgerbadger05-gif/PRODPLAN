@@ -6,11 +6,16 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 
 from app import models
 
 
 STATE_ID = 1
+
+
+class AcceptedPublicationBusy(RuntimeError):
+    """A background publication yields to an operator's accepted command."""
 
 
 @dataclass(frozen=True)
@@ -186,8 +191,18 @@ def lock_publication_epoch(
     *,
     generation: models.LedgerGeneration,
     expected_parent_id: int,
+    nowait: bool = False,
 ) -> tuple[models.PlanningTruthState, models.AcceptedProductionMutationState, int]:
     """Final short CAS: pointer -> epoch, after every heavy rebase."""
+    if nowait:
+        # A builder can already own executor rows. Never wait here behind an
+        # operator holding the pointer and requesting one of those rows.
+        try:
+            db.query(models.PlanningTruthState).filter_by(id=1).with_for_update(nowait=True).one()
+        except OperationalError as exc:
+            if getattr(exc.orig, "pgcode", None) == "55P03":
+                raise AcceptedPublicationBusy("accepted command is active; publication deferred") from exc
+            raise
     pointer, state = lock_accepted_mutation_state(db)
     if int(pointer.current_generation_id or 0) != int(expected_parent_id):
         raise RuntimeError("accepted pointer moved before publication")

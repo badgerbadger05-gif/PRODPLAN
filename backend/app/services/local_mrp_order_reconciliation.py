@@ -541,7 +541,10 @@ def reconcile_local_mrp_orders(
             > func.coalesce(models.ProductionProduct.produced_qty, 0),
         )
         .order_by(models.ProductionProduct.product_id.asc())
-        .with_for_update()
+        # The joined run is immutable input, not a reconciliation target.
+        # FOR UPDATE on it blocks new orders' source_run_id FK checks while
+        # those commands already own the accepted pointer (lock inversion).
+        .with_for_update(of=(models.ProductionProduct, models.ProductionOrder), nowait=True)
         .all()
     )
     if not rows:

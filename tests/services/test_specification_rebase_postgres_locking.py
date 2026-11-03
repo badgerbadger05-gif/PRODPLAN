@@ -1,77 +1,89 @@
-"""Real PostgreSQL regression for the rebase/executor writer boundary."""
-import concurrent.futures
-import os
-import threading
-import uuid
+"""Real PostgreSQL regressions: operator commands win over background builds."""
+from datetime import datetime, timezone
+from decimal import Decimal
+from types import SimpleNamespace
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import make_url
-from sqlalchemy.orm import Session, configure_mappers
-from sqlalchemy.schema import CreateTable
+import pytest
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app import models
+from app.services.accepted_command_mutation import (
+    AcceptedPublicationBusy, lock_publication_epoch,
+    record_accepted_production_mutation,
+)
 from app.services.specification_mrp_rebase import rebase_fixed_plan_remaining_roots
+from tests.services.test_reservation_current_prepare_install import postgres_reservation_session
 
 
-def probe_rebase_writer_boundary(database_url: str) -> None:
-    # This probe owns only an isolated test schema, never production tables.
-    assert (make_url(database_url).database or '').startswith('test_')
-    schema = 'test_rebase_lock_' + uuid.uuid4().hex
-    admin = create_engine(database_url)
-    with admin.begin() as connection:
-        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-    engine = create_engine(database_url, connect_args={'options': f'-csearch_path={schema}'})
-    ready = threading.Event()
-
-    def rebase():
-        with Session(engine) as session:
-            session.connection()  # Establish the second connection before timing.
-            ready.set()
-            try:
-                rebase_fixed_plan_remaining_roots(session, 999999)
-            except ValueError as exc:
-                return str(exc)
-            raise AssertionError('The isolated test has no accepted planning truth')
-
-    try:
-        with engine.begin() as connection:
-            connection.execute(text('CREATE TABLE ledger_generation (id BIGINT PRIMARY KEY)'))
-            models.PlanningTruthState.__table__.create(connection)
-            # The run is deliberately absent; its normal lookup still needs
-            # its real column shape. No unrelated FK targets are needed here.
-            connection.execute(CreateTable(models.PlanningRun.__table__, include_foreign_key_constraints=[]))
-            connection.execute(models.PlanningTruthState.__table__.insert().values(id=1))
-        configure_mappers()  # Mapper startup must not imitate a blocked writer.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            with engine.begin() as executor:
-                executor.execute(text('SELECT id FROM planning_truth_state WHERE id=1 FOR UPDATE'))
-                future = pool.submit(rebase)
-                assert ready.wait(5), 'Second PostgreSQL connection did not start'
-                # A rebase must wait for the executor, including before validating
-                # or locking its predecessor. The former order returned or touched
-                # domain rows while the executor held this boundary.
-                try:
-                    future.result(timeout=0.5)
-                except concurrent.futures.TimeoutError:
-                    pass
-                else:
-                    raise AssertionError('Rebase bypassed the active executor writer')
-            assert future.result(timeout=5) == 'current accepted planning truth is unavailable'
-    finally:
-        engine.dispose()
-        with admin.begin() as connection:
-            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        admin.dispose()
+def _insert_order(engine, run_id, number):
+    with Session(engine) as command:
+        command.execute(text("SET LOCAL lock_timeout='1s'"))
+        command.query(models.PlanningTruthState).filter_by(id=1).with_for_update().one()
+        command.add(models.ProductionOrder(
+            order_number=number, source="mrp", source_run_id=run_id,
+            order_date=datetime.now(timezone.utc),
+        ))
+        command.commit()
 
 
-def test_postgres_rebase_waits_for_existing_executor_writer():
-    import pytest
-    database_url = os.environ.get('PRODPLAN_REBASE_LOCK_TEST_URL')
-    if not database_url:
-        pytest.skip('requires an isolated PostgreSQL test database')
-    probe_rebase_writer_boundary(database_url)
+def test_postgres_order_commits_during_rebase_preparation(postgres_reservation_session, monkeypatch):
+    from tests.services.test_specification_mrp_rebase import _world, _stub_publication
+    from app.services import specification_mrp_rebase as rebase
+    from app.services import obligation_refresh_orchestrator as orchestrator
+
+    db = postgres_reservation_session
+    _generation, _plan, run, _line = _world(db, accepted_qty=Decimal("8"))
+    run_id = int(run.run_id)
+    monkeypatch.setattr(rebase, "live_plan_run_ids", lambda *_: [run_id])
+    _stub_publication(monkeypatch, db)
+    publish = orchestrator.run_obligation_refresh
+
+    def paused_build(*args, **kwargs):
+        db.flush()  # Include the real wrapper's closed-snapshot FK writes.
+        _insert_order(db.get_bind(), run_id, "DURING-REBASE")
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "run_obligation_refresh", paused_build)
+    assert rebase_fixed_plan_remaining_roots(db, run_id)["status"] == "rebased"
+    assert db.query(models.ProductionOrder).filter_by(order_number="DURING-REBASE").count() == 1
 
 
-if __name__ == '__main__':
-    probe_rebase_writer_boundary(os.environ['PRODPLAN_REBASE_LOCK_TEST_URL'])
-    print('PostgreSQL rebase/executor writer boundary verified')
+def test_postgres_reconciliation_does_not_lock_joined_source_run(postgres_reservation_session):
+    from tests.services.test_local_mrp_order_reconciliation import _scenario
+    from app.services.local_mrp_order_reconciliation import reconcile_local_mrp_orders
+
+    db = postgres_reservation_session
+    generation, live, order, product = _scenario(
+        db, order_qty=Decimal("10"), target_qty=Decimal("5"), order_ref1c="exported-order",
+    )
+    source_run_id = int(order.source_run_id)
+    db.add(models.PlanningTruthState(id=1, current_generation_id=generation.id))
+    db.commit()
+    reconcile_local_mrp_orders(db, ledger_generation_id=generation.id, live_run_ids=[live.run_id])
+    _insert_order(db.get_bind(), source_run_id, "DURING-RECONCILIATION")
+    db.rollback()
+
+
+def test_postgres_final_publication_yields_to_command_and_rejects_stale_epoch(postgres_reservation_session):
+    from tests.services.test_accepted_command_mutation import _truth
+
+    db = postgres_reservation_session
+    parent_id = _truth(db).id
+    target = SimpleNamespace(source_watermarks={"accepted_production_mutation_epoch": 0})
+    with Session(db.get_bind()) as command:
+        command.query(models.PlanningTruthState).filter_by(id=1).with_for_update().one()
+        with pytest.raises(AcceptedPublicationBusy):
+            lock_publication_epoch(db, generation=target, expected_parent_id=parent_id, nowait=True)
+        db.rollback()
+        record_accepted_production_mutation(command, mutation_kind="executor", product_ids=[9])
+        command.commit()
+    with pytest.raises(RuntimeError, match="mutations changed"):
+        lock_publication_epoch(db, generation=target, expected_parent_id=parent_id, nowait=True)
+    db.rollback()
+    target.source_watermarks["accepted_production_mutation_epoch"] = 1
+    _pointer, _state, epoch = lock_publication_epoch(
+        db, generation=target, expected_parent_id=parent_id, nowait=True,
+    )
+    assert epoch == 1
+    db.rollback()

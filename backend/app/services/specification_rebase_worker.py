@@ -9,6 +9,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.accepted_command_mutation import AcceptedPublicationBusy
 from app.services.item_ledger.physical_refresh_candidacy import (
     has_live_physical_refresh_candidate,
 )
@@ -450,6 +451,20 @@ def run_one_pending_specification_rebase(
         )
     except Exception as exc:
         db.rollback()
+        if isinstance(exc, AcceptedPublicationBusy) or getattr(
+            getattr(exc, "orig", None), "pgcode", None
+        ) == "55P03":
+            # Normal operator traffic wins. This is contention, not a broken
+            # MRP: retain the durable request without exhausting its retries.
+            if not dry_run:
+                for row in selected_requests:
+                    request = db.get(models.SpecificationRebaseQueue, int(row.id))
+                    if request is not None:
+                        request.status = "pending"
+                        request.last_error = None
+                        request.result = {"status": "deferred", "reason": "accepted_command_busy"}
+                db.commit()
+            return {"status": "deferred", "reason": "accepted_command_busy", "dry_run": bool(dry_run)}
         if not dry_run:
             failures = _record_run_failure(db, int(run.run_id), str(exc))
             for request_id in [int(row.id) for row in selected_requests]:

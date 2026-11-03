@@ -1396,6 +1396,7 @@ def publish_obligation_refresh_batch(
     # Every heavy builder/current-owner write is complete.  Hold the accepted
     # pointer only for the final CAS and pointer-last handoff.
     from .accepted_command_mutation import (
+        AcceptedPublicationBusy,
         consume_locked_publication_epoch,
         lock_publication_epoch,
     )
@@ -1415,8 +1416,11 @@ def publish_obligation_refresh_batch(
         savepoint = db.begin_nested()
         try:
             pointer, mutation_state, publication_epoch = lock_publication_epoch(
-                db, generation=target, expected_parent_id=int(parent.id),
+                db, generation=target, expected_parent_id=int(parent.id), nowait=True,
             )
+        except AcceptedPublicationBusy:
+            savepoint.rollback()
+            raise
         except RuntimeError as exc:
             savepoint.rollback()
             db.expire_all()

@@ -127,13 +127,13 @@ def rebase_fixed_plan_remaining_roots(
     same generation build and rolls the transaction back, so it is suitable for
     the planned shadow benchmark but not for a polling endpoint.
     """
-    # Executor commands acquire this boundary before touching orders/runs.
-    # Take it first too: a late pointer lock after staging successor orders
-    # inverted that order and deadlocked with a simultaneous manual launch.
+    # Preparation reads accepted truth without locking its pointer or source
+    # run. The canonical publisher catches up accepted-command epochs and owns
+    # the short pointer-last CAS. Locking here serializes the entire build with
+    # every operator command, defeating that prepare/install boundary.
     truth = (
         db.query(models.PlanningTruthState)
         .filter(models.PlanningTruthState.id == 1)
-        .with_for_update()
         .one_or_none()
     )
     if truth is None or truth.current_generation_id is None:
@@ -141,7 +141,6 @@ def rebase_fixed_plan_remaining_roots(
     predecessor = (
         db.query(models.PlanningRun)
         .filter(models.PlanningRun.run_id == int(run_id))
-        .with_for_update()
         .one_or_none()
     )
     if predecessor is None:
@@ -167,7 +166,6 @@ def rebase_fixed_plan_remaining_roots(
         .filter(
             models.ProductionPlanHeader.id == int(predecessor.source_plan_id)
         )
-        .with_for_update()
         .one_or_none()
     )
     if predecessor_plan is None or str(predecessor_plan.status) != "fixed":

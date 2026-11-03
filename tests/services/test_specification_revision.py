@@ -593,6 +593,24 @@ def test_a_change_a_remaining_root_uses_rebases_the_run(db_session, monkeypatch)
     assert calls == [(int(run.run_id), ("spec-changed",))]
 
 
+def test_operator_contention_defers_rebase_without_consuming_failure_budget(db_session, monkeypatch):
+    from app.services import specification_rebase_worker as worker
+    from app.services.accepted_command_mutation import AcceptedPublicationBusy
+
+    run, request = _rebase_scope_world(db_session, changed_spec_used_by="open")
+
+    def busy(*args, **kwargs):
+        raise AcceptedPublicationBusy("operator owns the accepted pointer")
+
+    monkeypatch.setattr(worker, "rebase_fixed_plan_remaining_roots", busy)
+    for _ in range(worker.MAX_REBASE_ATTEMPTS + 1):
+        result = worker.run_one_pending_specification_rebase(db_session)
+        assert result["status"] == "deferred"
+    assert db_session.get(models.SpecificationRebaseRunState, run.run_id) is None
+    db_session.refresh(request)
+    assert request.status == "pending" and request.last_error is None
+
+
 def test_a_main_specification_switched_to_another_document_rebases_the_run(
     db_session, monkeypatch,
 ):
