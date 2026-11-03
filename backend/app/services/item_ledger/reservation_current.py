@@ -377,7 +377,7 @@ def install_prepared_current_reservations(
     owners = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.is_current.is_(True),
         models.ReservationEntry.current_identity.in_(sorted(target_identities) or [""]),
-    ).all()
+    ).populate_existing().all()
     owner_map = {
         str(row.current_identity): int(row.id) for row in owners
     }
@@ -388,7 +388,7 @@ def install_prepared_current_reservations(
     if prepared.retiring_identities:
         closed_rows = db.query(models.ReservationEntry).filter(
             models.ReservationEntry.current_identity.in_(prepared.retiring_identities),
-        ).all()
+        ).populate_existing().all()
         closed_by_identity = {
             str(row.current_identity): row for row in closed_rows
         }
@@ -814,9 +814,11 @@ def _publish_current_reservation_owners(
     """), {"generation_id": generation_id})
     db.execute(text("""
         UPDATE reservation_entry AS owner
-           SET lifecycle_status = 'closed', closed_at = current_timestamp
+           SET lifecycle_status = 'closed',
+               closed_at = coalesce(owner.closed_at, current_timestamp),
+               is_current = false, owner_kind = 'legacy'
           FROM reservation_publish_removed AS removed
-         WHERE owner.id = removed.id AND owner.lifecycle_status <> 'closed'
+         WHERE owner.id = removed.id
     """))
     db.execute(text("""
         INSERT INTO reservation_current_change (
@@ -1079,9 +1081,9 @@ def _publish_sqlite_bounded(
             before = _payload(owner)
             owner.lifecycle_status = "closed"
             owner.closed_at = datetime.now(timezone.utc)
-            owner.is_current = False
-            owner.owner_kind = "legacy"
             _record_change(owner, before, _payload(owner), "close")
+        owner.is_current = False
+        owner.owner_kind = "legacy"
     db.flush()
     return {"published": len(by_identity)}
 

@@ -1,4 +1,6 @@
 from decimal import Decimal
+import os
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,34 @@ from app.services.item_ledger.reservation_current import (
     prepared_reservation_views_with_execution,
 )
 from tests.r11.test_r11_reservation_current_owner import _db_reservation
+
+
+@pytest.fixture
+def postgres_reservation_session():
+    """Exercise the real set-based publisher in a disposable test schema."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.orm import Session
+    from app.database import Base
+
+    url = os.getenv("PRODPLAN_REBASE_LOCK_TEST_URL")
+    if not url:
+        pytest.skip("requires an isolated PostgreSQL test database")
+    assert (make_url(url).database or "").startswith("test_")
+    admin = create_engine(url)
+    schema = "test_reservation_publish_" + uuid.uuid4().hex
+    with admin.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_engine(url, connect_args={"options": f"-csearch_path={schema}"})
+    try:
+        Base.metadata.create_all(engine)
+        with Session(engine, autoflush=False, expire_on_commit=False) as db:
+            yield db
+    finally:
+        engine.dispose()
+        with admin.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin.dispose()
 
 
 def _world(db):
@@ -198,3 +228,40 @@ def test_prepare_target_views_exclude_owner_classified_for_close(db_session):
     db_session.refresh(closing)
     assert closing.lifecycle_status == "closed"
     assert closing.is_current is False
+
+
+@pytest.mark.parametrize("already_closed", [False, True])
+def test_postgres_install_retires_only_replaced_run_and_refreshes_loaded_owners(
+    postgres_reservation_session, already_closed,
+):
+    db = postgres_reservation_session
+    _old, owner, target, stage = _world(db)
+    _generation, closing = _db_reservation(
+        db, generation_key="pg-closing", status="accepted",
+    )
+    _retained_generation, retained = _db_reservation(
+        db, generation_key="pg-retained", status="accepted",
+    )
+    if already_closed:
+        closing.lifecycle_status = "closed"
+    db.flush()
+    prepared = prepare_current_reservations(
+        db, generation_id=target.id, retire_run_ids=(closing.run_id,),
+    )
+    installed = install_prepared_current_reservations(
+        db, prepared, retire_closed_allocations=False,
+    )
+    assert installed.closed_identities == (closing.current_identity,)
+    assert installed.owner_id_by_identity == {
+        owner.current_identity: owner.id, retained.current_identity: retained.id,
+    }
+    # These objects were loaded before raw SQL DML. Verification must refresh
+    # them rather than checking stale SQLAlchemy identity-map values.
+    assert closing.lifecycle_status == "closed"
+    assert closing.is_current is False and closing.owner_kind == "legacy"
+    assert closing.closed_at is not None
+    assert owner.ledger_generation_id == target.id
+    assert owner.replenishment_received_qty == Decimal("3")
+    assert retained.lifecycle_status == "active" and retained.is_current is True
+    db.commit()
+    assert db.query(models.ReservationEntry).filter_by(id=stage.id).count() == 0

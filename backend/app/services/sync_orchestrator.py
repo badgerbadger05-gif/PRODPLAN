@@ -342,17 +342,31 @@ def _rollback_if_possible(db: Optional[Session]) -> None:
             pass
 
 
+def _job_next_due(state: Dict[str, Any], job: SyncJob) -> Optional[datetime]:
+    js = _job_state(state, job.id)
+    started = _parse_iso(js.get("last_run_at"))
+    # Clearing last_run_at is the scheduler's existing force-due command.
+    if started is None:
+        return None
+    finished = _parse_iso(js.get("last_finished_at"))
+    if finished is None:
+        finished = started + timedelta(milliseconds=int(js.get("last_duration_ms") or 0))
+    due = finished + timedelta(seconds=_interval_for(state, job)) if finished else None
+    retry = _parse_iso(js.get("next_retry_at"))
+    return max(due, retry) if due and retry else due or retry
+
+
 def _due_jobs(state: Dict[str, Any], now: datetime) -> List[SyncJob]:
     """Jobs whose interval has elapsed (or never ran), enabled only."""
     due: List[SyncJob] = []
     for job in SYNC_JOBS:
         if not _is_enabled(state, job.id):
             continue
-        last = _parse_iso(_job_state(state, job.id).get("last_run_at"))
-        if last is None:
+        next_due = _job_next_due(state, job)
+        if next_due is None:
             due.append(job)
             continue
-        if (now - last).total_seconds() >= _interval_for(state, job):
+        if now >= next_due:
             due.append(job)
     return due
 
@@ -1180,18 +1194,26 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             summary = job.runner(db, config)
             job_state["last_status"] = "ok"
             job_state["last_error"] = None
+            job_state["failure_count"] = 0
+            job_state["next_retry_at"] = None
             result["summary"] = summary if isinstance(summary, dict) else {"result": str(summary)}
         except Exception as exc:  # noqa: BLE001 — one job's failure must not kill the loop
             _rollback_if_possible(db)
             job_state["last_status"] = "error"
             job_state["last_error"] = str(exc)[:1000]
+            job_state["failure_count"] = int(job_state.get("failure_count") or 0) + 1
             result["status"] = "error"
             result["error"] = str(exc)
         finally:
-            # Always stamp last_run_at so a failing job waits its interval before
-            # retry instead of being hammered every tick.
+            # The interval starts at completion: a long failing rebase must not
+            # consume its own wait while it holds the executor writer boundary.
             job_state["last_run_at"] = now.isoformat()
             job_state["last_duration_ms"] = int((time.time() - started) * 1000)
+            finished = now + timedelta(milliseconds=job_state["last_duration_ms"])
+            job_state["last_finished_at"] = finished.isoformat()
+            if job.id == "specificationRebase" and job_state["last_status"] == "error":
+                backoff = min(3600, 300 * 2 ** min(job_state["failure_count"] - 1, 4))
+                job_state["next_retry_at"] = (finished + timedelta(seconds=backoff)).isoformat()
             state.setdefault("jobs", {})[job.id] = job_state
             _save_state(state, required=True)
 
@@ -1211,13 +1233,8 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
     jobs_out: List[Dict[str, Any]] = []
     for job in SYNC_JOBS:
         js = _job_state(state, job.id)
-        last = _parse_iso(js.get("last_run_at"))
         interval = _interval_for(state, job)
-        next_due = None
-        if last is not None:
-            from datetime import timedelta
-
-            next_due = (last + timedelta(seconds=interval)).isoformat()
+        next_due = _job_next_due(state, job)
         jobs_out.append({
             "id": job.id,
             "title": job.title,
@@ -1227,8 +1244,11 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
             "last_status": js.get("last_status"),
             "last_error": js.get("last_error"),
             "last_duration_ms": js.get("last_duration_ms"),
-            "next_due_at": next_due,
-            "due_now": last is None or (now - last).total_seconds() >= interval,
+            "last_finished_at": js.get("last_finished_at"),
+            "failure_count": int(js.get("failure_count") or 0),
+            "next_retry_at": js.get("next_retry_at"),
+            "next_due_at": next_due.isoformat() if next_due else None,
+            "due_now": next_due is None or now >= next_due,
         })
     current_parent: Optional[models.LedgerGeneration] = (
         _current_accepted_parent(db)

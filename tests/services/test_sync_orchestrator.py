@@ -115,6 +115,55 @@ def test_real_registry_orders_nomenclature_before_stock():
     assert idx["warehouses"] < idx["stock"]
 
 
+def test_long_rebase_failure_waits_after_completion_and_backs_off(tmp_state, monkeypatch):
+    ticks = iter([0.0, 480.0, 1000.0, 1480.0, 2000.0, 2480.0])
+    monkeypatch.setattr(orch.time, "time", lambda: next(ticks))
+    calls = []
+
+    def runner(db, config):
+        calls.append(1)
+        if len(calls) < 3:
+            raise ValueError("reservation retirement did not close every prepared owner")
+        return {"status": "rebased"}
+
+    job = SyncJob("specificationRebase", "Rebase", 60, runner)
+    monkeypatch.setattr(orch, "SYNC_JOBS", [job])
+    monkeypatch.setattr(orch, "_JOB_BY_ID", {job.id: job})
+    monkeypatch.setattr(orch, "_ORDER_INDEX", {job.id: 0})
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://x/odata"})
+    orch._save_state({"jobs": {job.id: {"enabled": True}}})
+    now = datetime(2026, 11, 3, 9, tzinfo=timezone.utc)
+
+    assert orch.tick(db=None, now=now)["status"] == "error"
+    finished = now + timedelta(seconds=480)
+    retry = finished + timedelta(seconds=300)
+    snap = orch.status(now=finished)["jobs"][0]
+    assert snap["next_due_at"] == retry.isoformat()
+    assert snap["due_now"] is False
+    assert orch.tick(db=None, now=retry - timedelta(seconds=1))["status"] == "idle"
+    assert orch.tick(db=None, now=retry)["status"] == "error"
+    second_retry = retry + timedelta(seconds=480 + 600)
+    assert orch.status(now=retry)["jobs"][0]["next_due_at"] == second_retry.isoformat()
+    assert orch.tick(db=None, now=second_retry)["status"] == "ok"
+    js = orch._load_state()["jobs"][job.id]
+    assert js["failure_count"] == 0 and js["next_retry_at"] is None
+    assert orch.tick(db=None, now=second_retry + timedelta(seconds=480 + 59))["status"] == "idle"
+
+
+def test_old_schedule_duration_is_used_for_completion_backoff():
+    now = datetime(2026, 11, 3, 9, tzinfo=timezone.utc)
+    job = SyncJob("specificationRebase", "Rebase", 60, lambda *_: {})
+    state = {"jobs": {job.id: {
+        "enabled": True, "last_run_at": now.isoformat(), "last_duration_ms": 480000,
+    }}}
+    assert orch._job_next_due(state, job) == now + timedelta(seconds=540)
+    state["jobs"][job.id].update(
+        last_run_at=None, last_finished_at=now.isoformat(),
+        next_retry_at=(now + timedelta(hours=1)).isoformat(),
+    )
+    assert orch._job_next_due(state, job) is None
+
+
 def test_registry_covers_employees_warehouses_and_groups():
     ids = {j.id for j in orch.SYNC_JOBS}
     # The three the operator asked about are all scheduled.
