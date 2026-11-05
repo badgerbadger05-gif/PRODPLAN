@@ -1318,6 +1318,27 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.queryByText(/Выберите склад-источник/)).not.toBeInTheDocument()
   })
 
+  it('launches in 1C with a missing feeder warning and creates no transfer', async () => {
+    const printWindow = { document: { write: vi.fn(), open: vi.fn(), close: vi.fn() }, close: vi.fn(), closed: false }
+    vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
+    vi.mocked(postMaterialIssues).mockResolvedValue({
+      status: 'ok', created: [], reused: [], selection_required: [],
+      feeder_shortages: [], already_on_destination: [], errors: [],
+      transfer_warnings: ['Перемещение не создано: у участка не назначен склад-питатель'],
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+    await waitFor(() => expect(exportProductionOrdersTo1C).toHaveBeenCalledWith(
+      [101], ['production:order:101'], 'rev-7',
+    ))
+    await waitFor(() => expect(screen.getByText(/Перемещение не создано: у участка не назначен склад-питатель/)).toBeInTheDocument())
+    expect(exportMaterialIssuesTo1C).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('launches an order created after cutoff without materializing its retained work item again', async () => {
     const launched = {
       ...fakeRows()[0],
@@ -1580,6 +1601,7 @@ describe('ProductionControlPage — characterization', () => {
       expect(within(rowFor('Предложение MRP')).getByRole('checkbox')).not.toBeChecked()
       expect(printWindow.close).toHaveBeenCalled()
       expect(exportMaterialIssuesTo1C).not.toHaveBeenCalled()
+      expect(exportProductionOrdersTo1C).not.toHaveBeenCalled()
       await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
       await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledTimes(2))
       expect(materializeMakeWorkItems).toHaveBeenCalledTimes(1)

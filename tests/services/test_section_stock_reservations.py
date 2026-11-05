@@ -320,7 +320,7 @@ def test_partial_feeder_allocates_only_free_feeder_qty_and_leaves_remainder_pend
     ] == pytest.approx(0)
 
 
-def test_missing_feeder_binding_fails_clear_without_warehouse_picker(db_session):
+def test_missing_feeder_skips_transfer_without_blocking_parent_launch(db_session):
     db = db_session
     _add_warehouses(db)
     _parent, component, product = _setup(db, order_qty=2, suffix="NO-FEEDER")
@@ -334,7 +334,11 @@ def test_missing_feeder_binding_fails_clear_without_warehouse_picker(db_session)
     result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
     assert result["created"] == []
     assert result["selection_required"] == []
-    assert "workshop feeder warehouse is not configured" in result["errors"][0]
+    assert result["errors"] == []
+    assert "не назначен склад-питатель" in result["transfer_warnings"][0]
+    assert db.query(ProductionMaterialIssue).filter_by(product_id=product.product_id).count() == 0
+    assert db.query(ProductionMaterialCustodyEvent).filter_by(product_id=product.product_id).count() == 0
+    assert preview_materials(db, product.product_id)["coverage_status"] == "ready"
     component_row = preview_materials(db, product.product_id)["components"][0]
     assert component_row["feeder_unavailable_reason"] == "workshop_feeder_assignment_missing"
     assert "не указан склад-питатель" in component_row["feeder_unavailable_label"]

@@ -596,7 +596,7 @@ export function ProductionControlPage() {
       const feederPending = result.feeder_shortages?.length ?? 0
       const alreadyOnDestination = result.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
 
-      setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${feederPending ? `, ожидают пополнения питателя ${feederPending}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
+      setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${feederPending ? `, ожидают пополнения питателя ${feederPending}` : ''}${errors ? `, ошибок ${errors}` : ''}${result.transfer_warnings?.length ? `. ${result.transfer_warnings.join('; ')}` : ''}`)
       await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -698,6 +698,7 @@ export function ProductionControlPage() {
         throw new Error(`Запуск в 1С остановлен: ${issueResult.errors.join('\n')}`)
       }
       const feederPending = issueResult.feeder_shortages?.length ?? 0
+      const transferWarning = issueResult.transfer_warnings?.join('; ') ?? ''
       const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
       const issueIds = issueIdsFromCreateResult(issueResult)
       if (!issueIds.length) {
@@ -718,10 +719,12 @@ export function ProductionControlPage() {
         const summary = `Запуск в 1С: заказов проведено ${ordersCreated}`
           + (ordersExisting ? `, заказов уже было ${ordersExisting}` : '')
           + (feederPending ? `; ожидают пополнения питателя ${feederPending}` : '')
+          + (transferWarning ? `. ${transferWarning}` : '')
         if (ordersError || parent.status === 'partial_error') {
           closeRouteSheetWindow(printWindow)
           throw new Error(`${summary}, ошибок ${ordersError}`)
         }
+        setMessage(`${summary}. Журнал и печать обновляются в фоне.`)
         const pendingReceipt = {
           targetRefs: new Set(orderReceipts.map((receipt) => receipt.targetRef)),
           exportBasisRevision: materialContext.sourceRevision,
@@ -756,6 +759,7 @@ export function ProductionControlPage() {
         (transfersExisting ? `, перемещений уже было ${transfersExisting}` : '') +
         (internalReserves ? `; заявок без перемещения ${internalReserves} — материал уже на участке` : '') +
         (feederPending ? `; ожидают пополнения питателя ${feederPending}` : '') +
+        (transferWarning ? `. ${transferWarning}` : '') +
         (skipped ? `, пропущено ${skipped}` : '') +
         (errored ? `, ошибок ${errored}` : '')
       if (errored > 0 || result.status === 'partial_error' || parent.status === 'partial_error') {

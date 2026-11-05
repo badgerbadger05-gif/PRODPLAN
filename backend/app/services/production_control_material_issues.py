@@ -811,6 +811,7 @@ def create_material_issues(
             "reused": [],
             "selection_required": [],
             "feeder_shortages": [],
+            "transfer_warnings": [],
             "already_on_destination": [],
             "errors": [],
         }
@@ -824,6 +825,7 @@ def create_material_issues(
     reused: List[Dict[str, Any]] = []
     selection_required: List[Dict[str, Any]] = []
     feeder_shortages: List[Dict[str, Any]] = []
+    transfer_warnings: List[str] = []
     errors: List[str] = []
     already_on_destination: List[Dict[str, Any]] = []
     consumed_destination_stock: Dict[Tuple[str, int], float] = {}
@@ -953,7 +955,12 @@ def create_material_issues(
             continue
         feeder_ref = _feeder_warehouse_for_product(db, product, spec_id)
         if not feeder_ref:
-            errors.append(f"product_id={pid}: workshop feeder warehouse is not configured")
+            # Launch coverage belongs to accepted global stock. A missing
+            # feeder prevents a transfer, not export of the parent order.
+            transfer_warnings.append(
+                f"{product.item.item_name} (product_id={pid}): перемещение не создано — "
+                "у участка не назначен склад-питатель"
+            )
             continue
         linked_without_export_ref = [
             row for row in existing_rows
@@ -1188,6 +1195,7 @@ def create_material_issues(
         "reused": reused,
         "selection_required": selection_required,
         "feeder_shortages": feeder_shortages,
+        "transfer_warnings": transfer_warnings,
         "already_on_destination": already_on_destination,
         "errors": errors,
     }

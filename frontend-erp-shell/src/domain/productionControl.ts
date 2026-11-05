@@ -146,6 +146,7 @@ export type WarehouseCandidate = {
 
 export type MaterialIssueCreateResponse = {
   status: string
+  transfer_warnings?: string[]
   created: Array<{
     issue_id: number
     document_number: string
