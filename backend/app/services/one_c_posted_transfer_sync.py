@@ -46,19 +46,20 @@ from .one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 BATCH_SIZE = 15
 
 
-def _fetch_pending_links(db: Session) -> List[SyncLink]:
+def _fetch_pending_links(
+    db: Session, *, issue_ids: Optional[Iterable[int]] = None
+) -> List[SyncLink]:
     """sync_link rows we should re-check against 1C."""
-    return (
-        db.query(SyncLink)
-        .filter(
-            SyncLink.source_system == "PRODPLAN",
-            SyncLink.source_doctype == "material_issue",
-            SyncLink.target_entity == STOCK_TRANSFER_ENTITY,
-            SyncLink.status.in_(("success", "posted")),
-            SyncLink.target_ref_key.isnot(None),
-        )
-        .all()
+    query = db.query(SyncLink).filter(
+        SyncLink.source_system == "PRODPLAN",
+        SyncLink.source_doctype == "material_issue",
+        SyncLink.target_entity == STOCK_TRANSFER_ENTITY,
+        SyncLink.status.in_(("success", "posted")),
+        SyncLink.target_ref_key.isnot(None),
     )
+    if issue_ids is not None:
+        query = query.filter(SyncLink.source_id.in_({int(value) for value in issue_ids}))
+    return query.all()
 
 
 def _query_transfer_docs(client: OData1CClient, ref_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
@@ -314,17 +315,19 @@ def _apply_posted(
     return (changed, None)
 
 
-def sync_posted_transfers(db: Session, *, dry_run: bool = False) -> Dict[str, Any]:
+def sync_posted_transfers(
+    db: Session, *, dry_run: bool = False, issue_ids: Optional[Iterable[int]] = None
+) -> Dict[str, Any]:
     """
-    Read-only against 1C. Picks all material-issue exports that landed
-    successfully (sync_link.status='success'), asks 1C which of them are
-    Posted=true now, and locally promotes them to status='posted' +
-    line-state='assembled'.
+    Read-only against 1C. Picks material-issue exports, optionally bounded to
+    ``issue_ids``, asks 1C which of them are Posted=true now, and locally
+    promotes them to status='posted' + line-state='assembled'. Confirmed
+    documents are queued for physical Ledger read-back.
 
     `dry_run=True` performs the same 1C reads but skips DB writes — useful
     for diagnostics.
     """
-    pending = _fetch_pending_links(db)
+    pending = _fetch_pending_links(db, issue_ids=issue_ids)
     by_ref: Dict[str, SyncLink] = {}
     for link in pending:
         ref = str(link.target_ref_key or "").strip()
@@ -338,6 +341,7 @@ def sync_posted_transfers(db: Session, *, dry_run: bool = False) -> Dict[str, An
         "candidates": len(by_ref),
         "posted_found": 0,
         "advanced": 0,
+        "readback_enqueued": 0,
         "errors": [],
         "details": [],
     }
@@ -361,6 +365,7 @@ def sync_posted_transfers(db: Session, *, dry_run: bool = False) -> Dict[str, An
     summary["posted_found"] = len(posted_docs)
 
     advanced = 0
+    readback_enqueued = 0
     errors: List[str] = []
     for ref in sorted(deleted_docs):
         link = by_ref.get(ref)
@@ -392,6 +397,16 @@ def sync_posted_transfers(db: Session, *, dry_run: bool = False) -> Dict[str, An
             if err:
                 errors.append(err)
                 continue
+            if changed or issue_ids is not None:
+                from .item_ledger.ingest import enqueue_recorder_pull
+
+                enqueue_recorder_pull(
+                    db,
+                    STOCK_TRANSFER_ENTITY,
+                    ref,
+                    source="posted_transfer_sync",
+                )
+                readback_enqueued += 1
             if changed:
                 advanced += 1
                 summary["details"].append(
@@ -410,6 +425,7 @@ def sync_posted_transfers(db: Session, *, dry_run: bool = False) -> Dict[str, An
         db.commit()
 
     summary["advanced"] = advanced
+    summary["readback_enqueued"] = readback_enqueued
     summary["errors"] = errors
     if errors:
         summary["status"] = "partial_error"

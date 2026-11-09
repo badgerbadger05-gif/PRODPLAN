@@ -325,7 +325,7 @@ export function ReleaseFeasibilityPage() {
                         <th>Позиция</th>
                         <th className="feasKindCell">Тип</th>
                         <th className="numCell">Требуется</th>
-                        <th className="numCell">На складах</th>
+                        <th className="numCell">Свободно</th>
                         <th className="numCell">Не хватает</th>
                         <th className="feasUnitCell">Ед.</th>
                         <th className="feasReasonCell">Причина</th>
@@ -381,7 +381,7 @@ export function ReleaseFeasibilityPage() {
                         <th>Состав</th>
                         <th className="numCell">На единицу</th>
                         <th className="numCell">Нужно по ветке</th>
-                        <th className="numCell">На складах</th>
+                        <th className="numCell">Свободно</th>
                         <th className="numCell">Не хватает</th>
                         <th className="feasUnitCell">Ед.</th>
                         <th className="feasReasonCell">Причина</th>
@@ -460,7 +460,7 @@ export function ReleaseFeasibilityPage() {
                     <div className="detailGrid">
                       <span>Тип</span><strong>{selected.kind === 'node' ? 'узел (есть состав)' : 'материал / покупное'}</strong>
                       <span>Требуется</span><strong>{qty(selected.required_qty)} {selected.unit || ''}</strong>
-                      <span>На складах</span><strong>{qty(selected.stock_on_hand)} {selected.unit || ''}</strong>
+                      <span>Свободно</span><strong>{qty(selected.stock_on_hand)} {selected.unit || ''}</strong>
                       <span>Пойдёт в дело</span><strong>{qty(selected.allocated_qty)} {selected.unit || ''}</strong>
                       <span>Не хватает</span><strong>{qty(selected.shortage_qty)} {selected.unit || ''}</strong>
                       <span>Пополнение</span><strong>{selected.replenishment_method || '—'}</strong>
@@ -472,7 +472,10 @@ export function ReleaseFeasibilityPage() {
                       {selected.warehouses.map((warehouse) => (
                         <div className="detailListRow" key={`${warehouse.warehouse_name}-${warehouse.qty}`}>
                           <span>{warehouse.warehouse_name}</span>
-                          <strong>{qty(warehouse.qty)}</strong>
+                          <strong>{qty(warehouse.qty)} свободно</strong>
+                          <span>
+                            физически {qty(warehouse.physical_qty)} · опека {qty(warehouse.reserved_qty)}
+                          </span>
                           {!warehouse.counted && <span className="miniPill failed">не в расчёте</span>}
                         </div>
                       ))}

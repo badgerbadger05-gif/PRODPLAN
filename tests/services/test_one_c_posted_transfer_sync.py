@@ -1788,3 +1788,35 @@ def test_empty_when_no_pending_links(db_session, monkeypatch):
     assert result["status"] == "ok"
     assert result["candidates"] == 0
     assert result["advanced"] == 0
+
+
+def test_targeted_sync_enqueues_readback_only_for_selected_issue(db_session, monkeypatch):
+    db = db_session
+    selected, _selected_link = _mk_issue_with_link(db, target_ref_key="ref-selected")
+    other, _other_link = _mk_issue_with_link(db, target_ref_key="ref-other")
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync,
+        "OData1CClient",
+        lambda **_: _FakeOData({"ref-selected", "ref-other"}),
+    )
+
+    result = posted_sync.sync_posted_transfers(
+        db, issue_ids={int(selected.issue_id)}
+    )
+
+    assert result["candidates"] == 1
+    assert result["posted_found"] == 1
+    assert result["advanced"] == 1
+    assert result["readback_enqueued"] == 1
+    pull = db.query(StockRecorderPull).one()
+    assert pull.recorder_type == STOCK_TRANSFER_ENTITY
+    assert pull.recorder_ref == "ref-selected"
+    assert pull.status == "pending"
+    assert pull.source == "posted_transfer_sync"
+
+    db.refresh(selected)
+    db.refresh(other)
+    assert selected.status == "posted"
+    assert other.status == "exported"
