@@ -2940,7 +2940,13 @@ def post_material_issue_assembled(
 
 
 @router.post("/sync-posted-transfers", response_model=dict)
-def post_sync_posted_transfers(dry_run: bool = False, db: Session = Depends(get_db)):
+def post_sync_posted_transfers(
+    dry_run: bool = False,
+    issue_ids: Optional[str] = Query(
+        None, description="CSV ID заявок для адресной синхронизации"
+    ),
+    db: Session = Depends(get_db),
+):
     """
     Pull Posted=true flag from 1C for previously-exported material-issue
     transfers and advance local state to 'assembled' per plan rule
@@ -2949,7 +2955,16 @@ def post_sync_posted_transfers(dry_run: bool = False, db: Session = Depends(get_
     `?dry_run=true` performs the same reads but skips local DB writes.
     """
     try:
-        return sync_posted_transfers(db, dry_run=bool(dry_run))
+        selected_issue_ids = None
+        if issue_ids is not None:
+            selected_issue_ids = {
+                int(value.strip()) for value in issue_ids.split(",") if value.strip()
+            }
+            if not selected_issue_ids or any(value <= 0 for value in selected_issue_ids):
+                raise ValueError("issue_ids must contain positive integer IDs")
+        return sync_posted_transfers(
+            db, dry_run=bool(dry_run), issue_ids=selected_issue_ids
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

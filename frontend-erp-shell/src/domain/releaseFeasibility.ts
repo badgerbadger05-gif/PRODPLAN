@@ -18,6 +18,8 @@ export type FeasibilitySearchResponse = {
 export type FeasibilityWarehouse = {
   warehouse_name: string
   qty: number
+  physical_qty: number
+  reserved_qty: number
   /** false — склад исключён настройками, его остаток в покрытие не идёт. */
   counted: boolean
 }

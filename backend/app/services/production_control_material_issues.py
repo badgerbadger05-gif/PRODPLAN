@@ -954,14 +954,6 @@ def create_material_issues(
                 reused.append(_issue_reuse_payload(existing, product))
             continue
         feeder_ref = _feeder_warehouse_for_product(db, product, spec_id)
-        if not feeder_ref:
-            # Launch coverage belongs to accepted global stock. A missing
-            # feeder prevents a transfer, not export of the parent order.
-            transfer_warnings.append(
-                f"{product.item.item_name} (product_id={pid}): перемещение не создано — "
-                "у участка не назначен склад-питатель"
-            )
-            continue
         linked_without_export_ref = [
             row for row in existing_rows
             if str(row.status or "") in {"draft", "requested"}
@@ -1034,6 +1026,15 @@ def create_material_issues(
                     )
             if remainder > 1e-9:
                 transfer_components.append({**comp, "required_qty": remainder})
+
+        if transfer_components and not feeder_ref:
+            # Launch coverage belongs to accepted global stock. A missing
+            # feeder prevents a transfer, not export of the parent order.
+            transfer_warnings.append(
+                f"{product.item.item_name} (product_id={pid}): перемещение не создано — "
+                "у участка не назначен склад-питатель"
+            )
+            continue
 
         groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
         if transfer_components:

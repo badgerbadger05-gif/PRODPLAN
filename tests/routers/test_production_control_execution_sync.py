@@ -28,3 +28,22 @@ def test_execution_sync_reads_orders_before_transfers(db_session, monkeypatch):
         "orders": {"orders_updated": 1},
         "transfers": {"advanced": 2},
     }
+
+
+def test_posted_transfer_sync_accepts_target_issue_ids(db_session, monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        routes,
+        "sync_posted_transfers",
+        lambda db, *, dry_run, issue_ids: calls.append((dry_run, issue_ids)) or {
+            "candidates": len(issue_ids)
+        },
+    )
+
+    result = routes.post_sync_posted_transfers(
+        dry_run=True, issue_ids="3286, 3287,3288", db=db_session
+    )
+
+    assert calls == [(True, {3286, 3287, 3288})]
+    assert result == {"candidates": 3}

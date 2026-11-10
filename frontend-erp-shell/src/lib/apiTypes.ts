@@ -11926,6 +11926,8 @@ export interface operations {
         parameters: {
             query?: {
                 dry_run?: boolean;
+                /** @description CSV ID заявок для адресной синхронизации */
+                issue_ids?: string | null;
             };
             header?: never;
             path?: never;
