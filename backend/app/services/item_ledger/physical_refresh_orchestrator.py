@@ -75,7 +75,6 @@ from .physical_refresh_generation import fork_physical_refresh_generation
 from .physical_refresh_discard import discard_physical_refresh_candidate
 from .output_repair_gate import assert_output_repair_allows
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
-from app.services.planning_truth import record_pointer_verification
 from .physical_refresh_current_publish import (
     ForwardPhysicalRefreshUnavailable,
     physical_refresh_last_failure_status,
@@ -2106,20 +2105,9 @@ def run_physical_refresh(
                 ledger_generation_id=int(physical_generation.id),
                 reason="no semantic physical delta",
             )
-            # Decision §57.  This tick did read 1C up to ``cutoff`` and proved
-            # the accepted pointer still converges on balances; the only thing
-            # it did not find is a reason to create a successor.  Freshness is
-            # the age of the last successful reconciliation, not of the last
-            # publication, so record the proof on the pointer in the same
-            # transaction as the discard.  Without it a weekend without
-            # postings left every HTTP reader on 503 ``planning_truth_
-            # unavailable`` until the first Monday document arrived.
-            verified_cutoff = record_pointer_verification(
-                db,
-                verified_generation_id=int(parent.id),
-                verified_cutoff=cutoff,
-                balance_convergence_valid=bool(convergence.valid),
-            )
+            # ``record_verified_noop`` stored this tick's proof on the pointer
+            # in the same transaction as the candidate discard.
+            verified_cutoff = cutoff
             db.commit()
             fixed_run_ids = tuple(
                 int(run_id)

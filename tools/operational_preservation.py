@@ -41,7 +41,7 @@ OPTIONAL_TABLES = frozenset({
     "accepted_production_mutation_state", "accepted_production_mutation",
 })
 SOURCE_REVISION = "20260909_02"
-TARGET_REVISION = "20261030_02"
+TARGET_REVISION = "20260921_01"
 PURCHASE_ADDITIONS = frozenset({
     "current_execution_scope_id", "current_execution_source_revision",
 })
