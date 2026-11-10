@@ -13,6 +13,8 @@ from app.services import planning_truth
 from app.services.item_ledger import current_execution
 from app.services.item_ledger import physical_refresh_current_publish as publisher
 from app.services.item_ledger import physical_refresh_stock_bin as stock_bin
+from app.services import mrp_result_projection
+from app.services.planning_truth import PlanningTruthUnavailable
 from app.services.item_ledger.physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
 from app.services.production_control_common import DONE_STATE_KEY
 
@@ -159,6 +161,70 @@ def _patch_safe_pipeline(monkeypatch, phases):
         publisher, "publish_current_future_supply", lambda db, generation_id, **_kwargs: {},
     )
     monkeypatch.setattr(publisher, "_fixed_run_ids", lambda db: (1,))
+
+
+def test_obligation_builder_allows_only_private_stale_parent_rebuild(
+    db_session, monkeypatch,
+):
+    """The canonical refresh builder may read an expired parent once.
+
+    The MRP builder and SQL-backed freshness guard remain real; only the
+    persisted source projection pieces are fixture-backed so this exercises
+    the actual private call boundary used by physical refresh.
+    """
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    parent, _target = _generations(db_session)
+    parent.capabilities = {
+        "physical_ledger": True,
+        "execution_allocations": True,
+        "planning_snapshots": True,
+    }
+    db_session.flush()
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=parent.id,
+        ledger_cutoff=parent.cutoff,
+    )
+    db_session.add(run)
+    db_session.flush()
+
+    monkeypatch.setattr(
+        mrp_result_projection,
+        "_collect_mrp_payload",
+        lambda *_args: (
+            {"production": [{"item_id": 10, "agg_key": "item:10", "qty": 2}],
+             "purchase": [], "rework": [], "capacity": []},
+            {"run_id": int(run.run_id), "summary": {}, "row_counts": {}, "total_qty": {}},
+        ),
+    )
+    monkeypatch.setattr(
+        mrp_result_projection,
+        "_row_specs",
+        lambda rows: [("production:item:10", "production", 10, "item:10", rows["production"][0])],
+    )
+    monkeypatch.setattr(mrp_result_projection, "_frozen_root_membership", lambda *_a, **_k: {10: {1}})
+    monkeypatch.setattr(mrp_result_projection, "_validate_obligation_lineage", lambda *_a, **_k: None)
+    monkeypatch.setattr(mrp_result_projection, "sealed_run_anchor", lambda *_a, **_k: parent)
+    monkeypatch.setattr(
+        publisher,
+        "build_period_plan_execution_current_payloads",
+        lambda *_a, **_k: {},
+    )
+
+    with pytest.raises(PlanningTruthUnavailable):
+        publisher._build_obligation_view_payloads(
+            db_session, generation_id=int(parent.id), run_ids=(int(run.run_id),),
+        )
+
+    mrp_payloads, period_payloads = publisher._build_obligation_view_payloads(
+        db_session,
+        generation_id=int(parent.id),
+        run_ids=(int(run.run_id),),
+        allow_stale_parent=True,
+    )
+    assert set(mrp_payloads) == {str(run.run_id)}
+    assert period_payloads == {}
 
 
 def test_production_affected_items_include_source_free_terminal_release_range(

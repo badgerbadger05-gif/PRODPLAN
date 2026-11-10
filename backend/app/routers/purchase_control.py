@@ -283,6 +283,17 @@ def get_orders(
         saved.pop("snapshot_id", None)
         saved.pop("summary", None)
         saved.pop("cards", None)
+        # The projection builder keeps ``truth_status=building`` in its
+        # internal purchase payload while it stages rows.  Once that payload
+        # has been published as a ready accepted current scope, the public
+        # current-owner contract must expose accepted truth.
+        if (
+            bool(getattr(current_manifest, "result_ready", False))
+            and str(current_manifest.source_revision or "").startswith("accepted:g")
+        ):
+            saved["truth_status"] = "accepted"
+        saved["current_scope_id"] = int(current_manifest.id)
+        saved["source_revision"] = str(current_manifest.source_revision)
         saved["current_execution_scope_id"] = int(current_manifest.id)
         # The page totals belong to the rows this answer serves, not to the
         # unfiltered build-time cardinality of the publication envelope.

@@ -1830,6 +1830,51 @@ def _manifest_basis(
     )
 
 
+def validate_recovery_material_custody_full_tail(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+) -> dict[str, int]:
+    """Require a recovery candidate to cover the complete custody event stream.
+
+    Normal physical and obligation-refresh projections are immutable snapshots
+    at their generation cutoff.  Guarded recovery is different: it replaces the
+    already-live compact custody rows without advancing that cutoff.  Its caller
+    must therefore hold ``lock_current_custody_marker`` and prove that no local
+    operational event was appended after the candidate was built.  A writer
+    that reached the marker first is visible here and makes recovery fail; one
+    that reaches it later waits until the new current projection is published.
+    """
+    generation_id = int(ledger_generation_id)
+    manifest = _read_manifest(db, generation_id=generation_id)
+    if manifest is None or str(manifest.status) != "complete":
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=None if manifest is None else generation_id,
+            reason="recovery custody snapshot manifest is missing or incomplete",
+        )
+
+    projected_watermark = int(manifest.source_event_high_watermark_id)
+    full_stream_watermark = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0)).scalar()
+        or 0
+    )
+    if projected_watermark != full_stream_watermark:
+        raise MaterialCustodySnapshotUnavailable(
+            manifest_generation_id=generation_id,
+            expected_generation_id=generation_id,
+            stored_generation_id=generation_id,
+            reason=(
+                "recovery custody snapshot does not cover the full custody event stream"
+            ),
+        )
+    return {
+        "ledger_generation_id": generation_id,
+        "source_event_high_watermark_id": projected_watermark,
+        "full_stream_high_watermark_id": full_stream_watermark,
+    }
+
+
 def prepare_current_material_custody(
     db: Session, *, ledger_generation_id: int
 ) -> PreparedCurrentMaterialCustodyChange:
@@ -2397,6 +2442,7 @@ def lock_current_custody_marker(db: Session) -> models.PlanningTruthState | None
     return (
         db.query(models.PlanningTruthState)
         .filter(models.PlanningTruthState.id == 1)
+        .populate_existing()
         .with_for_update()
         .one_or_none()
     )
@@ -2664,6 +2710,7 @@ def load_compact_current_material_custody(
     db: Session,
     *,
     consumer: str,
+    allow_stale_parent: bool = False,
 ) -> tuple[int, MaterialCustodyState]:
     """Read the already-published compact custody projection only.
 
@@ -2675,7 +2722,16 @@ def load_compact_current_material_custody(
     """
     from .planning_truth import require_accepted_truth
 
-    truth = require_accepted_truth(db, consumer)
+    # The physical-refresh builder may need to rebuild a disposable candidate
+    # from the structurally accepted parent before it records the completed
+    # source-proof marker.  Public readers keep the default strict freshness
+    # guard; this explicit private flag does not skip pointer/manifest,
+    # provenance, or event-tail validation below.
+    truth = require_accepted_truth(
+        db,
+        consumer,
+        allow_stale=allow_stale_parent,
+    )
     generation_id = int(truth.generation_id)
     manifest = _read_manifest(db, generation_id=generation_id)
     if manifest is None or str(manifest.status) != "complete":

@@ -1396,11 +1396,12 @@ def test_publisher_failure_rolls_back_and_discards_candidate(
 
 
 def test_run_physical_refresh_true_noop_discards_lightweight_candidate(db_session, monkeypatch):
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
     parent, _ = _accepted_parent(db_session, generation_key="noop-parent")
     target_cutoff = parent.cutoff + timedelta(days=1)
     batch = models.PhysicalImportBatch(
         batch_key="noop-refresh-batch", status="completed", cutoff=target_cutoff,
-        source_watermarks={}, completed_at=target_cutoff,
+        source_watermarks={"content_hash": "noop-refresh-proof"}, completed_at=target_cutoff,
     )
     physical = models.LedgerGeneration(
         generation_key="noop-refresh-generation", status="building", cutoff=target_cutoff,
@@ -1439,7 +1440,10 @@ def test_run_physical_refresh_true_noop_discards_lightweight_candidate(db_sessio
         compared=0, mismatched=0, matched=0, terminal_batch_id=batch.id, deltas=(),
     )
     monkeypatch.setattr(workflow, "fork_physical_refresh_generation", lambda *a, **k: fork_result)
-    monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *a, **k: object())
+    monkeypatch.setattr(
+        workflow, "run_physical_recorder_audit",
+        lambda *a, **k: SimpleNamespace(recorder_audit_checksum="a" * 64),
+    )
     monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *a, **k: import_result)
     monkeypatch.setattr(
         workflow,
@@ -1451,6 +1455,8 @@ def test_run_physical_refresh_true_noop_discards_lightweight_candidate(db_sessio
         "_aggregate_sles_for_convergence",
         lambda *a, **k: pytest.fail("normal refresh scanned historical SLE prefix"),
     )
+    batch_id = int(batch.id)
+    batch_key = str(batch.batch_key)
     result = workflow.run_physical_refresh(
         db_session, generation_key="noop-refresh-generation", target_cutoff=target_cutoff,
         client=object(),
@@ -1460,6 +1466,14 @@ def test_run_physical_refresh_true_noop_discards_lightweight_candidate(db_sessio
     assert result.replayed_rows == 0
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
     assert db_session.get(models.LedgerGeneration, physical.id).status == "rejected"
+    verification = db_session.query(models.PlanningTruthVerification).one()
+    assert verification.ledger_generation_id == parent.id
+    assert verification.physical_import_batch_id == batch_id
+    assert verification.physical_import_batch_key == batch_key
+    assert verification.source_batch_hash == "noop-refresh-proof"
+    # The disposable candidate batch is removed by discard; the source proof
+    # remains as historical evidence without an FK to that boundary.
+    assert db_session.get(models.PhysicalImportBatch, batch_id) is None
     assert db_session.query(models.StockBin).count() == before_bins
     # Decision §57: the tick read 1C up to the new cutoff and converged, so the
     # pointer it was computed from is verified that far even though nothing was

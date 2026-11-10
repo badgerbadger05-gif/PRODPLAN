@@ -49,24 +49,75 @@ require_env() {
   [[ "${admin_token}" != *REPLACE* && "${admin_token}" != *change_me* ]] || die \
     "замените шаблонный ITEM_LEDGER_ADMIN_TOKEN"
 
-  local frontend_context
-  frontend_context="$(sed -n 's/^PRODPLAN_FRONTEND_BUILD_CONTEXT=//p' "${ENV_FILE}" | tail -n 1)"
-  frontend_context="${frontend_context:-./frontend-erp-shell}"
-  [[ -f "${frontend_context}/Dockerfile" && -f "${frontend_context}/package.json" ]] || die \
-    "PRODPLAN_FRONTEND_BUILD_CONTEXT не указывает на подготовленный frontend: ${frontend_context}"
+}
 
-  local expected_frontend_commit actual_frontend_commit
-  expected_frontend_commit="$(
-    sed -n 's/^PRODPLAN_FRONTEND_EXPECTED_COMMIT=//p' "${ENV_FILE}" | tail -n 1
-  )"
-  [[ "${expected_frontend_commit}" =~ ^[0-9a-f]{40}$ ]] || die \
-    "задайте полный 40-символьный PRODPLAN_FRONTEND_EXPECTED_COMMIT"
-  actual_frontend_commit="$(git -C "${frontend_context}" rev-parse HEAD 2>/dev/null)" || die \
-    "frontend context не принадлежит проверенному Git checkout: ${frontend_context}"
-  [[ "${actual_frontend_commit}" == "${expected_frontend_commit}" ]] || die \
-    "frontend commit ${actual_frontend_commit} не совпадает с ожидаемым ${expected_frontend_commit}"
-  [[ -z "$(git -C "${frontend_context}" status --short --untracked-files=no)" ]] || die \
-    "frontend checkout содержит незакоммиченные изменения"
+env_value() {
+  local key="$1"
+  sed -n "s/^${key}=//p" "${ENV_FILE}" | tail -n 1
+}
+
+require_runtime_images() {
+  require_runtime_image \
+    PRODPLAN_BACKEND_GREEN_IMAGE \
+    PRODPLAN_BACKEND_GREEN_EXPECTED_IMAGE_ID \
+    PRODPLAN_BACKEND_GREEN_REVISION
+  require_runtime_image \
+    PRODPLAN_SYNC_WORKER_IMAGE \
+    PRODPLAN_SYNC_WORKER_EXPECTED_IMAGE_ID \
+    PRODPLAN_SYNC_WORKER_REVISION
+  require_runtime_image \
+    PRODPLAN_FRONTEND_IMAGE \
+    PRODPLAN_FRONTEND_EXPECTED_IMAGE_ID
+}
+
+require_runtime_image() {
+  local image_var="$1" image_id_var="$2" revision_var="${3:-}"
+  local image expected_id actual_id expected_revision actual_revision
+  image="$(env_value "${image_var}")"
+  expected_id="$(env_value "${image_id_var}")"
+  [[ "${image}" =~ ^[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] || die \
+    "${image_var} must name a stable local image tag"
+  [[ "${image}" != *:latest && "${image}" != *REPLACE* ]] || die \
+    "${image_var} must not use latest or a placeholder"
+  [[ "${expected_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || die \
+    "${image_id_var} must contain the reviewed sha256 image ID"
+  actual_id="$(docker image inspect "${image}" --format '{{.Id}}' 2>/dev/null)" || die \
+    "reviewed image is not present locally: ${image}"
+  [[ "${actual_id}" == "${expected_id}" ]] || die \
+    "image ${image} ID ${actual_id} != expected ${expected_id}"
+  if [[ -n "${revision_var}" ]]; then
+    expected_revision="$(env_value "${revision_var}")"
+    [[ "${expected_revision}" =~ ^[0-9a-f]{40}$ ]] || die \
+      "${revision_var} must contain the reviewed 40-character commit"
+    actual_revision="$(docker image inspect "${image}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+    [[ "${actual_revision}" == "${expected_revision}" ]] || die \
+      "image ${image} revision ${actual_revision} != expected ${expected_revision}"
+  fi
+}
+
+require_frontend_proxy_config() {
+  local nginx_config
+  nginx_config="$(env_value PRODPLAN_FRONTEND_NGINX_CONFIG)"
+  nginx_config="${nginx_config:-./config-shadow/nginx/default.conf}"
+  [[ -f "${nginx_config}" ]] || die \
+    "reviewed persistent frontend nginx config is missing: ${nginx_config}"
+  grep -Fqx '  set $backend_upstream http://backend-green:8000;' "${nginx_config}" || die \
+    "frontend nginx config must point only to backend-green"
+}
+
+require_schema_at_head() {
+  local expected_heads current_heads
+  expected_heads="$(
+    compose run --rm --no-deps backend-green python -c \
+      'from alembic.config import Config; from alembic.script import ScriptDirectory; print(",".join(sorted(ScriptDirectory.from_config(Config("alembic.ini")).get_heads())))'
+  )" || die "не удалось прочитать Alembic heads из reviewed backend image"
+  current_heads="$(
+    compose exec -T db sh -c \
+      'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "SELECT version_num FROM alembic_version ORDER BY version_num"'
+  )" || die "не удалось прочитать текущую ревизию Alembic из shadow-базы"
+  current_heads="${current_heads//$'\n'/,}"
+  [[ -n "${expected_heads}" && "${current_heads}" == "${expected_heads}" ]] || die \
+    "shadow schema ${current_heads:-<none>} != reviewed backend head ${expected_heads:-<none>}; run explicit migrate"
 }
 
 compose() {
@@ -114,28 +165,32 @@ bootstrap() {
 
 build_images() {
   require_env
-  compose build backend frontend
+  require_runtime_images
+  info "используются pinned backend/frontend/worker images; implicit build запрещён"
 }
 
 migrate() {
   require_env
+  require_runtime_images
   compose up -d db
   wait_for_db
   # A one-shot container applies migrations before the long-running backend is
   # allowed to start.
-  compose run --rm --no-deps backend alembic upgrade head
+  compose run --rm --no-deps backend-green alembic upgrade head
+  require_schema_at_head
   info "миграции shadow-базы применены"
 }
 
 start_stack() {
   require_retired_ports_closed
   require_env
+  require_runtime_images
+  require_frontend_proxy_config
   compose config --quiet
-  compose build backend frontend
   compose up -d db
   wait_for_db
-  compose run --rm --no-deps backend alembic upgrade head
-  compose up -d --no-deps backend
+  require_schema_at_head
+  compose up -d --no-deps backend-green
   compose up -d frontend
   verify_stack
 }
@@ -143,17 +198,20 @@ start_stack() {
 verify_stack() {
   require_retired_ports_closed
   require_env
+  require_runtime_images
+  require_frontend_proxy_config
+  require_schema_at_head
   compose ps
   local backend_port frontend_port
-  backend_port="$(sed -n 's/^PRODPLAN_SHADOW_BACKEND_PORT=//p' "${ENV_FILE}" | tail -n 1)"
+  backend_port="$(sed -n 's/^PRODPLAN_SHADOW_GREEN_PORT=//p' "${ENV_FILE}" | tail -n 1)"
   frontend_port="$(sed -n 's/^PRODPLAN_SHADOW_FRONTEND_PORT=//p' "${ENV_FILE}" | tail -n 1)"
-  backend_port="${backend_port:-8020}"
+  backend_port="${backend_port:-18020}"
   frontend_port="${frontend_port:-9020}"
   curl --fail --silent --show-error --max-time 10 \
     "http://127.0.0.1:${backend_port}/health" >/dev/null
   curl --fail --silent --show-error --max-time 10 \
     "http://127.0.0.1:${frontend_port}/" >/dev/null
-  compose exec -T backend alembic current
+  compose exec -T backend-green alembic current
   info "backend и frontend отвечают; 8010/9010 закрыты; версия миграции показана выше"
 }
 
@@ -187,7 +245,8 @@ restore_db() {
     "restore разрешён только из ${backup_root}, получен ${source_real}"
   [[ "${CONFIRM_RESTORE:-}" == "${PROJECT_NAME}" ]] || die \
     "restore удалит ТОЛЬКО shadow-базу; повторите с CONFIRM_RESTORE=${PROJECT_NAME}"
-  compose --profile automation stop frontend backend sync-worker 2>/dev/null || true
+  compose --profile automation --profile rollback stop \
+    frontend backend backend-green sync-worker 2>/dev/null || true
   compose up -d db
   wait_for_db
   compose exec -T db sh -c \
@@ -202,16 +261,53 @@ restore_db() {
 
 start_workers() {
   require_env
-  # sync-worker has its own Compose image tag.  Rebuild it explicitly so an
-  # automation restart cannot silently reuse code from an older shadow commit.
-  compose --profile automation build sync-worker
-  compose --profile automation up -d sync-worker
+  require_runtime_images
+  local green_port
+  green_port="$(env_value PRODPLAN_SHADOW_GREEN_PORT)"
+  green_port="${green_port:-18020}"
+  curl --fail --silent --show-error --max-time 10 \
+    "http://127.0.0.1:${green_port}/health" >/dev/null || die \
+    "backend-green is not healthy; refusing to start worker"
+  local worker_id worker_state worker_paused worker_image desired_worker_image
+  local worker_base_url
+  local stray_green_worker
+  stray_green_worker="$(
+    docker ps -aq \
+      --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
+      --filter "label=com.docker.compose.service=sync-worker-green"
+  )"
+  [[ -z "${stray_green_worker}" ]] || die \
+    "sync-worker-green still exists; remove it before starting canonical sync-worker"
+  worker_id="$(compose --profile automation ps --all -q sync-worker 2>/dev/null || true)"
+  if [[ -n "${worker_id}" ]]; then
+    worker_state="$(docker inspect --format '{{.State.Status}}' "${worker_id}")"
+    worker_paused="$(docker inspect --format '{{.State.Paused}}' "${worker_id}")"
+    worker_image="$(docker inspect --format '{{.Image}}' "${worker_id}")"
+    worker_base_url="$(
+      docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${worker_id}" \
+        | sed -n 's/^SYNC_BASE_URL=//p' \
+        | tail -n 1
+    )"
+    desired_worker_image="$(env_value PRODPLAN_SYNC_WORKER_EXPECTED_IMAGE_ID)"
+    if [[ "${worker_state}" == running ]]; then
+      if [[ \
+        "${worker_paused}" == false \
+        && "${worker_image}" == "${desired_worker_image}" \
+        && "${worker_base_url}" == "http://backend-green:8000" \
+      ]]; then
+        info "canonical sync-worker уже запущен на reviewed image"
+        return 0
+      fi
+      die "existing sync-worker is running or paused on another image; use the explicit pause/drain/stop handoff first"
+    fi
+  fi
+  compose --profile automation up -d --no-deps --force-recreate sync-worker
   info "shadow sync-worker включён; legacy MRP reconcile-worker удалён"
 }
 
 stop_stack() {
   require_env
-  compose --profile automation stop
+  compose --profile automation --profile rollback stop
   info "shadow-контейнеры остановлены; volume и данные сохранены"
 }
 
@@ -220,9 +316,9 @@ usage() {
 Использование: scripts/shadow-stack.sh COMMAND
 
   bootstrap        создать защищённые каталоги и шаблон .env.shadow
-  build            собрать backend и frontend
+  build            проверить наличие pinned backend/frontend/worker images
   migrate          поднять только БД и применить Alembic
-  start            build -> БД -> миграции -> backend -> frontend -> verify
+  start            pinned green backend -> frontend -> verify
   verify           проверить контейнеры, HTTP и текущую миграцию
   backup           создать согласованный custom-format dump shadow-базы
   restore FILE     восстановить shadow-базу (нужен CONFIRM_RESTORE=prodplan-shadow)

@@ -240,6 +240,8 @@ def _row_specs(
 def build_mrp_result_current_payload(
     db: Session,
     run_id: int,
+    *,
+    allow_stale_parent: bool = False,
 ) -> dict[str, Any]:
     """Build the direct current-owner payload for one MRP run.
 
@@ -281,6 +283,7 @@ def build_mrp_result_current_payload(
             db,
             CONSUMER,
             required_capabilities=REQUIRED_CAPABILITIES,
+            allow_stale=allow_stale_parent,
         )
         current_generation = _accepted_generation(db, int(truth.generation_id))
         sealed_run_anchor(db, run, current_generation)

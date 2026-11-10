@@ -828,12 +828,16 @@ def _replenishment_work_item_checkpoint(
             f"live-plan scope is unreadable for generation {int(generation.id)}: {exc}"
         ) from exc
     if live_run_ids:
+        staged_identities = {
+            str(entry.current_identity or "") for entry in scope_entries.values()
+        }
         for entry in db.query(models.ReservationEntry).filter(
             models.ReservationEntry.run_id.in_(sorted(live_run_ids)),
             models.ReservationEntry.is_current.is_(True),
             models.ReservationEntry.lifecycle_status == "active",
         ).all():
-            scope_entries.setdefault(int(entry.id), entry)
+            if str(entry.current_identity or "") not in staged_identities:
+                scope_entries.setdefault(int(entry.id), entry)
     expected = {
         int(entry.id): entry
         for entry in scope_entries.values()

@@ -30,11 +30,11 @@ services:
       retries: 15
       start_period: 15s
 
-  backend:
-    build:
-      context: ./backend
-      args:
-        INSTALL_DEV: "false"
+  # The normal stack runs the reviewed immutable green image. Keep the old
+  # backend only as an explicit rollback profile; never rebuild it implicitly.
+  backend-green:
+    image: ${PRODPLAN_BACKEND_GREEN_IMAGE:?Set PRODPLAN_BACKEND_GREEN_IMAGE in .env.shadow}
+    pull_policy: never
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://${PRODPLAN_SHADOW_POSTGRES_USER:-prodplan_shadow}:${PRODPLAN_SHADOW_POSTGRES_PASSWORD:?Set PRODPLAN_SHADOW_POSTGRES_PASSWORD in .env.shadow}@db:5432/${PRODPLAN_SHADOW_POSTGRES_DB:-prodplan_shadow}
@@ -48,7 +48,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "${PRODPLAN_SHADOW_BIND_ADDRESS:-0.0.0.0}:${PRODPLAN_SHADOW_BACKEND_PORT:-8020}:8000"
+      - "127.0.0.1:${PRODPLAN_SHADOW_GREEN_PORT:-18020}:8000"
     volumes:
       # OData credentials live here, but the sync orchestrator also persists
       # its independent shadow schedule in this directory.
@@ -68,22 +68,63 @@ services:
       retries: 15
       start_period: 30s
 
+    networks:
+      default:
+        aliases:
+          - backend-green
+
+  # Preserve the canonical service identity and DNS name for an explicit
+  # rollback. The inactive profile prevents ordinary start from reviving it.
+  backend:
+    profiles: ["rollback"]
+    image: ${PRODPLAN_BACKEND_ROLLBACK_IMAGE:?Set PRODPLAN_BACKEND_ROLLBACK_IMAGE in .env.shadow}
+    pull_policy: never
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://${PRODPLAN_SHADOW_POSTGRES_USER:-prodplan_shadow}:${PRODPLAN_SHADOW_POSTGRES_PASSWORD:?Set PRODPLAN_SHADOW_POSTGRES_PASSWORD in .env.shadow}@db:5432/${PRODPLAN_SHADOW_POSTGRES_DB:-prodplan_shadow}
+      PLANNING_TRUTH_MAX_AGE_SECONDS: "${PRODPLAN_TRUTH_MAX_AGE_SECONDS:-86400}"
+      TZ: Europe/Moscow
+      PRODPLAN_DEPLOYMENT_CONTOUR: production
+      PRODPLAN_MATERIAL_ISSUE_NUMBER_OFFSET: ${PRODPLAN_MATERIAL_ISSUE_NUMBER_OFFSET:-100000000}
+      ITEM_LEDGER_ADMIN_TOKEN: ${ITEM_LEDGER_ADMIN_TOKEN:?Set ITEM_LEDGER_ADMIN_TOKEN in .env.shadow}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PRODPLAN_SHADOW_BIND_ADDRESS:-0.0.0.0}:${PRODPLAN_SHADOW_BACKEND_PORT:-8020}:8000"
+    volumes:
+      - ./config-shadow:/app/config
+      - ./output-shadow:/app/output
+    extra_hosts:
+      - "mtzw7:10.36.0.6"
+      - "mtzw7.lan:10.36.0.6"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
   frontend:
-    build:
-      # The finished UI may live in a separate checkout while the release is
-      # being assembled. Point this at that exact reviewed source tree.
-      context: ${PRODPLAN_FRONTEND_BUILD_CONTEXT:-./frontend-erp-shell}
-      args:
-        VITE_DEPLOYMENT_CONTOUR: production
+    # Keep the exact reviewed live UI image; never rebuild an older frontend
+    # implicitly during a backend/worker restart.
+    image: ${PRODPLAN_FRONTEND_IMAGE:?Set PRODPLAN_FRONTEND_IMAGE in .env.shadow}
+    pull_policy: never
     restart: unless-stopped
     environment:
       TZ: Europe/Moscow
       PRODPLAN_DEPLOYMENT_CONTOUR: production
     depends_on:
-      backend:
+      backend-green:
         condition: service_healthy
     ports:
       - "${PRODPLAN_SHADOW_BIND_ADDRESS:-0.0.0.0}:${PRODPLAN_SHADOW_FRONTEND_PORT:-9020}:80"
+    volumes:
+      - ${PRODPLAN_FRONTEND_NGINX_CONFIG:-./config-shadow/nginx/default.conf}:/etc/nginx/conf.d/default.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
       interval: 10s
@@ -91,19 +132,17 @@ services:
       retries: 15
       start_period: 20s
 
-  # Workers are intentionally OFF during bootstrap. Start them after checking
-  # the OData load and selecting the required cadence.
+  # There is exactly one canonical worker. It follows green and is pinned;
+  # no second green-worker service may be started concurrently.
   sync-worker:
     profiles: ["automation"]
-    build:
-      context: ./backend
-      args:
-        INSTALL_DEV: "false"
+    image: ${PRODPLAN_SYNC_WORKER_IMAGE:?Set PRODPLAN_SYNC_WORKER_IMAGE in .env.shadow}
+    pull_policy: never
     restart: unless-stopped
     command: ["python", "sync_worker.py"]
     environment:
       TZ: Europe/Moscow
-      SYNC_BASE_URL: http://backend:8000
+      SYNC_BASE_URL: http://backend-green:8000
       SYNC_TICK_INTERVAL_SECONDS: ${PRODPLAN_SHADOW_SYNC_TICK_INTERVAL_SECONDS:-300}
       SYNC_STARTUP_DELAY_SECONDS: ${PRODPLAN_SHADOW_SYNC_STARTUP_DELAY_SECONDS:-180}
       # A physical refresh can legitimately run for tens of minutes.  Keep
@@ -112,7 +151,7 @@ services:
       SYNC_TICK_TIMEOUT_SECONDS: ${PRODPLAN_SHADOW_SYNC_TICK_TIMEOUT_SECONDS:-3600}
       PRODPLAN_DEPLOYMENT_CONTOUR: production
     depends_on:
-      backend:
+      backend-green:
         condition: service_healthy
 
 volumes:

@@ -54,11 +54,11 @@ def _generations(db_session, *, key="scope-repair", with_target=True):
     target_cutoff = parent_cutoff + timedelta(days=1)
     parent_batch = models.PhysicalImportBatch(
         batch_key=f"{key}-parent-batch", status="completed", source_complete=True,
-        cutoff=parent_cutoff, source_watermarks={}, completed_at=parent_cutoff,
+        cutoff=parent_cutoff, source_watermarks={"content_hash": f"{key}-parent-proof"}, completed_at=parent_cutoff,
     )
     target_batch = models.PhysicalImportBatch(
         batch_key=f"{key}-target-batch", status="completed", source_complete=True,
-        cutoff=target_cutoff, source_watermarks={}, completed_at=target_cutoff,
+        cutoff=target_cutoff, source_watermarks={"content_hash": f"{key}-target-proof"}, completed_at=target_cutoff,
     )
     parent = models.LedgerGeneration(
         generation_key=f"{key}-parent", status="accepted", cutoff=parent_cutoff,
@@ -303,7 +303,7 @@ def test_noop_refresh_republishes_invalidated_scopes_without_row_or_audit_churn(
     target_cutoff = parent.cutoff + timedelta(days=1)
     batch = models.PhysicalImportBatch(
         batch_key="noop-repair-batch", status="completed", cutoff=target_cutoff,
-        source_watermarks={}, completed_at=target_cutoff,
+        source_watermarks={"content_hash": "noop-repair-proof"}, completed_at=target_cutoff,
     )
     candidate = models.LedgerGeneration(
         generation_key="noop-repair-candidate", status="building", cutoff=target_cutoff,
@@ -357,7 +357,10 @@ def test_noop_refresh_republishes_invalidated_scopes_without_row_or_audit_churn(
         compared=0, mismatched=0, matched=0, terminal_batch_id=batch.id, deltas=(),
     )
     monkeypatch.setattr(workflow, "fork_physical_refresh_generation", lambda *a, **k: fork_result)
-    monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *a, **k: object())
+    monkeypatch.setattr(
+        workflow, "run_physical_recorder_audit",
+        lambda *a, **k: SimpleNamespace(recorder_audit_checksum="a" * 64),
+    )
     monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *a, **k: import_result)
     monkeypatch.setattr(
         bootstrap, "_aggregate_sles_for_convergence",
@@ -410,7 +413,7 @@ def test_noop_refresh_leaves_ready_scopes_completely_untouched(db_session, monke
     target_cutoff = parent.cutoff + timedelta(days=1)
     batch = models.PhysicalImportBatch(
         batch_key="noop-clean-batch", status="completed", cutoff=target_cutoff,
-        source_watermarks={}, completed_at=target_cutoff,
+        source_watermarks={"content_hash": "noop-clean-proof"}, completed_at=target_cutoff,
     )
     candidate = models.LedgerGeneration(
         generation_key="noop-clean-candidate", status="building", cutoff=target_cutoff,
@@ -447,7 +450,10 @@ def test_noop_refresh_leaves_ready_scopes_completely_untouched(db_session, monke
         complete=True, physical_import_batch_id=batch.id,
     )
     monkeypatch.setattr(workflow, "fork_physical_refresh_generation", lambda *a, **k: fork_result)
-    monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *a, **k: object())
+    monkeypatch.setattr(
+        workflow, "run_physical_recorder_audit",
+        lambda *a, **k: SimpleNamespace(recorder_audit_checksum="a" * 64),
+    )
     monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *a, **k: import_result)
     monkeypatch.setattr(
         publisher, "build_compact_current_assembly_payload",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -417,7 +418,7 @@ def test_current_assembly_queue_exposes_identity_revision_and_filters_before_pag
 
 
 def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_session):
-    _accepted_generation(db_session)
+    generation, _ = _accepted_generation(db_session)
     rows = [
         {
             "run_id": 3000 + index,
@@ -440,13 +441,50 @@ def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_sessi
         }
         for index in range(5)
     ]
+    from app.services.item_ledger.physical_refresh_current_publish import (
+        _publish_assembly_current,
+    )
+    queue_rows = [
+        {
+            "entity_kind": "assembly_queue",
+            "business_identity": f"plan-line:{row['plan_line_id']}",
+            "scope_key": "assembly:all-live-plans",
+            "payload": {
+                "plan_id": row["plan_id"],
+                "plan_line_id": row["plan_line_id"],
+                "run_id": row["run_id"],
+                "item_id": row["item_id"],
+                "bucket_date": row["bucket_date"],
+                "period_from": row["period_from"],
+                "period_to": row["period_to"],
+                "planned_output_qty": str(row["planned_output_qty"]),
+                "accepted_plan_output_qty": str(row["accepted_plan_output_qty"]),
+                "assembly_remaining_qty": str(row["assembly_remaining_qty"]),
+                "eligible_from": row["eligible_from"],
+                "original_priority": row["priority_key"],
+                "sort_key": row["sort_key"],
+            },
+        }
+        for row in rows
+    ]
+    _publish_assembly_current(
+        db_session,
+        target_id=int(generation.id),
+        assembly_payload=SimpleNamespace(
+            queue_rows=tuple(queue_rows), readiness_rows=(), readiness_metrics={}
+        ),
+        revision="physical:g1:queue-summary",
+    )
     db_session.commit()
 
     page = client.get(
         "/api/v1/production-control/assembly-queue", params={"limit": 2, "offset": 3}
     )
-    assert page.status_code == 503
-    assert page.json()["detail"]["code"] == "assembly_queue_unavailable"
+    assert page.status_code == 200
+    body = page.json()
+    assert len(body["rows"]) == 2
+    assert body["total_rows"] == 5
+    assert body["total_queue_qty"] == 50.0
 
     assert (
         client.get(
@@ -454,6 +492,77 @@ def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_sessi
         ).status_code
         == 422
     )
+
+
+def test_assembly_queue_keeps_missing_summary_fail_closed(client, db_session):
+    generation, _ = _accepted_generation(db_session)
+    from app.services.item_ledger.current_execution import publish_current_execution_scope
+
+    rows = [
+        {
+            "entity_kind": "assembly_queue",
+            "business_identity": "plan-line:601",
+            "scope_key": "assembly:all-live-plans",
+            "payload": {
+                "plan_id": 401,
+                "plan_line_id": 601,
+                "run_id": 301,
+                "item_id": 7,
+                "period_from": "2026-08-01",
+                "period_to": "2026-08-31",
+                "bucket_date": "2026-08-03",
+                "planned_output_qty": "10",
+                "accepted_plan_output_qty": "3",
+                "assembly_remaining_qty": "7",
+                "original_priority": ["2026-08-01", "2026-08-31", 401, 601],
+                "sort_key": "2026-08-01|2026-08-31|0000000401|0000000601",
+            },
+        },
+    ]
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:r8-missing-summary",
+        source_generation_id=int(generation.id),
+        scope_key="assembly:all-live-plans",
+        rows=rows,
+        entity_kinds=("assembly_queue",),
+        summary={"total_rows": 1},
+    )
+    db_session.commit()
+
+    response = client.get("/api/v1/production-control/assembly-queue")
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "assembly_queue_unavailable",
+            "reason": "current queue summary is missing",
+        }
+    }
+
+
+def test_assembly_queue_publisher_persists_zero_summary_for_empty_queue(
+    client, db_session
+):
+    generation, _ = _accepted_generation(db_session)
+    from app.services.item_ledger.physical_refresh_current_publish import (
+        _publish_assembly_current,
+    )
+
+    _publish_assembly_current(
+        db_session,
+        target_id=int(generation.id),
+        assembly_payload=SimpleNamespace(
+            queue_rows=(), readiness_rows=(), readiness_metrics={}
+        ),
+        revision="physical:g1:empty-queue-summary",
+    )
+    db_session.commit()
+
+    response = client.get("/api/v1/production-control/assembly-queue")
+    assert response.status_code == 200
+    assert response.json()["rows"] == []
+    assert response.json()["total_rows"] == 0
+    assert response.json()["total_queue_qty"] == 0.0
 
 
 def test_assembly_queue_router_rejects_missing_assembly_queue_capability(

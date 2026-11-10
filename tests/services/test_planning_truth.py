@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -92,6 +92,114 @@ def test_publish_and_require_return_complete_accepted_identity(db_session):
         is False
     )
     assert required.accepted_at is not None
+
+
+def test_verified_noop_advances_freshness_without_mutating_generation(db_session, monkeypatch):
+    now = datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc)
+    cutoff = datetime(2026, 9, 18, 14, 43, 36, tzinfo=timezone.utc)
+    batch = models.PhysicalImportBatch(
+        batch_key="verified-noop-batch", status="completed", source_complete=True,
+        cutoff=now, source_watermarks={"content_hash": "batch-proof"}, completed_at=now,
+    )
+    generation = _generation(
+        generation_key="verified-noop-generation", status="accepted",
+        cutoff=cutoff, accepted_at=cutoff, physical_import_batch=batch,
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.commit()
+    monkeypatch.setenv(planning_truth.TRUTH_MAX_AGE_SECONDS_ENV, "86400")
+
+    assert planning_truth.get_readiness(db_session, now=now).truth_status == "stale"
+    planning_truth.record_verified_noop(
+        db_session,
+        generation_id=generation.id,
+        physical_import_batch_id=batch.id,
+        verified_through=now - timedelta(minutes=1),
+        convergence_hash="c" * 64,
+        recorder_audit_checksum="a" * 64,
+        verified_at=now,
+    )
+    db_session.commit()
+
+    ready = planning_truth.get_readiness(db_session, now=now)
+    assert ready.ready is True
+    assert ready.truth_status == "accepted"
+    persisted = db_session.get(models.LedgerGeneration, generation.id)
+    assert persisted.cutoff.replace(tzinfo=timezone.utc) == cutoff
+    assert persisted.accepted_at.replace(tzinfo=timezone.utc) == cutoff
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == generation.id
+
+
+def test_incomplete_noop_source_cannot_advance_freshness(db_session):
+    now = datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc)
+    batch = models.PhysicalImportBatch(
+        batch_key="incomplete-noop-batch", status="completed", source_complete=False,
+        cutoff=now, source_watermarks={}, completed_at=now,
+    )
+    generation = _generation(
+        generation_key="incomplete-noop-generation", status="accepted",
+        cutoff=now - timedelta(days=3), accepted_at=now - timedelta(days=3),
+        physical_import_batch=batch,
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.commit()
+
+    with pytest.raises(ValueError, match="completed source batch"):
+        planning_truth.record_verified_noop(
+            db_session,
+            generation_id=generation.id,
+            physical_import_batch_id=batch.id,
+            verified_through=now,
+            convergence_hash="c" * 64,
+            recorder_audit_checksum="a" * 64,
+            verified_at=now,
+        )
+    assert db_session.query(models.PlanningTruthVerification).count() == 0
+
+
+def test_verified_noop_requires_current_pointer_and_observed_timestamp(db_session):
+    now = datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc)
+    batch = models.PhysicalImportBatch(
+        batch_key="cas-noop-batch", status="completed", source_complete=True,
+        cutoff=now, source_watermarks={"content_hash": "cas-proof"}, completed_at=now,
+    )
+    first = _generation(
+        generation_key="cas-noop-first", status="accepted", cutoff=now,
+        accepted_at=now, physical_import_batch=batch,
+    )
+    second = _generation(
+        generation_key="cas-noop-second", status="accepted", cutoff=now,
+        accepted_at=now,
+    )
+    db_session.add_all([first, second])
+    db_session.flush()
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=second.id))
+    db_session.commit()
+
+    with pytest.raises(planning_truth.PlanningTruthVerificationConflict):
+        planning_truth.record_verified_noop(
+            db_session,
+            generation_id=first.id,
+            physical_import_batch_id=batch.id,
+            verified_through=now,
+            convergence_hash="c" * 64,
+            recorder_audit_checksum="a" * 64,
+            verified_at=now,
+        )
+    with pytest.raises(ValueError, match="after verified_at"):
+        planning_truth.record_verified_noop(
+            db_session,
+            generation_id=second.id,
+            physical_import_batch_id=batch.id,
+            verified_through=now + timedelta(seconds=1),
+            convergence_hash="c" * 64,
+            recorder_audit_checksum="a" * 64,
+            verified_at=now,
+        )
 
 
 def test_malformed_accepted_generation_is_rejected_fail_closed(db_session):

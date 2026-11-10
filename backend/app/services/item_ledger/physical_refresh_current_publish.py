@@ -1444,6 +1444,7 @@ def _build_obligation_view_payloads(
     *,
     generation_id: int,
     run_ids: Sequence[int],
+    allow_stale_parent: bool = False,
 ) -> tuple[dict[str, Any], Mapping[str, Any]]:
     """Build the MRP and period current payloads with the canonical builders.
 
@@ -1462,7 +1463,9 @@ def _build_obligation_view_payloads(
     """
     with sealed_lineage_read_batch(db):
         mrp_payloads = {
-            str(run_id): build_mrp_result_current_payload(db, int(run_id))
+            str(run_id): build_mrp_result_current_payload(
+                db, int(run_id), allow_stale_parent=allow_stale_parent,
+            )
             for run_id in sorted({int(value) for value in run_ids})
         }
         period_payloads = build_period_plan_execution_current_payloads(
@@ -1543,6 +1546,13 @@ def _publish_assembly_current(
     revision: str,
 ) -> tuple[int, int]:
     queue_rows = tuple(_member(assembly_payload, "queue_rows") or ())
+    total_queue_qty = sum(
+        (
+            Decimal(str(_member(row, "payload", {}).get("assembly_remaining_qty") or "0"))
+            for row in queue_rows
+        ),
+        Decimal("0"),
+    )
     queue_result = publish_current_execution_scope(
         db,
         source_revision=revision,
@@ -2389,6 +2399,7 @@ def _publish_forward_physical_refresh_current(
     start_phase("obligation_view_payload")
     mrp_payloads, period_payloads = _build_obligation_view_payloads(
         db, generation_id=int(target.id), run_ids=run_ids,
+        allow_stale_parent=True,
     )
     if _phase_tracker is not None:
         _phase_tracker.complete("obligation_view_payload")
@@ -2966,6 +2977,7 @@ def _repair_current_execution_scopes_from_pointer(
     )
     mrp_payloads, period_payloads = _build_obligation_view_payloads(
         db, generation_id=int(generation.id), run_ids=run_ids,
+        allow_stale_parent=True,
     )
 
     revision = f"repair:g{int(generation.id)}:{source_revision}"

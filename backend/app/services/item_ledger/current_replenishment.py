@@ -2520,6 +2520,26 @@ def prepare_current_replenishment_for_accepted_generation(
         raise CurrentReplenishmentError(
             "current replenishment publication requires an accepted generation"
         )
+    if _text(generation.status) == "building":
+        previous_generation_ids = {
+            int(value)
+            for (value,) in db.query(
+                models.CurrentReplenishmentState.ledger_generation_id
+            ).distinct().all()
+        }
+        if previous_generation_ids:
+            from .live_plan_scope import sealed_generation_lineage_ids
+
+            try:
+                lineage = set(sealed_generation_lineage_ids(db, generation))
+            except ValueError as exc:
+                raise CurrentReplenishmentError(
+                    f"generation {int(generation.id)} is outside the sealed parent lineage"
+                ) from exc
+            if not previous_generation_ids.issubset(lineage):
+                raise CurrentReplenishmentError(
+                    f"generation {int(generation.id)} is outside the sealed parent lineage"
+                )
     reservation_query = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.lifecycle_status == "active",
         models.ReservationEntry.realization_mode == "buy",
@@ -2639,13 +2659,15 @@ def prepare_current_replenishment_for_accepted_generation(
     # Use the complete visible physical prefix, then restrict it by persisted
     # typed supplier provenance.  A raw positive ``receipt`` movement is not
     # sufficient: internal transfers and other receipt-like rows are not BUY.
-    from .physical_visibility import visible_sles_for_generation
+    from .physical_visibility import PhysicalVisibilityError, visible_sles_for_generation
 
-    visible = {
-        int(row.id): row
-        for row in visible_sles_for_generation(db, int(generation_id))
-        if bool(row.active)
-    }
+    try:
+        visible = {
+            int(row.id): row
+            for row in visible_sles_for_generation(db, int(generation_id))
+        }
+    except PhysicalVisibilityError as exc:
+        raise CurrentReplenishmentError(str(exc)) from exc
     provenance = (
         db.query(models.StockLedgerSupplierReceiptProvenance)
         .filter(

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -47,6 +47,8 @@ from app.services.production_control_journal_projection import (
 )
 from app.services.production_material_custody_projection import (
     build_material_custody_projection,
+    lock_current_custody_marker,
+    validate_recovery_material_custody_full_tail,
 )
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_projection import (
@@ -81,6 +83,7 @@ from app.services.item_ledger.future_supply_capture import (
 from app.services.item_ledger.shelf_projection_persistence import (
     materialize_shelf_projections,
 )
+from app.services.item_ledger.live_plan_scope import sealed_generation_lineage_ids
 from app.services.local_mrp_order_reconciliation import reconcile_local_mrp_orders
 
 
@@ -464,6 +467,9 @@ def run_obligation_refresh(
     explicit_make_transfer_recorders: set[str] | None = None,
     accepted_at: datetime | None = None,
     allow_stale_parent: bool = False,
+    recovery_source_current: bool = False,
+    recovery_owner_fingerprints: Mapping[int, Sequence[str]] | None = None,
+    recovery_source_generations: Mapping[int, int] | None = None,
 ) -> ObligationRefreshOrchestrationResult:
     """Build and atomically publish every refresh/add candidate.
 
@@ -473,7 +479,13 @@ def run_obligation_refresh(
     key = str(generation_key or "").strip()
     if not key:
         raise ValueError("generation_key is required")
-    if db.get_bind().dialect.name == "postgresql":
+    if recovery_source_current and (
+        not recovery_owner_fingerprints or not recovery_source_generations
+    ):
+        raise ObligationRefreshOrchestratorError(
+            "recovery requires exact owner fingerprints and source generations"
+        )
+    if db.get_bind().dialect.name == "postgresql" and not recovery_source_current:
         db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
     assert_output_repair_allows(
         db,
@@ -610,11 +622,70 @@ def run_obligation_refresh(
         if entry.get("action") in {"replace", "retire"}
         and entry.get("parent_run_id") is not None
     }))
-    # Retained obligations are stable business rows anchored to their original
-    # run/generation lineage.  A replacement refresh must not copy or retarget
-    # them into the candidate generation; live-scope readers resolve the sealed
-    # lineage explicitly when they need the retained plan.
+    # Normal refreshes keep retained obligations on their original sealed
+    # lineage.  Explicit recovery alone may stage their exact previous owners.
     retained_reservation_count = 0
+    if recovery_source_current:
+        if not recovery_owner_fingerprints or not recovery_source_generations:
+            raise ObligationRefreshOrchestratorError(
+                "recovery requires exact owner fingerprints and source generations"
+            )
+        if {int(key) for key in recovery_owner_fingerprints} != set(retained_run_ids):
+            raise ObligationRefreshOrchestratorError(
+                "recovery owner fingerprint set must equal the accepted manifest retain set"
+            )
+        if {int(key) for key in recovery_source_generations} != set(retained_run_ids):
+            raise ObligationRefreshOrchestratorError(
+                "recovery source generation set must equal the accepted manifest retain set"
+            )
+        recovery_runs = {
+            int(row.run_id): row
+            for row in db.query(models.PlanningRun).filter(
+                models.PlanningRun.run_id.in_(retained_run_ids)
+            ).all()
+        }
+        if set(recovery_runs) != set(retained_run_ids) or any(
+            str(row.status) != "FIXED_SNAPSHOT" for row in recovery_runs.values()
+        ):
+            raise ObligationRefreshOrchestratorError(
+                "recovery retain set contains a non-fixed or missing planning run"
+            )
+        for run_id, source_generation_id in recovery_source_generations.items():
+            source_generation_id = int(source_generation_id)
+            run = recovery_runs[int(run_id)]
+            if source_generation_id == -1:
+                current_rows = db.query(models.ReservationEntry).filter(
+                    models.ReservationEntry.run_id == int(run_id),
+                    models.ReservationEntry.is_current.is_(True),
+                ).all()
+                parent_lineage = set(sealed_generation_lineage_ids(db, parent))
+                if not current_rows or any(
+                    int(row.ledger_generation_id) not in parent_lineage
+                    for row in current_rows
+                ):
+                    raise ObligationRefreshOrchestratorError(
+                        f"current recovery owner for run {run_id} is outside the sealed parent lineage"
+                    )
+                continue
+            source_generation = db.get(models.LedgerGeneration, source_generation_id)
+            if (
+                source_generation is None
+                or str(source_generation.status) != "accepted"
+                or int(run.ledger_generation_id or -1) != source_generation_id
+            ):
+                raise ObligationRefreshOrchestratorError(
+                    f"recovery source generation is not the sealed accepted lineage for run {run_id}"
+                )
+        retained_reservation_count = carry_forward_retained_reservations(
+            db,
+            parent_generation_id=int(parent_generation_id),
+            target_generation_id=target_id,
+            retained_run_ids=retained_run_ids,
+            preserve_realization=False,
+            source_current=True,
+            expected_source_fingerprints=recovery_owner_fingerprints,
+            recovery_source_generations=recovery_source_generations,
+        )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
     execution_batch = _single_stage(db, target_id, "execution_allocation", key)
@@ -639,7 +710,6 @@ def run_obligation_refresh(
     )
     reservation_count = db.query(models.ReservationEntry.id).filter(
         models.ReservationEntry.ledger_generation_id == target_id,
-        models.ReservationEntry.run_id.in_(candidate_ids),
     ).count()
     reservation_consumption = materialize_reservation_consumption_allocations(
         db,
@@ -854,6 +924,37 @@ def run_obligation_refresh(
         raise ObligationRefreshOrchestratorError(
             f"obligation refresh candidate is structurally invalid: {exc}"
         ) from exc
+    if recovery_source_current:
+        # Recovery deliberately does not hold the global lock over the long
+        # replay.  Take it only at the publication boundary and re-check the
+        # pointer plus the exact source-owner proof immediately before CAS.
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
+        locked_pointer = lock_current_custody_marker(db)
+        if (
+            locked_pointer is None
+            or int(locked_pointer.current_generation_id or -1) != int(parent_generation_id)
+        ):
+            raise ObligationRefreshOrchestratorError(
+                "recovery parent changed before final publication"
+            )
+        carry_forward_retained_reservations(
+            db,
+            parent_generation_id=int(parent_generation_id),
+            target_generation_id=target_id,
+            retained_run_ids=retained_run_ids,
+            preserve_realization=False,
+            source_current=True,
+            expected_source_fingerprints=recovery_owner_fingerprints,
+            recovery_source_generations=recovery_source_generations,
+        )
+        try:
+            validate_recovery_material_custody_full_tail(
+                db,
+                ledger_generation_id=target_id,
+            )
+        except RuntimeError as exc:
+            raise ObligationRefreshOrchestratorError(str(exc)) from exc
     published = publish_obligation_refresh_batch(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
@@ -874,4 +975,40 @@ def run_obligation_refresh(
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,
+    )
+
+
+def run_guarded_obligation_recovery(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    generation_key: str,
+    source_generation_by_run: Mapping[int, int],
+    owner_fingerprints: Mapping[int, Sequence[str]],
+    started_by: str | None = None,
+    accepted_at: datetime | None = None,
+    config_snapshot: Mapping[str, Any] | None = None,
+) -> ObligationRefreshOrchestrationResult:
+    """Recover retained owners from an accepted manifest, once, with proof.
+
+    A source value of ``-1`` means the exact ``is_current`` owner; any other
+    value is an exact sealed source generation (used for an accepted owner
+    whose current marker was not promoted).  This wrapper deliberately has no
+    add/replace/retire inputs: the accepted parent's retain manifest is the
+    complete business scope.  Normal refreshes never enter this mode.
+    """
+    if not source_generation_by_run or not owner_fingerprints:
+        raise ObligationRefreshOrchestratorError(
+            "guarded recovery requires a non-empty exact owner proof"
+        )
+    return run_obligation_refresh(
+        db,
+        parent_generation_id=int(parent_generation_id),
+        generation_key=generation_key,
+        started_by=started_by,
+        accepted_at=accepted_at,
+        config_snapshot=config_snapshot or {},
+        recovery_source_current=True,
+        recovery_owner_fingerprints=owner_fingerprints,
+        recovery_source_generations=source_generation_by_run,
     )
