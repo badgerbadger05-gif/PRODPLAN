@@ -6,7 +6,6 @@ import {
   coverageLabels,
   type ControlWarehouse,
   type EmployeeOption,
-  type MaterialIssueCreateResponse,
   type MaterialsResponse,
   type OrderRow,
   type ProductionFilters,
@@ -583,29 +582,6 @@ export function ProductionControlPage() {
     renderRouteSheets(ids, prepareRouteSheetWindow())
   }
 
-  async function createMaterialIssues(productIds?: number[]) {
-    const ids = productIds ?? selectedRows.flatMap(productionRowProductIds)
-    if (!ids.length) return
-    if (!beginDangerousMutation()) return
-    setLoading(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await requestMaterialIssues(ids)
-      const errors = result.errors?.length ?? 0
-      const feederPending = result.feeder_shortages?.length ?? 0
-      const alreadyOnDestination = result.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
-
-      setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${feederPending ? `, ожидают пополнения питателя ${feederPending}` : ''}${errors ? `, ошибок ${errors}` : ''}${result.transfer_warnings?.length ? `. ${result.transfer_warnings.join('; ')}` : ''}`)
-      await load(offsetRef.current)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      endDangerousMutation()
-      setLoading(false)
-    }
-  }
-
   async function exportTo1C(productIds?: number[]) {
     let ids = productIds ?? selectedRows.flatMap(productionRowProductIds)
     const workItemIds = productIds == null
@@ -699,7 +675,6 @@ export function ProductionControlPage() {
       }
       const feederPending = issueResult.feeder_shortages?.length ?? 0
       const transferWarning = issueResult.transfer_warnings?.join('; ') ?? ''
-      const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
       const issueIds = issueIdsFromCreateResult(issueResult)
       if (!issueIds.length) {
         const orderIds = Array.from(new Set(finalContext.rows.map((row) => row.order_id).filter(
