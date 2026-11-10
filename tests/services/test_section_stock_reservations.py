@@ -320,6 +320,32 @@ def test_partial_feeder_allocates_only_free_feeder_qty_and_leaves_remainder_pend
     ] == pytest.approx(0)
 
 
+def test_missing_feeder_binding_allows_full_coverage_from_workshop(db_session):
+    db = db_session
+    _add_warehouses(db)
+    _parent, component, product = _setup(db, order_qty=2, suffix="NO-FEEDER-ON-WORKSHOP")
+    binding = db.query(WorkshopWarehouseBinding).filter_by(
+        workshop_id=product.control_state.workshop_id
+    ).one()
+    binding.feeder_warehouse_ref1c = None
+    db.commit()
+    _set_stock(db, component, {WORKSHOP_WH: 2, SOURCE_WH: 20})
+
+    result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+
+    assert result["errors"] == []
+    assert result["feeder_shortages"] == []
+    assert result["already_on_destination"][0]["components"][0]["covered_qty"] == 2
+    assert len(result["created"]) == 1
+    issue = db.get(ProductionMaterialIssue, result["created"][0]["issue_id"])
+    assert issue.status == "posted"
+    assert issue.source_warehouse_ref1c == WORKSHOP_WH
+    assert issue.warehouse_ref1c == WORKSHOP_WH
+    assert issue.lines[0].required_qty == pytest.approx(2)
+    assert product.control_state.issue_status == "posted"
+    assert product.control_state.status == "assembled"
+
+
 def test_missing_feeder_binding_fails_clear_without_warehouse_picker(db_session):
     db = db_session
     _add_warehouses(db)
