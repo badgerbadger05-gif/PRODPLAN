@@ -1547,6 +1547,9 @@ class ProductionPlanHeader(Base):
     created_by = Column(String(100), nullable=True)
     fixed_by = Column(String(100), nullable=True)
     fixed_at = Column(TIMESTAMP, nullable=True)
+    # Explicit business boundary for finished-product output only. NULL retains
+    # the historical fixation rule; component stock coverage is unaffected.
+    output_credit_from = Column(Date, nullable=True)
     closed_at = Column(DateTime(timezone=True), nullable=True)
     closed_reason = Column(String(50), nullable=True)
     # Immutable successor lineage.  A specification rebase never edits the

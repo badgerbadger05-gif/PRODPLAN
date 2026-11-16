@@ -122,7 +122,8 @@ def test_assembly_queue_rejects_divergent_run_and_plan_periods(db_session):
         assembly_queue_materialization._build_rows(db_session, int(generation.id))
 
 
-def test_rebased_queue_keeps_original_plan_execution_and_fixation(db_session):
+@pytest.mark.parametrize("credit_from", [None, date(2026, 8, 1)])
+def test_rebased_queue_keeps_original_plan_execution_and_fixation(db_session, credit_from):
     cutoff = datetime(2026, 8, 20, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="rebase-plan-truth", cutoff=cutoff)
     item = models.Item(item_code="FG-REBASE", item_name="Rebased plan truth")
@@ -132,6 +133,7 @@ def test_rebased_queue_keeps_original_plan_execution_and_fixation(db_session):
         end=date(2026, 8, 31),
     )
     db_session.add_all((item, plan))
+    plan.output_credit_from = credit_from
     db_session.flush()
     old_run = _run(db_session, generation=generation, plan=plan)
     old_run.status = "REBASED"
@@ -166,7 +168,7 @@ def test_rebased_queue_keeps_original_plan_execution_and_fixation(db_session):
     assert payload["planned_output_qty"] == 12.0
     assert payload["accepted_plan_output_qty"] == 10.0
     assert payload["assembly_remaining_qty"] == 2.0
-    assert payload["eligible_from"] == plan.fixed_at
+    assert payload["eligible_from"] == assembly_queue_materialization.plan_output_eligible_from(plan)
 
 
 def _allocation(

@@ -222,6 +222,7 @@ def _serialize_plan(
         "created_by": str(plan.created_by or "") if plan.created_by else None,
         "fixed_by": str(plan.fixed_by or "") if plan.fixed_by else None,
         "fixed_at": plan.fixed_at.isoformat() if plan.fixed_at else None,
+        "output_credit_from": plan.output_credit_from.isoformat() if plan.output_credit_from else None,
         "created_at": plan.created_at.isoformat() if plan.created_at else None,
         "updated_at": plan.updated_at.isoformat() if plan.updated_at else None,
         "line_count": int(line_count or 0) if line_count is not None else None,
@@ -480,11 +481,15 @@ def create_period_plan(
     period_to: Any,
     created_by: Optional[str] = None,
     comment: Optional[str] = None,
+    output_credit_from: Any = None,
 ) -> Dict[str, Any]:
     start = _parse_date(period_from, "period_from")
     finish = _parse_date(period_to, "period_to")
     if finish < start:
         raise ValueError("Дата окончания периода не может быть раньше даты начала")
+    credit_from = _parse_date(output_credit_from, "output_credit_from") if output_credit_from else None
+    if credit_from is not None and not start <= credit_from <= finish:
+        raise ValueError("Дата начала зачёта выпуска должна входить в период плана")
     title = str(name or "").strip()
     if not title:
         raise ValueError("Название плана обязательно")
@@ -511,6 +516,7 @@ def create_period_plan(
         status="draft",
         created_by=created_by,
         comment=effective_comment,
+        output_credit_from=credit_from,
     )
     db.add(plan)
     db.commit()
@@ -719,6 +725,7 @@ def update_period_plan_header(
     period_from: Any = None,
     period_to: Any = None,
     comment: Any = None,
+    output_credit_from: Any = None,
 ) -> Dict[str, Any]:
     """Update editable header fields. Only allowed for draft plans."""
     plan = _get_plan(db, plan_id)
@@ -732,6 +739,11 @@ def update_period_plan_header(
     new_to = _parse_date(period_to, "period_to") if period_to is not None else plan.period_to
     if new_to < new_from:
         raise ValueError("Дата окончания периода не может быть раньше даты начала")
+    credit_from = (_parse_date(output_credit_from, "output_credit_from")
+                   if output_credit_from is not None else plan.output_credit_from)
+    if credit_from is not None and not new_from <= credit_from <= new_to:
+        raise ValueError("Дата начала зачёта выпуска должна входить в период плана")
+    plan.output_credit_from = credit_from
     plan.period_from = new_from
     plan.period_to = new_to
     if comment is not None:
@@ -2439,6 +2451,9 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
         .all()
     )
 
+    # The bulk API accepts any date inside the plan period, including a final
+    # partial week. Keep those saved dates visible and included in totals.
+    bucket_keys = sorted(set(bucket_keys) | {row.bucket_date.isoformat() for row in rows})
     forecast_by_cell = (
         _plan_matrix_forecasts(db, int(plan.id), [int(row.item_id) for row in rows], bucket_keys)
         if include_forecasts else {}

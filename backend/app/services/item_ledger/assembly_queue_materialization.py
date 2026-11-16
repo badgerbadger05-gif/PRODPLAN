@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Any
 
@@ -15,6 +16,18 @@ from .live_plan_scope import live_plan_run_ids
 
 
 ROW_KIND = "assembly_queue_line"
+
+
+def plan_output_eligible_from(plan: Any) -> datetime | None:
+    """Explicit output date is Moscow midnight, stable across MRP rebases.
+
+    Existing plans retain their original fixation boundary. This only controls
+    finished-product completion, never physical stock or component replenishment.
+    """
+    credit_from = getattr(plan, "output_credit_from", None)
+    if credit_from is not None:
+        return datetime.combine(credit_from, time.min, tzinfo=ZoneInfo("Europe/Moscow"))
+    return plan.fixed_at
 
 
 def _dec(value: Any) -> Decimal:
@@ -145,7 +158,7 @@ def _build_rows_by_scope(
         # Rebase must not make a backdated, late-imported physical output
         # ineligible merely because the successor run started later.  The
         # historical boundary belongs to the immutable fixed plan.
-        eligible_from = plan.fixed_at
+        eligible_from = plan_output_eligible_from(plan)
         period_from, period_to = _frozen_run_period(run, plan)
         priority = _priority_key(period_from, period_to, plan_id, line_id)
         sort_key = _sort_key(period_from, period_to, plan_id, line_id)

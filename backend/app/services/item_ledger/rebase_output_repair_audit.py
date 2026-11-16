@@ -174,12 +174,14 @@ def _corrected_candidates(db: Session, candidates):
                 f"replacement plan_id={int(plan.id)} lacks immutable fixed_at"
             )
         current_boundary = _utc(candidate.eligible_from)
-        original_boundary = _fixed_boundary_utc(plan.fixed_at, candidate.eligible_from)
+        from .assembly_queue_materialization import plan_output_eligible_from
+        plan_boundary = plan_output_eligible_from(plan)
+        original_boundary = _fixed_boundary_utc(plan_boundary, candidate.eligible_from)
         if current_boundary < original_boundary:
             raise RebaseOutputRepairAuditError(
                 f"replacement plan_line_id={int(candidate.plan_line_id)} predates plan fixation"
             )
-        corrected.append(replace(candidate, eligible_from=plan.fixed_at))
+        corrected.append(replace(candidate, eligible_from=plan_boundary))
         if current_boundary > original_boundary:
             changed_lines[int(candidate.plan_line_id)] = {
                 "plan_id": int(candidate.plan_id),

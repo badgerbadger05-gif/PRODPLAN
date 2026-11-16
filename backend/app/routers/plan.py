@@ -319,6 +319,7 @@ class PeriodPlanCreateRequest(BaseModel):
     period_to: str
     created_by: Optional[str] = None
     comment: Optional[str] = None
+    output_credit_from: Optional[str] = None
 
 
 class PeriodPlanLineEntry(BaseModel):
@@ -353,6 +354,7 @@ class PeriodPlanUpdateRequest(BaseModel):
     period_from: Optional[str] = None
     period_to: Optional[str] = None
     comment: Optional[str] = None
+    output_credit_from: Optional[str] = None
 
 
 class FixedPlanCorrectionTargetEntry(BaseModel):
@@ -713,6 +715,7 @@ async def period_plans_create(
             period_to=req.period_to,
             created_by=req.created_by,
             comment=req.comment,
+            output_credit_from=req.output_credit_from,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -856,6 +859,7 @@ async def period_plans_patch(
             period_from=req.period_from,
             period_to=req.period_to,
             comment=req.comment,
+            output_credit_from=req.output_credit_from,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
