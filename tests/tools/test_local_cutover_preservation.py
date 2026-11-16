@@ -1,5 +1,6 @@
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,6 +57,9 @@ def test_writers_stop_acknowledgement_required():
 
 def _fake_pipeline(monkeypatch, tmp_path):
     calls = []
+    # This is a mocked historical rehearsal, not a claim that today's graph
+    # still has its pinned single head. Keep the real mismatch gate below.
+    monkeypatch.setattr(runner.ScriptDirectory, "from_config", lambda config: SimpleNamespace(get_heads=lambda: [runner.TARGET_REVISION]))
 
     class Engine:
         def dispose(self):
@@ -106,6 +110,15 @@ def _fake_pipeline(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "postflight_manifest", postflight)
     monkeypatch.setattr(runner, "verify_preservation", preservation)
     return calls
+
+
+def test_changed_repository_heads_block_before_any_connection(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(runner, "create_engine", lambda *a, **kw: calls.append("connect"))
+    monkeypatch.setattr(runner.ScriptDirectory, "from_config", lambda config: SimpleNamespace(get_heads=lambda: [runner.TARGET_REVISION, "new_head"]))
+    with pytest.raises(runner.RehearsalBlocked, match="repository_alembic_head_mismatch"):
+        runner.run_rehearsal(URL, expected_database=DATABASE, restore_receipt=_restore_receipt(), writers_stopped=True, output=tmp_path / "run.json")
+    assert calls == []
 
 
 def test_runner_uses_canonical_order_captures_before_any_mutation_and_keeps_evidence(monkeypatch, tmp_path):

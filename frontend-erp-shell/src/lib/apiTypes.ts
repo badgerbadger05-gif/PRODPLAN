@@ -5394,6 +5394,8 @@ export interface components {
             created_by?: string | null;
             /** Comment */
             comment?: string | null;
+            /** Output Credit From */
+            output_credit_from?: string | null;
         };
         /** PeriodPlanFixRequest */
         PeriodPlanFixRequest: {
@@ -5505,6 +5507,8 @@ export interface components {
             period_to?: string | null;
             /** Comment */
             comment?: string | null;
+            /** Output Credit From */
+            output_credit_from?: string | null;
         };
         /** PhysicalRefreshDiscardRequest */
         PhysicalRefreshDiscardRequest: {
