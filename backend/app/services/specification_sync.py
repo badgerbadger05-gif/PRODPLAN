@@ -80,6 +80,15 @@ def _sync_spec_components(
         quantity = Decimal(str(raw_qty))
         if not quantity.is_finite():
             raise ValueError(f"строка состава {identity}: недопустимое количество")
+        raw_output = value.get("КоличествоПродукции")
+        if raw_output is None or raw_output == "":
+            raise ValueError(f"строка состава {identity}: отсутствует количество продукции")
+        output_qty = Decimal(str(raw_output))
+        if not output_qty.is_finite() or output_qty <= 0:
+            raise ValueError(f"строка состава {identity}: недопустимое количество продукции")
+        # Each 1C composition line states material per its own output quantity.
+        # Normalize before grouping: repeated lines may have different divisors.
+        quantity /= output_qty
         key = (
             int(item.item_id),
             _norm_component_spec_ref(value.get("Спецификация_Key")),

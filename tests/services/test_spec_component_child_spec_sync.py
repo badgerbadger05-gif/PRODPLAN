@@ -45,6 +45,7 @@ def _comp(ref, nom, qty, spec_key, type_="Сборка"):
         "Ref_Key": ref,
         "Номенклатура_Key": nom,
         "Количество": qty,
+        "КоличествоПродукции": 1,
         "Этап_Key": "",
         "ТипСтрокиСостава": type_,
         "Спецификация_Key": spec_key,
@@ -64,6 +65,39 @@ def test_norm_component_spec_ref():
     assert _norm_component_spec_ref("   ") is None
     assert _norm_component_spec_ref("00000000-0000-0000-0000-000000000000") is None
     assert _norm_component_spec_ref("ABCD-1234") == "abcd-1234"
+
+
+def test_normalizes_each_source_output_quantity_before_summing(db_session, monkeypatch):
+    from decimal import Decimal
+    _add_item(db_session, "nom-a")
+    first = _comp("c1", "nom-a", "0.7", "")
+    first["КоличествоПродукции"] = 2
+    second = _comp("c2", "nom-a", "0.3", "")
+    second["КоличествоПродукции"] = 3
+    _patch_client(monkeypatch, [_spec_record([first, second])])
+    specification_sync.sync_specifications_from_odata(db_session, _req())
+    row = db_session.query(SpecComponent).one()
+    assert row.quantity == Decimal("0.450")
+    revision_count = db_session.query(SpecificationRevision).count()
+    stats = specification_sync.sync_specifications_from_odata(db_session, _req())
+    assert stats["components_updated"] == 0
+    assert db_session.query(SpecificationRevision).count() == revision_count
+
+
+@pytest.mark.parametrize("denominator", [None, "", 0, -1, "NaN", "Infinity"])
+def test_invalid_source_output_quantity_preserves_composition(db_session, monkeypatch, denominator):
+    from decimal import Decimal
+    _add_item(db_session, "nom-a")
+    _patch_client(monkeypatch, [_spec_record([_comp("c1", "nom-a", 7, "")])])
+    specification_sync.sync_specifications_from_odata(db_session, _req())
+    before_hash = db_session.query(Specification).one().content_hash
+    bad = _comp("c1", "nom-a", 0.7, "")
+    bad["КоличествоПродукции"] = denominator
+    _patch_client(monkeypatch, [_spec_record([bad])])
+    stats = specification_sync.sync_specifications_from_odata(db_session, _req())
+    assert stats["components_failed"] == 1
+    assert db_session.query(SpecComponent).one().quantity == Decimal("7.000")
+    assert db_session.query(Specification).one().content_hash == before_hash
 
 
 def test_sync_stores_component_spec_ref(db_session, monkeypatch):
