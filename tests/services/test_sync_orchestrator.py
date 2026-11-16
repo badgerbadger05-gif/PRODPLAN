@@ -111,8 +111,31 @@ def test_real_registry_orders_nomenclature_before_stock():
     # Sanity: the real registry keeps dependency order (nomenclature precedes stock).
     idx = orch._ORDER_INDEX
     assert idx["nomenclature"] < idx["specifications"]
+    assert idx["specifications"] < idx["defaultSpecifications"] < idx["specificationRebase"]
     assert idx["nomenclature"] < idx["stock"]
     assert idx["warehouses"] < idx["stock"]
+
+
+@pytest.mark.parametrize("dependency", ["nomenclature", "specifications"])
+def test_default_specifications_are_due_once_after_a_newer_successful_import(dependency):
+    default_job = orch._JOB_BY_ID["defaultSpecifications"]
+    default_finished = datetime(2026, 11, 16, 7, 48, tzinfo=timezone.utc)
+    import_finished = default_finished + timedelta(hours=3)
+    default_state = {"last_run_at": default_finished.isoformat(), "last_finished_at": default_finished.isoformat()}
+    dependency_state = {"last_status": "error", "last_finished_at": import_finished.isoformat()}
+    state = {"jobs": {default_job.id: default_state, dependency: dependency_state}}
+
+    assert orch._job_next_due(state, default_job) == default_finished + timedelta(hours=12)
+    dependency_state["last_status"] = "ok"
+    assert orch._job_next_due(state, default_job) == import_finished
+    assert default_job in orch._due_jobs(state, import_finished)
+
+    default_state["enabled"] = False
+    assert default_job not in orch._due_jobs(state, import_finished)
+    default_state["enabled"] = True
+    repeated_finish = import_finished + timedelta(seconds=5)
+    default_state["last_finished_at"] = repeated_finish.isoformat()
+    assert orch._job_next_due(state, default_job) == repeated_finish + timedelta(hours=12)
 
 
 def test_long_rebase_failure_waits_after_completion_and_backs_off(tmp_state, monkeypatch):

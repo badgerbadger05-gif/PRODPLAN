@@ -195,6 +195,7 @@ SYNC_JOBS: List[SyncJob] = [
     SyncJob("brigades", "Бригады", 86_400, _single("Catalog_Бригады", sync_employees_from_odata)),
     SyncJob("operations", "Операции", 43_200, _single("Catalog_Спецификации_Операции", sync_operations_from_odata)),
     SyncJob("specifications", "Спецификации", 43_200, _single("Catalog_Спецификации", sync_specifications_from_odata)),
+    SyncJob("defaultSpecifications", "Спецификации по умолчанию", 43_200, _single("InformationRegister_СпецификацииПоУмолчанию", sync_default_specifications_from_odata)),
     # Sync fills the durable queue, but automatic consumption stays disabled
     # until the run-scoped rebase implementation is accepted. The previous
     # plan-successor/full-refresh worker took 7-8 hours and produced invalid
@@ -206,7 +207,6 @@ SYNC_JOBS: List[SyncJob] = [
         3_600,
         _run_specification_rebase,
     ),
-    SyncJob("defaultSpecifications", "Спецификации по умолчанию", 43_200, _single("InformationRegister_СпецификацииПоУмолчанию", sync_default_specifications_from_odata)),
     SyncJob("productionStages", "Этапы производства", 86_400, _single("Catalog_ЭтапыПроизводства", sync_production_stages_from_odata)),
     SyncJob("warehouses", "Склады", 86_400, _single("AccumulationRegister_ЗапасыНаСкладах", sync_stock_warehouses_from_odata)),
     SyncJob("stock", "Остатки + обеспечение журнала", 1_800, _run_stock),
@@ -351,9 +351,21 @@ def _job_next_due(state: Dict[str, Any], job: SyncJob) -> Optional[datetime]:
     finished = _parse_iso(js.get("last_finished_at"))
     if finished is None:
         finished = started + timedelta(milliseconds=int(js.get("last_duration_ms") or 0))
-    due = finished + timedelta(seconds=_interval_for(state, job)) if finished else None
+    due = finished + timedelta(seconds=_interval_for(state, job))
+    if job.id == "defaultSpecifications":
+        # A previous register sync could have skipped rows whose item or spec
+        # was missing locally. Retry once after a newer successful import.
+        for dependency_id in ("nomenclature", "specifications"):
+            dependency = _job_state(state, dependency_id)
+            dependency_finished = _parse_iso(dependency.get("last_finished_at"))
+            if (
+                dependency.get("last_status") == "ok"
+                and dependency_finished is not None
+                and dependency_finished > finished
+            ):
+                due = min(due, dependency_finished)
     retry = _parse_iso(js.get("next_retry_at"))
-    return max(due, retry) if due and retry else due or retry
+    return max(due, retry) if retry else due
 
 
 def _due_jobs(state: Dict[str, Any], now: datetime) -> List[SyncJob]:

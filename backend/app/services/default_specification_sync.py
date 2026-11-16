@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Dict, Optional, List
-from datetime import datetime
+import logging
+from dataclasses import asdict, dataclass
 
 from sqlalchemy.orm import Session
 
 from ..models import DefaultSpecification, Item, Specification
 from ..schemas import ODataSyncRequest
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -17,6 +19,8 @@ class DefaultSpecificationSyncStats:
     records_created: int = 0
     records_updated: int = 0
     records_unchanged: int = 0
+    records_missing_item: int = 0
+    records_missing_specification: int = 0
     duplicates_deleted: int = 0
     dry_run: bool = False
     odata_url: str = ""
@@ -123,7 +127,11 @@ def sync_default_specifications_from_odata(db: Session, req: ODataSyncRequest) -
                 item = existing_items.get(item_key)
                 spec = existing_specs.get(spec_key)
 
-                if not item or not spec:
+                if item is None:
+                    stats.records_missing_item += 1
+                if spec is None:
+                    stats.records_missing_specification += 1
+                if item is None or spec is None:
                     continue
 
                 char_norm = _norm_char(characteristic_key)
@@ -205,6 +213,12 @@ def sync_default_specifications_from_odata(db: Session, req: ODataSyncRequest) -
         stats.records_updated = updated_count
         stats.records_unchanged = unchanged_count
         stats.duplicates_deleted = duplicates_deleted
+        if stats.records_missing_item or stats.records_missing_specification:
+            logger.warning(
+                "Default specification sync skipped unresolved references: missing item=%s, missing specification=%s",
+                stats.records_missing_item,
+                stats.records_missing_specification,
+            )
 
         if req.dry_run:
             db.rollback()
