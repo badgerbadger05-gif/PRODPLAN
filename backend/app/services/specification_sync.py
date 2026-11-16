@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, asdict
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Optional, List
 from datetime import datetime
 
@@ -34,6 +36,110 @@ def _norm_component_spec_ref(value) -> Optional[str]:
     return raw
 
 
+def _sync_spec_components(
+    db: Session,
+    spec_id: int,
+    components_data: list,
+    *,
+    existing_items: dict[str, Item],
+    existing_stages: dict[str, ProductionStage],
+) -> tuple[int, int, int]:
+    existing = (
+        db.query(SpecComponent)
+        .filter_by(spec_id=spec_id)
+        .order_by(SpecComponent.component_id)
+        .all()
+    )
+    stored_rows = defaultdict(list)
+    stored_stages = defaultdict(set)
+    for row in existing:
+        key = (
+            int(row.item_id),
+            _norm_component_spec_ref(row.component_spec_ref1c),
+            row.component_type or "Материал",
+        )
+        stored_rows[(*key, row.stage_id)].append(row)
+        if row.stage_id is not None:
+            stored_stages[key].add(row.stage_id)
+
+    incoming_rows = []
+    incoming_stages = defaultdict(set)
+    for value in components_data:
+        # List and exact OData readers can represent a composition row by
+        # LineNumber; Ref_Key is not always included on tabular parts.
+        identity = str(value.get("LineNumber") or value.get("Ref_Key") or "").strip()
+        if not identity:
+            raise ValueError("строка состава не содержит LineNumber или Ref_Key")
+        item_ref = str(value.get("Номенклатура_Key") or "").strip()
+        item = existing_items.get(item_ref)
+        if item is None:
+            raise ValueError(f"строка состава {identity}: неизвестная номенклатура {item_ref!r}")
+        raw_qty = value.get("Количество")
+        if raw_qty is None or raw_qty == "":
+            raise ValueError(f"строка состава {identity}: отсутствует количество")
+        quantity = Decimal(str(raw_qty))
+        if not quantity.is_finite():
+            raise ValueError(f"строка состава {identity}: недопустимое количество")
+        key = (
+            int(item.item_id),
+            _norm_component_spec_ref(value.get("Спецификация_Key")),
+            value.get("ТипСтрокиСостава") or "Материал",
+        )
+        stage = existing_stages.get((value.get("Этап_Key") or "").strip())
+        stage_id = stage.stage_id if stage else None
+        if stage_id is not None:
+            incoming_stages[key].add(stage_id)
+        incoming_rows.append((key, stage_id, quantity))
+
+    # 1C may repeat the same material in several composition lines. Sum only
+    # equivalent rows and keep quantities at each explicit stage and child pin.
+    quantities = defaultdict(Decimal)
+    for key, stage_id, qty in incoming_rows:
+        if stage_id is None:
+            # OData may omit a stage that was curated locally. Retain it if
+            # there is a unique stored stage not already explicit in the input.
+            candidates = stored_stages[key] - incoming_stages[key]
+            if len(candidates) > 1:
+                raise ValueError(f"неоднозначный этап состава для item_id={key[0]}, spec_id={spec_id}")
+            stage_id = next(iter(candidates), None)
+        quantities[(*key, stage_id)] += qty
+
+    # Match the precision of SpecComponent.quantity after summing source rows.
+    quantities = {key: qty.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP) for key, qty in quantities.items()}
+    kept_ids = set()
+    created = updated = deleted = 0
+    for key, quantity in quantities.items():
+        item_id, spec_ref, component_type, stage_id = key
+        candidates = stored_rows.get(key)
+        if candidates:
+            row = candidates[0]
+            kept_ids.add(row.component_id)
+            if (
+                row.quantity != quantity
+                or row.component_spec_ref1c != spec_ref
+                or row.component_type != component_type
+            ):
+                row.quantity = quantity
+                row.component_spec_ref1c = spec_ref
+                row.component_type = component_type
+                updated += 1
+        else:
+            db.add(SpecComponent(
+                spec_id=spec_id,
+                item_id=item_id,
+                quantity=quantity,
+                stage_id=stage_id,
+                component_type=component_type,
+                component_spec_ref1c=spec_ref,
+            ))
+            created += 1
+    for row in existing:
+        if row.component_id not in kept_ids:
+            db.delete(row)
+            deleted += 1
+    return created, updated, deleted
+
+
 @dataclass
 class SpecificationSyncStats:
     """Статистика синхронизации спецификаций"""
@@ -44,6 +150,7 @@ class SpecificationSyncStats:
     components_created: int = 0
     components_updated: int = 0
     components_deleted: int = 0
+    components_failed: int = 0
     operations_created: int = 0
     operations_updated: int = 0
     spec_operations_created: int = 0
@@ -151,6 +258,7 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         components_created = 0
         components_updated = 0
         components_deleted = 0
+        components_failed = 0
         operations_created = 0
         operations_updated = 0
         spec_operations_created = 0
@@ -208,126 +316,60 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 if production_kind_key:
                     production_kind = existing_production_kinds.get(production_kind_key)
 
-                if existing_spec:
-                    # Проверяем, нужно ли обновлять
-                    needs_update = (
-                        existing_spec.spec_code != code or
-                        existing_spec.spec_name != name or
-                        existing_spec.production_kind_id != (production_kind.id if production_kind else None)
-                    )
-
-                    if needs_update:
-                        existing_spec.spec_code = code
-                        existing_spec.spec_name = name
-                        existing_spec.production_kind_id = production_kind.id if production_kind else None
-                        updated_count += 1
-                    else:
-                        unchanged_count += 1
-                else:
-                    # Создаем новую спецификацию
-                    current_spec = Specification(
-                        spec_code=code,
-                        spec_name=name,
-                        spec_ref1c=ref_key,
-                        production_kind_id=production_kind.id if production_kind else None
-                    )
-                    db.add(current_spec)
-                    # Важно: получить spec_id до создания связанных записей
-                    db.flush()
-                    created_count += 1
-                    # Добавим в индекс, чтобы исключить повторные вставки при дублирующихся записях
-                    existing_specs[ref_key] = current_spec
-
-                # Проверяем, что спецификация создана или найдена
-                if not current_spec:
-                    continue
-                touched_spec_ids.add(int(current_spec.spec_id))
-
-                # Обрабатываем компоненты спецификации.
-                # Естественный ключ строки состава — тройка (spec_id, item_id, закреплённая спека),
-                # потому что один и тот же компонент может присутствовать в одной спецификации
-                # несколько раз с разными Спецификация_Key (тип Сборка/Узел).
-                seen_component_keys: set[tuple[int, Optional[str]]] = set()
-                for comp_data in components_data:
-                    try:
-                        comp_ref_key = comp_data.get('Ref_Key', '').strip()
-                        if not comp_ref_key:
-                            continue
-
-                        item_key = comp_data.get('Номенклатура_Key', '').strip()
-                        quantity = comp_data.get('Количество', 0.0)
-                        stage_key = comp_data.get('Этап_Key', '').strip()
-                        component_type = comp_data.get('ТипСтрокиСостава', 'Материал')
-                        component_spec_ref1c = _norm_component_spec_ref(comp_data.get('Спецификация_Key'))
-
-                        # Находим связанные объекты
-                        item = existing_items.get(item_key)
-                        stage = existing_stages.get(stage_key) if stage_key else None
-
-                        if not item:
-                            continue
-
-                        seen_component_keys.add((int(item.item_id), component_spec_ref1c))
-
-                        # Создаем или обновляем компонент по полному естественному ключу
-                        existing_comp = db.query(SpecComponent).filter_by(
-                            spec_id=current_spec.spec_id,
-                            item_id=item.item_id,
-                            component_spec_ref1c=component_spec_ref1c
-                        ).first()
-
-                        if existing_comp:
-                            # Real 1C OData may omit component stage data. Keep a
-                            # previously curated/backfilled stage instead of
-                            # erasing it to NULL on every sync.
-                            desired_stage_id = stage.stage_id if stage else existing_comp.stage_id
-                            if (existing_comp.quantity != quantity or
-                                existing_comp.stage_id != desired_stage_id or
-                                existing_comp.component_type != component_type):
-                                existing_comp.quantity = quantity
-                                existing_comp.stage_id = desired_stage_id
-                                existing_comp.component_type = component_type
-                                components_updated += 1
+                # Header and composition must describe the same source
+                # version. A bad source row cannot turn unread materials into
+                # obsolete rows, nor create a selectable header-only spec.
+                try:
+                    with db.begin_nested():
+                        production_kind_id = production_kind.id if production_kind else None
+                        if existing_spec:
+                            needs_update = (
+                                existing_spec.spec_code != code
+                                or existing_spec.spec_name != name
+                                or existing_spec.production_kind_id != production_kind_id
+                            )
+                            if needs_update:
+                                existing_spec.spec_code = code
+                                existing_spec.spec_name = name
+                                existing_spec.production_kind_id = production_kind_id
                         else:
-                            new_comp = SpecComponent(
-                                spec_id=current_spec.spec_id,
-                                item_id=item.item_id,
-                                quantity=quantity,
-                                stage_id=stage.stage_id if stage else None,
-                                component_type=component_type,
-                                component_spec_ref1c=component_spec_ref1c
+                            current_spec = Specification(
+                                spec_code=code,
+                                spec_name=name,
+                                spec_ref1c=ref_key,
+                                production_kind_id=production_kind_id,
                             )
-                            db.add(new_comp)
-                            components_created += 1
+                            db.add(current_spec)
+                            db.flush()
 
-                    except Exception as e:
-                        print(f"Ошибка обработки компонента спецификации {ref_key}: {e}")
-                        continue
-
-                # Reconcile: удалить строки состава, которых больше нет в 1С
-                # (только если поле 'Состав' реально выгружено). Сверяем по полному
-                # естественному ключу (item_id, закреплённая спека), а не только item_id,
-                # иначе легальные дубли «один компонент с разными спеками» удалялись бы.
-                if can_reconcile_components:
-                    try:
-                        # SAVEPOINT: ошибка удаления не должна абортировать всю
-                        # транзакцию синка (иначе остальные спецификации падают
-                        # каскадом PendingRollbackError).
-                        with db.begin_nested():
-                            deleted = 0
-                            existing_rows = (
-                                db.query(SpecComponent)
-                                .filter(SpecComponent.spec_id == current_spec.spec_id)
-                                .all()
+                        created = updated = deleted = 0
+                        if has_components_field and not can_reconcile_components:
+                            raise ValueError("табличная часть состава не является списком")
+                        if can_reconcile_components:
+                            created, updated, deleted = _sync_spec_components(
+                                db,
+                                int(current_spec.spec_id),
+                                components_data,
+                                existing_items=existing_items,
+                                existing_stages=existing_stages,
                             )
-                            for row in existing_rows:
-                                if (int(row.item_id), row.component_spec_ref1c) not in seen_component_keys:
-                                    db.delete(row)
-                                    deleted += 1
-                            if deleted:
-                                components_deleted += int(deleted)
-                    except Exception as e:
-                        print(f"Ошибка reconcile компонентов спецификации {ref_key}: {e}")
+                        db.flush()
+                except Exception as error:
+                    components_failed += 1
+                    print(f"Ошибка синхронизации состава спецификации {ref_key}: {error}")
+                    continue
+
+                if not existing_spec:
+                    created_count += 1
+                    existing_specs[ref_key] = current_spec
+                elif needs_update:
+                    updated_count += 1
+                else:
+                    unchanged_count += 1
+                components_created += created
+                components_updated += updated
+                components_deleted += deleted
+                touched_spec_ids.add(int(current_spec.spec_id))
 
                 # Обрабатываем операции спецификации
                 seen_operation_ids: set[int] = set()
@@ -443,6 +485,7 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         stats.components_created = components_created
         stats.components_updated = components_updated
         stats.components_deleted = components_deleted
+        stats.components_failed = components_failed
         stats.operations_created = operations_created
         stats.operations_updated = operations_updated
         stats.spec_operations_created = spec_operations_created
