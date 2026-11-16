@@ -1,13 +1,13 @@
 """Add an opt-in immutable plan output credit date.
 
 Revision ID: 20261116_01
-Revises: 20261030_02
+Revises: 20260921_01 (verified deployed migration branch)
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "20261116_01"
-down_revision = "20261030_02"
+down_revision = "20260921_01"
 branch_labels = None
 depends_on = None
 
