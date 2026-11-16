@@ -158,7 +158,7 @@ def _matrix_payload(
 def _normalise_targets(
     entries: Iterable[Mapping[str, Any]],
     *,
-    month_key: tuple[int, int],
+    month_key: tuple[int, int] | None,
 ) -> tuple[dict[tuple[int, date], Decimal], list[dict[str, Any]]]:
     targets: dict[tuple[int, date], Decimal] = {}
     audit: list[dict[str, Any]] = []
@@ -173,7 +173,7 @@ def _normalise_targets(
             ) from exc
         if item_id <= 0:
             raise FixedPlanCorrectionError("target item_id must be positive")
-        if (bucket_date.year, bucket_date.month) != month_key:
+        if month_key is not None and (bucket_date.year, bucket_date.month) != month_key:
             raise FixedPlanCorrectionError(
                 "target bucket_date is outside the corrected plan month"
             )
@@ -248,7 +248,7 @@ def correct_fixed_plan_groups(
     corrected_by: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Correct independent same-month groups in one atomic generation."""
+    """Correct independent groups; a single programme may span several months."""
     group_requests: list[dict[str, Any]] = []
     all_plan_ids: list[int] = []
     for raw_group in groups:
@@ -374,13 +374,13 @@ def correct_fixed_plan_groups(
                 (plan.period_to.year, plan.period_to.month)
                 for plan in group_plans
             }
-            if len(month_keys) != 1:
+            if len(month_keys) != 1 and len(group_plans) != 1:
                 raise FixedPlanCorrectionError(
                     "every plan inside one correction group must belong to the same calendar month"
                 )
             targets, target_payload = _normalise_targets(
                 group["raw_targets"],
-                month_key=next(iter(month_keys)),
+                month_key=next(iter(month_keys)) if len(month_keys) == 1 else None,
             )
             period_from = min(plan.period_from for plan in group_plans)
             period_to = max(plan.period_to for plan in group_plans)
@@ -769,7 +769,7 @@ def correct_fixed_plan_group(
     corrected_by: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Compatibility wrapper for one same-month group."""
+    """Compatibility wrapper for one guarded correction group."""
     return correct_fixed_plan_groups(
         db,
         groups=({

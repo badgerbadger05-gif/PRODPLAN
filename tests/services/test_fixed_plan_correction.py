@@ -377,6 +377,52 @@ def test_correction_rejects_cross_month_group_before_mutation(db_session, monkey
     assert Decimal(db_session.get(models.ProductionPlanLine, lines[1].id).qty) == 5
 
 
+def test_single_multimonth_programme_adds_kit_without_changing_existing_fact(db_session, monkeypatch):
+    generation, plans, runs, lines, items = _world(db_session)
+    plan = plans[0]
+    plan.period_to = date(2026, 2, 28)
+    plan.output_credit_from = date(2026, 1, 1)
+    runs[1].period_to = plan.period_to
+    db_session.commit()
+    calls = []
+    _stub_refresh(monkeypatch, db_session, calls)
+    result = correct_fixed_plan_groups(
+        db_session,
+        groups=[{"plan_ids": [1], "target_entries": [
+            {"item_id": items[0].item_id, "bucket_date": "2026-01-01", "qty": "5"},
+            {"item_id": items[2].item_id, "bucket_date": "2026-02-28", "qty": "2"},
+        ]}],
+        source_id="multimonth-kit-addition", source_hash="d" * 64,
+        expected_generation_id=generation.id, expected_source_revision=REVISION,
+    )
+    assert result["status"] == "applied"
+    assert len(calls) == 1 and calls[0]["replace_plan_ids"] == (1,)
+    db_session.expire_all()
+    old = db_session.get(models.ProductionPlanLine, lines[1].id)
+    assert (old.qty, old.accepted_output_qty, old.remaining_output_qty) == (5, 4, 1)
+    kit = db_session.query(models.ProductionPlanLine).filter_by(plan_id=1, item_id=items[2].item_id).one()
+    assert (kit.qty, kit.accepted_output_qty, kit.remaining_output_qty) == (2, 0, 2)
+    assert db_session.get(models.ProductionPlanHeader, 1).output_credit_from == date(2026, 1, 1)
+
+
+def test_single_multimonth_programme_rejects_date_outside_its_period(db_session, monkeypatch):
+    generation, plans, runs, lines, items = _world(db_session)
+    plans[0].period_to = date(2026, 2, 28)
+    runs[1].period_to = date(2026, 2, 28)
+    db_session.commit()
+    calls = []
+    _stub_refresh(monkeypatch, db_session, calls)
+    with pytest.raises(FixedPlanCorrectionError, match="outside the corrected group period"):
+        correct_fixed_plan_groups(
+            db_session, groups=[{"plan_ids": [1], "target_entries": [
+                {"item_id": items[2].item_id, "bucket_date": "2026-03-01", "qty": "2"},
+            ]}], source_id="multimonth-invalid-date", source_hash="e" * 64,
+            expected_generation_id=generation.id, expected_source_revision=REVISION,
+        )
+    assert calls == []
+    assert db_session.get(models.ProductionPlanLine, lines[1].id).qty == 5
+
+
 def test_mixed_overproduction_summary_keeps_cellwise_remaining():
     payload = {
         "plan_output_rows": [
